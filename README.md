@@ -45,7 +45,7 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 
 - `--format yaml|csv|jsonl|explore` — only `--json` and human text exist.
   Extend `output::mode` and `output::envelope` when you need the rest.
-- `--dry-run` on `remember` (it's not really destructive, but SFRS §3 says
+- `--dry-run` on `remember` (it's not really destructive, but the CLI Standard §3 says
   every write command SHOULD accept it — add a no-op path if you want strict
   compliance).
 - Packaging manifests (`packaging/guix.scm`, `packaging/default.nix`,

@@ -27,7 +27,7 @@ No tests yet, no CI, no formatter config. Scaffold — compiles-by-inspection.
 - `--json` flag OR any of `AI_AGENT`, `AGENT`, `CI` env vars OR non-TTY stdout → machine output (single-line JSON to stdout, structured error to stderr).
 - `ENGRAM_DB` env var for db path (default: `engram.db`).
 - `--no-color` respects `NO_COLOR` convention.
-- `describe` subcommand prints JSON capability manifest (SFRS introspection).
+- `describe` subcommand prints JSON capability manifest (CLI Standard introspection).
 - `schema` prints JSON Schema for the `Memory` type.
 
 ## Storage

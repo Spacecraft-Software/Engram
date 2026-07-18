@@ -80,7 +80,7 @@ There are no tests yet — scaffold status. Compile-by-inspection only.
   // SPDX-License-Identifier: GPL-3.0-or-later
   ```
 - **Timestamps:** ISO 8601 UTC only (via `jiff`, never local time). Suffix with `Z` if needed.
-- **CLI shape:** Per SFRS (Spacecraft Free Reference Spec) — all commands emit structured output, `--json` flag or non-TTY stdout triggers machine mode (JSON to stdout, structured errors to stderr).
+- **CLI shape:** Per the Spacecraft Software Dual-Mode Self-Documenting CLI Standard (v1.0.0) — all commands emit structured output, `--json` flag or non-TTY stdout triggers machine mode (JSON to stdout, structured errors to stderr).
 - **Envelopes:** Every command/route returns `Response<T>` (operation name, data, optional error).
 - **Role defaults:** `"note"` on all surfaces. Alternatives: `"user"`, `"assistant"`, `"system"`.
 
@@ -93,7 +93,7 @@ There are no tests yet — scaffold status. Compile-by-inspection only.
 - `mcp` — run as MCP server (stdio)
 - `serve [--addr <ip:port>]` — run HTTP server (default `127.0.0.1:8420`)
 - `schema` — print JSON Schema for `Memory` type
-- `describe` — print SFRS capability manifest (JSON)
+- `describe` — print CLI Standard capability manifest (JSON)
 
 **Global flags:**
 - `--db <path>` — database file (env: `ENGRAM_DB`, default: `engram.db`)

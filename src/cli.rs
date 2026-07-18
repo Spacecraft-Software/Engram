@@ -59,9 +59,9 @@ pub enum Command {
         #[arg(long, default_value = "127.0.0.1:8420")]
         addr: String,
     },
-    /// JSON Schema for engram's data types (SFRS introspection).
+    /// JSON Schema for engram's data types (CLI Standard introspection).
     Schema,
-    /// Machine-readable capability manifest (SFRS introspection).
+    /// Machine-readable capability manifest (CLI Standard introspection).
     Describe,
     /// Save a complete chat history for a scope to a Texinfo file.
     SaveChat {
