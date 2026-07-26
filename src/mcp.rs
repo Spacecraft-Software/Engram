@@ -60,6 +60,49 @@ pub struct SearchArgs {
 fn default_limit() -> u32 { 50 }
 fn default_search_limit() -> u32 { 20 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RuleAddArgs {
+    /// Stable kebab-case identifier, unique within the scope. Re-using an
+    /// existing id revises that rule in place instead of adding a second one.
+    pub rule_id: String,
+    /// The rule itself, as plain prose.
+    pub text: String,
+    /// Scope to file the rule under. Omit to use the scope resolved from the
+    /// server process's working directory — pass it explicitly whenever this
+    /// server is shared across projects.
+    pub scope: Option<String>,
+    /// Which agent/model is recording the rule.
+    #[serde(default = "default_agent")]
+    pub agent: String,
+}
+fn default_agent() -> String { "mcp-client".to_string() }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RuleListArgs {
+    /// Scope to read. Omit to use the server process's resolved scope.
+    pub scope: Option<String>,
+    /// Also return withdrawn rules, each flagged `"retired": true`.
+    #[serde(default)]
+    pub include_retired: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RuleRetireArgs {
+    /// Id of the rule to withdraw.
+    pub rule_id: String,
+    /// Scope to read. Omit to use the server process's resolved scope.
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RuleSyncArgs {
+    /// Scope to render. Omit to use the server process's resolved scope.
+    pub scope: Option<String>,
+    /// Report what would be written without touching any file.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 #[tool_router]
 impl EngramMcp {
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
@@ -96,6 +139,119 @@ impl EngramMcp {
             serde_json::to_string(&mems).unwrap_or_default(),
         )]))
     }
+
+    #[tool(
+        description = "Record a durable project rule, or revise the existing rule with the same rule_id. \
+                       Use for policy that must keep applying in later sessions — coding standards, \
+                       packaging gates, review requirements — not for one-off facts (use `remember`). \
+                       Storing a rule does not surface it to anyone: call `rule_sync` afterwards."
+    )]
+    async fn rule_add(&self, Parameters(args): Parameters<RuleAddArgs>) -> Result<CallToolResult, McpError> {
+        crate::rules::validate_rule_id(&args.rule_id).map_err(|e| McpError::invalid_params(e, None))?;
+        crate::rules::validate_rule_text(&args.text).map_err(|e| McpError::invalid_params(e, None))?;
+        let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
+
+        let store = self.store.lock().map_err(lock_err)?;
+        let upsert = store
+            .rule_add(&args.agent, &resolved.name, &args.rule_id, args.text.trim())
+            .map_err(store_err)?;
+
+        let payload = serde_json::json!({
+            "rule": upsert.rule,
+            "created": upsert.created,
+            "scope": resolved.name,
+            "scope_origin": resolved.origin,
+            "next_step": "call rule_sync to render this rule into AGENTS.md and CLAUDE.md; \
+                          until then no agent will read it",
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+    }
+
+    #[tool(
+        description = "List the durable rules in effect for a scope, ordered by rule_id. Call this \
+                       before asserting that something is or is not project policy."
+    )]
+    async fn rule_list(&self, Parameters(args): Parameters<RuleListArgs>) -> Result<CallToolResult, McpError> {
+        let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
+        let store = self.store.lock().map_err(lock_err)?;
+        let rules = if args.include_retired {
+            store.rules_including_retired(&resolved.name).map_err(store_err)?
+        } else {
+            store.rules(&resolved.name).map_err(store_err)?
+        };
+
+        let payload = serde_json::json!({
+            "scope": resolved.name,
+            "scope_origin": resolved.origin,
+            "count": rules.len(),
+            "rules": rules,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+    }
+
+    #[tool(
+        description = "Withdraw a rule so it stops being binding. Tombstones rather than deletes: \
+                       the rule leaves `rule_list` and synced files but stays in the database and \
+                       remains findable via `search`. Re-running `rule_add` with the same rule_id \
+                       reinstates it. Call `rule_sync` afterwards, or the markdown keeps asserting \
+                       the retired rule."
+    )]
+    async fn rule_retire(&self, Parameters(args): Parameters<RuleRetireArgs>) -> Result<CallToolResult, McpError> {
+        let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
+        let store = self.store.lock().map_err(lock_err)?;
+        let retire = store.rule_retire(&resolved.name, &args.rule_id).map_err(store_err)?;
+
+        if retire.outcome == crate::store::RetireOutcome::NotFound {
+            return Err(McpError::invalid_params(
+                format!("no rule '{}' in scope '{}'", args.rule_id, resolved.name),
+                None,
+            ));
+        }
+
+        let payload = serde_json::json!({
+            "rule_id": retire.rule_id,
+            "scope": retire.scope,
+            "outcome": retire.outcome,
+            "rule": retire.rule,
+            "scope_origin": resolved.origin,
+            "next_step": "call rule_sync to drop this rule from AGENTS.md and CLAUDE.md; \
+                          until then the synced files still assert it",
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+    }
+
+    #[tool(
+        description = "Render a scope's rules into AGENTS.md and CLAUDE.md at the project root, \
+                       rewriting only the region between the engram sentinels and leaving the rest \
+                       of each file untouched. Idempotent: re-running with unchanged rules writes \
+                       nothing. This is the step that actually puts rules in front of a model."
+    )]
+    async fn rule_sync(&self, Parameters(args): Parameters<RuleSyncArgs>) -> Result<CallToolResult, McpError> {
+        let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
+        let rules = {
+            let store = self.store.lock().map_err(lock_err)?;
+            store.rules(&resolved.name).map_err(store_err)?
+        };
+
+        let block = crate::rules::render_block(&resolved.name, &rules);
+        let mut written = Vec::new();
+        for path in crate::rules::target_paths(&resolved.root, &[]) {
+            let file = crate::rules::sync_file(&path, &block, args.dry_run).map_err(|e| {
+                McpError::internal_error(format!("failed to sync {}: {e}", path.display()), None)
+            })?;
+            written.push(file);
+        }
+
+        let payload = serde_json::json!({
+            "scope": resolved.name,
+            "scope_origin": resolved.origin,
+            "root": resolved.root.to_string_lossy(),
+            "rule_count": rules.len(),
+            "dry_run": args.dry_run,
+            "files": written,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+    }
 }
 
 #[tool_handler]
@@ -104,9 +260,16 @@ impl ServerHandler for EngramMcp {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
-                "Shared verbatim chat memory. Call `remember` after any decision or fact worth \
-                 keeping, scoped to a project/task id. Call `recall` at session start for that \
-                 scope. Call `search` when unsure whether something was already decided."
+                "Shared verbatim chat memory plus durable project rules.\n\n\
+                 Memory: call `remember` after any decision or fact worth keeping, scoped to a \
+                 project/task id. Call `recall` at session start for that scope. Call `search` \
+                 when unsure whether something was already decided.\n\n\
+                 Rules: call `rule_list` at session start to load the policy governing this \
+                 project. Call `rule_add` when the user states a standing requirement — \
+                 something that must keep applying in future sessions, not a one-off fact — then \
+                 `rule_sync` to render it into AGENTS.md and CLAUDE.md. A stored rule that is \
+                 never synced is read by nobody. Call `rule_retire` when a rule no longer \
+                 applies, then `rule_sync` again."
                     .to_string(),
             ),
             ..Default::default()
@@ -119,6 +282,9 @@ fn lock_err<T>(_: std::sync::PoisonError<T>) -> McpError {
 }
 fn store_err(e: rusqlite::Error) -> McpError {
     McpError::internal_error(format!("engram storage error: {e}"), None)
+}
+fn scope_err(e: std::io::Error) -> McpError {
+    McpError::internal_error(format!("could not resolve scope: {e}"), None)
 }
 
 /// Some MCP hosts (observed: Antigravity's plugin loader) probe a server with a

@@ -9,11 +9,12 @@ mod error;
 mod http;
 mod mcp;
 mod output;
+mod rules;
 mod store;
 mod time;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, RuleAction};
 use error::AppError;
 use output::envelope::Response;
 use output::mode::{resolve_mode, OutputMode};
@@ -39,22 +40,18 @@ fn main() {
 fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
     match command {
         Command::Remember { agent, scope, role, content } => {
-            let content = match content {
+            let content = match content.or_else(read_stdin) {
                 Some(c) => c,
                 None => {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
-                        let err = AppError::new(
+                    return fail(
+                        AppError::new(
                             error::ErrorCode::InvalidArgument,
                             2,
                             "no content provided",
                             "pass content as an argument or pipe it via stdin",
-                        );
-                        emit_error(&err, mode);
-                        return err.exit_code;
-                    }
-                    buf
+                        ),
+                        mode,
+                    )
                 }
             };
             let guard = store.lock().expect("store lock poisoned");
@@ -98,6 +95,7 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 }
             }
         }
+        Command::Rule { action } => run_rule(action, &store, mode),
         Command::Mcp => {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             if let Err(e) = rt.block_on(mcp::run_stdio(store)) {
@@ -117,7 +115,10 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             0
         }
         Command::Schema => {
-            let schema = schemars::schema_for!(store::Memory);
+            let schema = serde_json::json!({
+                "Memory": schemars::schema_for!(store::Memory),
+                "Rule": schemars::schema_for!(store::Rule),
+            });
             println!("{}", serde_json::to_string_pretty(&schema).unwrap());
             0
         }
@@ -127,9 +128,26 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 "version": env!("CARGO_PKG_VERSION"),
                 "maintainer": "Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>",
                 "website": "https://Engram.SpacecraftSoftware.org/",
-                "commands": ["remember", "recall", "search", "save-chat", "mcp", "serve", "schema", "describe"],
+                "commands": [
+                    "remember", "recall", "search",
+                    "rule add", "rule list", "rule retire", "rule sync",
+                    "save-chat", "mcp", "serve", "schema", "describe"
+                ],
                 "transports": ["cli", "mcp-stdio", "http"],
-                "storage": "sqlite+fts5, single shared file"
+                "storage": "sqlite+fts5, single shared file",
+                "rules": {
+                    "description": "Durable project policy, stored once and rendered into the \
+                                    markdown files agent harnesses auto-load.",
+                    "scope_resolution": ["--scope", "ENGRAM_SCOPE", "git-root-basename", "cwd-basename"],
+                    "sync_targets": rules::DEFAULT_TARGETS,
+                    "surfaces": ["cli", "mcp-stdio", "http"],
+                    "retire": "tombstones rather than deletes; re-adding the same id reinstates",
+                    "http_routes": [
+                        "POST /v1/rules", "GET /v1/rules", "DELETE /v1/rules/:rule_id",
+                        "POST /v1/rules/sync"
+                    ],
+                    "mcp_tools": ["rule_add", "rule_list", "rule_retire", "rule_sync"]
+                }
             });
             println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
             0
@@ -174,6 +192,229 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             }
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct RuleAddResult {
+    rule: store::Rule,
+    /// False when an existing rule with this id was revised in place.
+    created: bool,
+    scope_origin: rules::ScopeOrigin,
+    /// Storing a rule does not put it in front of any model. Say so, every
+    /// time — an agent reading this envelope should know the job is half done.
+    next_step: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct RuleListResult {
+    scope: String,
+    scope_origin: rules::ScopeOrigin,
+    count: usize,
+    rules: Vec<store::Rule>,
+}
+
+#[derive(serde::Serialize)]
+struct RuleRetireResult {
+    #[serde(flatten)]
+    retire: store::RuleRetire,
+    scope_origin: rules::ScopeOrigin,
+    /// Retiring changes the database, not the markdown. Say so.
+    next_step: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct RuleSyncResult {
+    scope: String,
+    scope_origin: rules::ScopeOrigin,
+    root: String,
+    rule_count: usize,
+    dry_run: bool,
+    files: Vec<rules::SyncedFile>,
+}
+
+fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
+    match action {
+        RuleAction::Add { id, scope, agent, text } => {
+            let text = match text {
+                Some(t) => t,
+                None => match read_stdin() {
+                    Some(t) => t,
+                    None => {
+                        return fail(
+                            AppError::new(
+                                error::ErrorCode::InvalidArgument,
+                                2,
+                                "no rule text provided",
+                                "pass the rule as an argument or pipe it via stdin",
+                            ),
+                            mode,
+                        )
+                    }
+                },
+            };
+            if let Err(reason) = rules::validate_rule_id(&id) {
+                return fail(
+                    AppError::new(error::ErrorCode::InvalidArgument, 2, reason, "use a short kebab-case id, e.g. skill-description-1000"),
+                    mode,
+                );
+            }
+            if let Err(reason) = rules::validate_rule_text(&text) {
+                return fail(
+                    AppError::new(error::ErrorCode::InvalidArgument, 2, reason, "state the rule as plain prose"),
+                    mode,
+                );
+            }
+
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
+            let guard = store.lock().expect("store lock poisoned");
+            match guard.rule_add(&agent, &resolved.name, &id, text.trim()) {
+                Ok(upsert) => {
+                    let result = RuleAddResult {
+                        rule: upsert.rule,
+                        created: upsert.created,
+                        scope_origin: resolved.origin,
+                        next_step: "run `engram rule sync` to render this rule into AGENTS.md and CLAUDE.md; \
+                                    until then no agent will read it",
+                    };
+                    emit_ok(Response::new("engram rule add", result), mode);
+                    0
+                }
+                Err(e) => fail(AppError::from(e), mode),
+            }
+        }
+
+        RuleAction::List { scope, include_retired } => {
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
+            let guard = store.lock().expect("store lock poisoned");
+            let listed = if include_retired {
+                guard.rules_including_retired(&resolved.name)
+            } else {
+                guard.rules(&resolved.name)
+            };
+            match listed {
+                Ok(rules) => {
+                    let result = RuleListResult {
+                        scope: resolved.name,
+                        scope_origin: resolved.origin,
+                        count: rules.len(),
+                        rules,
+                    };
+                    emit_ok(Response::new("engram rule list", result), mode);
+                    0
+                }
+                Err(e) => fail(AppError::from(e), mode),
+            }
+        }
+
+        RuleAction::Retire { id, scope } => {
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
+            let guard = store.lock().expect("store lock poisoned");
+            match guard.rule_retire(&resolved.name, &id) {
+                Ok(retire) => {
+                    // A missing id is a real error: the caller believes it is
+                    // withdrawing something and it is not.
+                    if retire.outcome == store::RetireOutcome::NotFound {
+                        return fail(
+                            AppError::new(
+                                error::ErrorCode::NotFound,
+                                3,
+                                format!("no rule '{id}' in scope '{}'", resolved.name),
+                                "list the ids with `engram rule list --include-retired`",
+                            ),
+                            mode,
+                        );
+                    }
+                    let payload = RuleRetireResult {
+                        retire,
+                        scope_origin: resolved.origin,
+                        next_step: "run `engram rule sync` to drop this rule from AGENTS.md and \
+                                    CLAUDE.md; until then the synced files still assert it",
+                    };
+                    emit_ok(Response::new("engram rule retire", payload), mode);
+                    0
+                }
+                Err(e) => fail(AppError::from(e), mode),
+            }
+        }
+
+        RuleAction::Sync { scope, files, dry_run } => {
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
+            let rule_list = {
+                let guard = store.lock().expect("store lock poisoned");
+                match guard.rules(&resolved.name) {
+                    Ok(r) => r,
+                    Err(e) => return fail(AppError::from(e), mode),
+                }
+            };
+
+            let block = rules::render_block(&resolved.name, &rule_list);
+            let mut written = Vec::new();
+            for path in rules::target_paths(&resolved.root, &files) {
+                match rules::sync_file(&path, &block, dry_run) {
+                    Ok(file) => written.push(file),
+                    Err(e) => {
+                        return fail(
+                            AppError::new(
+                                error::ErrorCode::InternalError,
+                                1,
+                                format!("failed to sync {}: {e}", path.display()),
+                                "check filesystem permissions for the project root",
+                            ),
+                            mode,
+                        )
+                    }
+                }
+            }
+
+            let result = RuleSyncResult {
+                scope: resolved.name,
+                scope_origin: resolved.origin,
+                root: resolved.root.to_string_lossy().into_owned(),
+                rule_count: rule_list.len(),
+                dry_run,
+                files: written,
+            };
+            emit_ok(Response::new("engram rule sync", result), mode);
+            0
+        }
+    }
+}
+
+/// Reads all of stdin, returning `None` when it is empty or unreadable.
+fn read_stdin() -> Option<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return None;
+    }
+    Some(buf)
+}
+
+fn scope_error(e: std::io::Error) -> AppError {
+    AppError::new(
+        error::ErrorCode::InternalError,
+        1,
+        format!("could not resolve scope: {e}"),
+        "pass --scope explicitly, or set ENGRAM_SCOPE",
+    )
+}
+
+/// Emits an error in the active mode and yields its exit code.
+fn fail(err: AppError, mode: OutputMode) -> i32 {
+    emit_error(&err, mode);
+    err.exit_code
 }
 
 #[derive(serde::Serialize)]

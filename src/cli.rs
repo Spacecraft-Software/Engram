@@ -52,6 +52,15 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Durable project rules — policy that outlives a session.
+    ///
+    /// A rule is stored once and rendered into the markdown files agent
+    /// harnesses load automatically, so it keeps applying without anyone
+    /// remembering to restate it.
+    Rule {
+        #[command(subcommand)]
+        action: RuleAction,
+    },
     /// Run as an MCP server over stdio.
     Mcp,
     /// Run the HTTP API.
@@ -76,6 +85,107 @@ pub enum Command {
         /// Optional signature model/agent name (e.g. gpt-5.6-pro).
         #[arg(long)]
         model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RuleAction {
+    /// Record a rule, or revise the existing rule with the same --id.
+    ///
+    /// Re-running with an id that already exists updates that rule in place
+    /// rather than storing a second, competing copy. Storing a rule does not
+    /// surface it to anyone — follow with `engram rule sync`.
+    #[command(after_help = "\
+EXAMPLES:
+  # Record a rule; scope defaults to the git working-tree name.
+  engram rule add --id skill-description-1000 \\
+      \"Do not ship a skill whose SKILL.md description exceeds 1000 characters.\"
+
+  # Revise it — same id, so this edits rather than duplicates.
+  engram rule add --id skill-description-1000 \"Revised wording.\"
+
+  # Long rules read better from a file.
+  cat rule.txt | engram rule add --id no-unwrap --scope engram
+")]
+    Add {
+        /// Stable kebab-case identifier, unique within the scope. Re-using one
+        /// edits that rule.
+        #[arg(long)]
+        id: String,
+        /// Scope to file the rule under. Defaults to ENGRAM_SCOPE, else the
+        /// git working-tree name, else the current directory name.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Which agent/model is recording the rule.
+        #[arg(long, env = "ENGRAM_AGENT", default_value = "engram-cli")]
+        agent: String,
+        /// The rule text. Reads stdin if omitted.
+        text: Option<String>,
+    },
+    /// List the rules in effect for a scope, ordered by id.
+    #[command(after_help = "\
+EXAMPLES:
+  engram rule list
+  engram rule list --scope spacecraft-software --json
+  engram rule list --include-retired
+")]
+    List {
+        /// Scope to read. Defaults to the same cascade as `rule add`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Also show withdrawn rules, flagged with "retired": true.
+        #[arg(long)]
+        include_retired: bool,
+    },
+    /// Withdraw a rule so it stops being binding.
+    ///
+    /// The rule is tombstoned, not deleted: it disappears from `rule list` and
+    /// from synced files, but stays in the database and remains findable via
+    /// `engram search`, because "we used to require this" is worth keeping.
+    /// Re-running `rule add` with the same id reinstates it.
+    #[command(after_help = "\
+EXAMPLES:
+  engram rule retire --id skill-description-1000
+  engram rule retire --id old-policy --scope spacecraft-software
+
+  # Retiring does not update the markdown; follow with a sync.
+  engram rule retire --id old-policy && engram rule sync
+")]
+    Retire {
+        /// Id of the rule to withdraw.
+        #[arg(long)]
+        id: String,
+        /// Scope to read. Defaults to the same cascade as `rule add`.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Render the scope's rules into AGENTS.md and CLAUDE.md.
+    ///
+    /// Rewrites only the region between the engram sentinels, leaving the rest
+    /// of each file untouched. Running it twice with unchanged rules is a
+    /// no-op, so it is safe to wire into a hook or a commit gate.
+    #[command(after_help = "\
+EXAMPLES:
+  # Render into AGENTS.md and CLAUDE.md at the project root.
+  engram rule sync
+
+  # Read-only check: reports 'updated' if the block is stale or hand-edited.
+  engram rule sync --dry-run
+
+  # Write somewhere else instead.
+  engram rule sync --file docs/RULES.md
+")]
+    Sync {
+        /// Scope to render. Defaults to the same cascade as `rule add`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Target file, repeatable. Relative paths resolve against the project
+        /// root. Defaults to AGENTS.md and CLAUDE.md.
+        #[arg(long = "file")]
+        files: Vec<std::path::PathBuf>,
+        /// Report what would be written without touching any file.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

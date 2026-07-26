@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+version = 1
+
+# Every committed file in Engram is software-class under Standard §4.1.1 — the
+# crate itself, its manifests, and the posture/agent documentation that ships
+# with and describes it. There is no document-class deliverable here yet; when
+# the Texinfo manual lands, add a later, more specific annotation marking
+# `doc/*.texi` as CC-BY-SA-4.0 (and ship LICENSES/CC-BY-SA-4.0.txt with it).
+#
+# `precedence = "override"` is load-bearing, not boilerplate:
+#
+#   1. README.md and CLAUDE.md quote the SPDX header convention inside fenced
+#      code blocks. Without an override, REUSE parses those examples as those
+#      files' own license declarations.
+#   2. It normalises the copyright line. Source headers carry the shorter
+#      "2026 Mohamed Hammad & Spacecraft Software"; this restates the canonical
+#      contactable form in one place rather than churning every .rs file.
+#
+# Per-file SPDX headers stay in every source file regardless — required by
+# Standard §4.3 and the Microsoft Rust Guidelines. This annotation is what
+# guarantees coverage for the files that cannot carry one meaningfully
+# (Cargo.lock, .gitignore) or where an inline tag would be misread (the docs).
+[[annotations]]
+path = "**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
+SPDX-License-Identifier = "GPL-3.0-or-later"

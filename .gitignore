@@ -1,4 +1,5 @@
 chat/
+research/
 /target
 *.db
 *.db-journal

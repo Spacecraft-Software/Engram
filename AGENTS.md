@@ -42,9 +42,61 @@ SQLite + FTS5, WAL journal mode, 5s busy timeout. The `memories_fts` virtual tab
 - `Response<T>` envelope on every command/route.
 - Role defaults to `"note"` on all surfaces.
 
+## Rules
+
+Durable policy, as opposed to memories (which record what happened). Stored as
+`memories` rows with `role = "rule"` and a stable `rule_id`, unique per scope —
+one write path, one FTS index, no parallel table.
+
+```sh
+engram rule add --id <kebab-id> [--scope S] [--agent A] [TEXT]   # stdin if TEXT omitted; upserts
+engram rule list [--scope S] [--include-retired]
+engram rule retire --id <kebab-id> [--scope S]                   # tombstone, not delete
+engram rule sync [--scope S] [--file PATH]... [--dry-run]
+```
+
+- **Scope cascade:** `--scope` → `ENGRAM_SCOPE` → git working-tree basename → cwd
+  basename. Returned as `scope_origin` on every response. Under MCP this resolves
+  against the *server process's* cwd — pass `scope` explicitly for a shared server.
+- **`sync` is the delivery step.** `rule add` only writes SQLite; nothing reads
+  SQLite. Rendering into `AGENTS.md`/`CLAUDE.md` is what makes a rule take effect.
+  Both surfaces return a `next_step` saying so.
+- **Sentinels:** `<!-- engram:rules:begin ... -->` / `<!-- engram:rules:end -->`.
+  Only that region is rewritten; everything else in the file is preserved. Rule
+  text containing `engram:rules:` is rejected at write time — it would break out
+  of its own block.
+- **Idempotent by construction:** the block carries no generation timestamp, so
+  it is a pure function of the rules. Unchanged rules ⇒ `unchanged` ⇒ no write.
+  Safe in a hook or commit gate; `--dry-run` makes it a read-only check.
+- **Upsert, not append:** re-using a `rule_id` revises that rule. `created_at`
+  survives; `updated_at` moves. Two competing copies of a rule would be worse
+  than none.
+- **Retire tombstones, never deletes.** A retired rule leaves `rule list` and the
+  synced files but stays in the database, stays findable via `search`, and comes
+  back from `--include-retired` flagged `retired: true`. Erasing the record of a
+  policy that once applied would defeat the purpose of a memory store. Re-adding
+  the same id reinstates it — the id is the rule's identity. Retiring twice is
+  idempotent (`already-retired`); retiring an unknown id is an error (exit 3 /
+  HTTP 404), not a silent success. **Retiring does not touch the markdown** —
+  follow with `rule sync` or the files keep asserting the retired rule.
+- MCP tools: `rule_add`, `rule_list`, `rule_retire`, `rule_sync`.
+- HTTP: `POST /v1/rules`, `GET /v1/rules` (`?scope=`, `?include_retired=`),
+  `DELETE /v1/rules/:rule_id` (retires; soft), `POST /v1/rules/sync`. These
+  return real status codes (400/404); the older `/v1/memory*` routes wrongly
+  answer `200` with an error body — follow the rule routes, not those.
+  `POST /v1/rules/sync` is the only route that writes outside the database;
+  paths derive from the server's cwd, never from caller input, and the CLI's
+  `--file` override is intentionally not exposed.
+
 ## Agent usage
 
+- Call `rule_list` at session start to load the policy governing this project.
+- Call `rule_add` + `rule_sync` when the user states a standing requirement —
+  something that must hold in *future* sessions. One-off facts go to `remember`.
+- Call `rule_retire` + `rule_sync` when the user withdraws one. Do not hand-edit
+  the managed block to remove a rule; the next sync would restore it.
 - Call `remember` after any decision, fact, or rationale — scope to project/task/run id.
 - Call `recall` at session start for that scope.
 - Call `search` before asserting something was already decided.
-- All three surfaces (CLI, MCP, HTTP) hit the same `Store`; behavior is identical.
+- CLI, MCP, and HTTP hit the same `Store`; behavior is identical for
+  remember/recall/search. Rules are CLI + MCP only.
