@@ -57,7 +57,7 @@ the full terms.
 @menu
 * Introduction::            What Engram is and the three surfaces.
 * Invocation::              The command-line interface.
-* MCP Server::              The seven Model Context Protocol tools.
+* MCP Server::              The nine Model Context Protocol tools.
 * HTTP API::                Routes and their status-code behavior.
 * Environment Variables::   Every variable Engram reads.
 * Rules::                   Durable project policy.
@@ -507,9 +507,11 @@ suitable for wiring into Claude Code, Codex, and other MCP clients:
 engram mcp --db /path/to/engram.db
 @end example
 
-The server exposes seven tools.  The memory tools mirror the CLI
+The server exposes nine tools.  The memory tools mirror the CLI
 commands of the same names; the rule tools mirror @command{engram
-rule}.
+rule}.  (The tool surface is deliberately narrow: every tool's schema
+costs context on every turn of every conversation, so Engram budgets a
+hard ceiling of ten.)
 
 @table @code
 @item remember
@@ -526,6 +528,19 @@ Read back the last N memories for a scope, in chronological order
 @cindex search tool (MCP)
 Full-text search across stored memories, optionally restricted to one
 scope (default limit 20).
+
+@item get
+@cindex get tool (MCP)
+Fetch a single memory by id --- the drill-down half of search/recall.
+Looks across the full history, superseded rows included: an id lookup
+answers ``what is this row'', not ``what is true now''.
+
+@item context
+@cindex context tool (MCP)
+Assemble a budget-packed session-start block: the scope's active rules
+first (always included), then recency+relevance fused memories packed
+to the token budget (default 3000).  One call replaces separate
+@code{recall} + @code{rule_list} at session start.
 
 @item rule_add
 @cindex rule_add tool (MCP)
@@ -582,6 +597,11 @@ target's validity window is closed in the same transaction; @code{404}
 for an unknown or cross-scope target, @code{400} for a rule target,
 and @code{409 Conflict} when the target was already superseded (the
 message names the winning id).
+
+@item GET /v1/memory/:id
+@cindex GET /v1/memory/:id
+Drill-down by id, across the full history (superseded rows included).
+@code{404} when no such id exists.
 
 @item GET /v1/memory/recall?scope=&limit=&budget_tokens=&as_of=&include_superseded=
 @cindex GET /v1/memory/recall

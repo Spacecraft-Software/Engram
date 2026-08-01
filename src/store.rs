@@ -569,13 +569,6 @@ impl Store {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "wired into the surfaces at M3 (MCP `get` tool, GET /v1/memory/:id)"
-        )
-    )]
     pub fn get(&self, id: &str, validity: Validity<'_>) -> rusqlite::Result<Option<Memory>> {
         let (clause, as_of) = validity_filter(validity, "", 2);
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1 {clause}");

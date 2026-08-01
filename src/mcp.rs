@@ -50,6 +50,35 @@ fn default_role() -> String {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetArgs {
+    /// Memory id (UUID) to fetch.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContextArgs {
+    /// Scope to assemble. Omitted: resolves via ENGRAM_SCOPE, then the git
+    /// working tree, then the cwd — of the SERVER process, so a shared
+    /// server should always pass it explicitly.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Optional free-text query; adds a relevance channel to the recency
+    /// channel before packing.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Token budget for the whole block (chars/4 estimate). Rules are always
+    /// included even over budget; memories fill the remainder.
+    #[serde(default = "default_context_budget")]
+    pub budget_tokens: u32,
+    /// Candidate pool size per channel.
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+fn default_context_budget() -> u32 {
+    3000
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RecallArgs {
     pub scope: String,
     #[serde(default = "default_limit")]
@@ -385,6 +414,60 @@ impl EngramMcp {
             payload.to_string(),
         )]))
     }
+
+    #[tool(
+        description = "Fetch a single memory by id — the drill-down half of search/recall. \
+                       Looks across the full history (superseded rows included): an id lookup \
+                       answers \"what is this row\", not \"what is true now\"."
+    )]
+    async fn get(&self, Parameters(args): Parameters<GetArgs>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().map_err(lock_err)?;
+        match store
+            .get(&args.id, crate::store::Validity::All)
+            .map_err(store_err)?
+        {
+            Some(mem) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&mem).unwrap_or_default(),
+            )])),
+            None => Err(McpError::invalid_params(
+                format!("no memory with id '{}'", args.id),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        description = "Assemble a budget-packed session-start context block: the scope's active \
+                       rules first (always included), then recency+relevance fused memories \
+                       packed to the token budget. Call this once at session start instead of \
+                       separate recall + rule_list."
+    )]
+    async fn context(
+        &self,
+        Parameters(args): Parameters<ContextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
+        let store = self.store.lock().map_err(lock_err)?;
+        let ctx = store
+            .context(
+                &resolved.name,
+                args.query.as_deref(),
+                args.limit,
+                args.budget_tokens,
+            )
+            .map_err(store_err)?;
+        let payload = serde_json::json!({
+            "scope": resolved.name,
+            "scope_origin": resolved.origin,
+            "rules": ctx.rules,
+            "memories": ctx.memories,
+            "rules_tokens": ctx.rules_tokens,
+            "budget": ctx.budget,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -394,9 +477,12 @@ impl ServerHandler for EngramMcp {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
                 "Shared verbatim chat memory plus durable project rules.\n\n\
-                 Memory: call `remember` after any decision or fact worth keeping, scoped to a \
-                 project/task id. Call `recall` at session start for that scope. Call `search` \
-                 when unsure whether something was already decided.\n\n\
+                 Memory: call `context` once at session start — it returns the scope's rules \
+                 plus a token-budgeted slice of relevant memories in one call. Call `remember` \
+                 after any decision or fact worth keeping, scoped to a project/task id (pass \
+                 `supersedes` to correct an earlier memory instead of contradicting it). Call \
+                 `search` when unsure whether something was already decided, and `get` to \
+                 drill down to a specific id.\n\n\
                  Rules: call `rule_list` at session start to load the policy governing this \
                  project. Call `rule_add` when the user states a standing requirement — \
                  something that must keep applying in future sessions, not a one-off fact — then \
@@ -1001,6 +1087,75 @@ mod tests {
             .await
             .expect_err("mutually exclusive pair is rejected");
         assert_eq!(both.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    // --- M3: drill-down + session-start context ---------------------------
+
+    #[tokio::test]
+    async fn get_tool_drills_down_across_history() {
+        let (mcp, _dir) = test_mcp();
+        let stored = mcp
+            .remember(Parameters(RememberArgs {
+                agent: "a".to_string(),
+                scope: "m3".to_string(),
+                role: "note".to_string(),
+                content: "drill target".to_string(),
+                supersedes: None,
+            }))
+            .await
+            .expect("remember");
+        let id = json_of(&stored)["id"].as_str().expect("id").to_string();
+
+        let fetched = mcp
+            .get(Parameters(GetArgs { id: id.clone() }))
+            .await
+            .expect("get");
+        assert_eq!(json_of(&fetched)["content"], "drill target");
+
+        let missing = mcp
+            .get(Parameters(GetArgs {
+                id: "nope".to_string(),
+            }))
+            .await
+            .expect_err("unknown id is rejected");
+        assert_eq!(missing.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn context_tool_returns_rules_memories_and_budget() {
+        let (mcp, _dir) = test_mcp();
+        mcp.rule_add(Parameters(RuleAddArgs {
+            rule_id: "policy".to_string(),
+            text: "Always test.".to_string(),
+            scope: Some("m3-ctx".to_string()),
+            agent: "a".to_string(),
+        }))
+        .await
+        .expect("rule");
+        mcp.remember(Parameters(RememberArgs {
+            agent: "a".to_string(),
+            scope: "m3-ctx".to_string(),
+            role: "note".to_string(),
+            content: "a remembered fact".to_string(),
+            supersedes: None,
+        }))
+        .await
+        .expect("remember");
+
+        let ctx = mcp
+            .context(Parameters(ContextArgs {
+                scope: Some("m3-ctx".to_string()),
+                query: None,
+                budget_tokens: 3000,
+                limit: 50,
+            }))
+            .await
+            .expect("context");
+        let v = json_of(&ctx);
+        assert_eq!(v["scope"], "m3-ctx");
+        assert_eq!(v["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(v["memories"].as_array().unwrap().len(), 1);
+        assert!(v["budget"]["estimator"].is_string());
     }
 }
 

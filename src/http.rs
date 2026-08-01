@@ -79,6 +79,8 @@ pub fn router(store: SharedStore) -> Router {
     Router::new()
         .route("/v1/memory", post(remember))
         .route("/v1/memory/recall", get(recall))
+        // `:id` — axum 0.7 syntax (see the note on the rules route below).
+        .route("/v1/memory/:id", get(get_memory))
         .route("/v1/memory/search", get(search))
         .route("/v1/context", get(context))
         // Rules. DELETE maps to retire, which tombstones rather than erases —
@@ -166,6 +168,26 @@ async fn remember(State(store): State<SharedStore>, Json(body): Json<RememberBod
                 "check that the database is writable",
             ),
         },
+    }
+}
+
+/// `GET /v1/memory/:id` — drill-down by id, across the full history
+/// (superseded rows included): an id lookup answers "what is this row",
+/// not "what is true now".
+async fn get_memory(State(store): State<SharedStore>, Path(id): Path<String>) -> ApiResult {
+    let guard = store.lock().expect("store lock poisoned");
+    match guard.get(&id, Validity::All) {
+        Ok(Some(mem)) => ok("GET /v1/memory/:id", mem),
+        Ok(None) => err(
+            StatusCode::NOT_FOUND,
+            format!("no memory with id '{id}'"),
+            "GET /v1/memory/search or /v1/memory/recall to find ids",
+        ),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e,
+            "check that the database is readable",
+        ),
     }
 }
 
@@ -1004,6 +1026,47 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // --- M3: drill-down --------------------------------------------------
+
+    #[tokio::test]
+    async fn get_memory_by_id_finds_current_and_superseded_rows() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+
+        let (_, body) = send(
+            &app,
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({
+                    "agent": "a", "scope": "s", "content": "the original"
+                }),
+            ),
+        )
+        .await;
+        let a_id = parse(&body)["data"]["id"].as_str().expect("id").to_string();
+        send(
+            &app,
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({
+                    "agent": "b", "scope": "s", "content": "the replacement", "supersedes": a_id
+                }),
+            ),
+        )
+        .await;
+
+        // Drill-down reaches the superseded row too: id lookups answer
+        // "what is this row", not "what is true now".
+        let (status, body) = send(&app, get(&format!("/v1/memory/{a_id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        let v = parse(&body);
+        assert_eq!(v["data"]["content"], "the original");
+        assert!(v["data"]["superseded_by"].is_string());
+
+        let (status, _) = send(&app, get("/v1/memory/no-such-id")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
 

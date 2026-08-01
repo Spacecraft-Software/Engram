@@ -54,16 +54,6 @@ impl AppError {
         )
     }
 
-    #[expect(dead_code, reason = "wired at M3 when `get` surfaces a not-found path")]
-    pub fn not_found(what: &str) -> Self {
-        Self::new(
-            ErrorCode::NotFound,
-            3,
-            format!("{what} not found"),
-            "check the id with `engram memory list` first",
-        )
-    }
-
     /// Single-line JSON to stderr — PowerShell fragments multi-line stderr.
     pub fn emit_to_stderr(&self) {
         #[derive(Serialize)]
