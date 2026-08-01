@@ -57,6 +57,9 @@ one write path, one FTS index, no parallel table.
 engram rule add --id <kebab-id> [--scope S] [--agent A] [TEXT]   # stdin if TEXT omitted; upserts
 engram rule list [--scope S] [--include-retired]
 engram rule retire --id <kebab-id> [--scope S]                   # tombstone, not delete
+engram rule purge --id <kebab-id> --yes [--dry-run]              # delete a RETIRED rule (CLI-only)
+engram remember ... --supersedes <id>                            # close old validity window, record replacement
+engram recall --scope S --as-of <ISO8601> | --include-superseded # time travel / full history
 engram rule sync [--scope S] [--file PATH]... [--dry-run]
 ```
 

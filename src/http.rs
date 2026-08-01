@@ -6,7 +6,7 @@
 //! Add a Bearer token check before exposing this beyond localhost.
 
 use crate::output::envelope::Response;
-use crate::store::{RetireOutcome, Store};
+use crate::store::{RetireOutcome, Store, SupersedeOutcome, Validity};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -50,6 +50,31 @@ fn err(status: StatusCode, message: impl std::fmt::Display, hint: &str) -> ApiRe
     )
 }
 
+/// Maps the `as_of` / `include_superseded` query pair to a [`Validity`],
+/// answering 400 for the mutually-exclusive combination or a malformed
+/// timestamp.
+fn http_validity(as_of: Option<&str>, include_superseded: bool) -> Result<Validity<'_>, ApiResult> {
+    match (as_of, include_superseded) {
+        (Some(_), true) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "as_of and include_superseded are mutually exclusive",
+            "pass one or the other",
+        )),
+        (Some(t), false) => {
+            if t.parse::<jiff::Timestamp>().is_err() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("as_of '{t}' is not an ISO 8601 UTC timestamp"),
+                    "use the form 2026-08-01T12:00:00Z",
+                ));
+            }
+            Ok(Validity::AsOf(t))
+        }
+        (None, true) => Ok(Validity::All),
+        (None, false) => Ok(Validity::Current),
+    }
+}
+
 pub fn router(store: SharedStore) -> Router {
     Router::new()
         .route("/v1/memory", post(remember))
@@ -74,6 +99,9 @@ struct RememberBody {
     scope: String,
     #[serde(default = "default_role")]
     role: String,
+    /// Close this memory id's validity window (same scope) and record the
+    /// new memory as its replacement.
+    supersedes: Option<String>,
     content: String,
 }
 fn default_role() -> String {
@@ -89,13 +117,55 @@ async fn remember(State(store): State<SharedStore>, Json(body): Json<RememberBod
         );
     }
     let guard = store.lock().expect("store lock poisoned");
-    match guard.remember(&body.agent, &body.scope, &body.role, &body.content) {
-        Ok(mem) => ok("POST /v1/memory", mem),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            e,
-            "check that the database is writable",
-        ),
+    match &body.supersedes {
+        Some(target) => match guard.remember_superseding(
+            &body.agent,
+            &body.scope,
+            &body.role,
+            &body.content,
+            target,
+        ) {
+            Ok(result) => match result.outcome {
+                SupersedeOutcome::Superseded => ok("POST /v1/memory", result),
+                SupersedeOutcome::NotFound => err(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "no memory '{target}' in scope '{}' (supersession is scope-local)",
+                        body.scope
+                    ),
+                    "GET /v1/memory/recall?scope=... to list ids",
+                ),
+                SupersedeOutcome::TargetIsRule => err(
+                    StatusCode::BAD_REQUEST,
+                    format!("'{target}' is a rule; rules are never superseded here"),
+                    "use POST /v1/rules (revise) or DELETE /v1/rules/:rule_id (retire)",
+                ),
+                SupersedeOutcome::AlreadySuperseded => err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "'{target}' was already superseded by '{}'",
+                        result
+                            .superseded_by_existing
+                            .as_deref()
+                            .unwrap_or("unknown")
+                    ),
+                    "supersede the current winner instead",
+                ),
+            },
+            Err(e) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e,
+                "check that the database is writable",
+            ),
+        },
+        None => match guard.remember(&body.agent, &body.scope, &body.role, &body.content) {
+            Ok(mem) => ok("POST /v1/memory", mem),
+            Err(e) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e,
+                "check that the database is writable",
+            ),
+        },
     }
 }
 
@@ -107,14 +177,23 @@ struct RecallParams {
     /// Pack results to a token budget (chars/4 estimate); the envelope
     /// carries `metadata.budget` when set.
     budget_tokens: Option<u32>,
+    /// Time-travel: only memories valid at this ISO 8601 UTC instant.
+    as_of: Option<String>,
+    /// Include superseded memories — the full verbatim history.
+    #[serde(default)]
+    include_superseded: bool,
 }
 fn default_limit() -> u32 {
     50
 }
 
 async fn recall(State(store): State<SharedStore>, Query(q): Query<RecallParams>) -> ApiResult {
+    let validity = match http_validity(q.as_of.as_deref(), q.include_superseded) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let guard = store.lock().expect("store lock poisoned");
-    match guard.recall(&q.scope, q.limit) {
+    match guard.recall(&q.scope, q.limit, validity) {
         Ok(mems) => match q.budget_tokens {
             Some(budget) => {
                 let (mems, report) = crate::retrieval::budget_recall(mems, budget);
@@ -139,14 +218,23 @@ struct SearchParams {
     /// Pack results to a token budget (chars/4 estimate); the envelope
     /// carries `metadata.budget` when set.
     budget_tokens: Option<u32>,
+    /// Time-travel: only memories valid at this ISO 8601 UTC instant.
+    as_of: Option<String>,
+    /// Include superseded memories — the full verbatim history.
+    #[serde(default)]
+    include_superseded: bool,
 }
 fn default_search_limit() -> u32 {
     20
 }
 
 async fn search(State(store): State<SharedStore>, Query(q): Query<SearchParams>) -> ApiResult {
+    let validity = match http_validity(q.as_of.as_deref(), q.include_superseded) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let guard = store.lock().expect("store lock poisoned");
-    match guard.search(&q.query, q.scope.as_deref(), q.limit) {
+    match guard.search(&q.query, q.scope.as_deref(), q.limit, validity) {
         Ok(mems) => match q.budget_tokens {
             Some(budget) => {
                 let (mems, report) = crate::retrieval::budget_search(mems, budget);
@@ -821,6 +909,101 @@ mod tests {
             json["timestamp"].as_str().is_some_and(|t| t.ends_with('Z')),
             "timestamp must be ISO 8601 UTC: {json}"
         );
+    }
+
+    // --- M2: supersession + validity -------------------------------------
+
+    #[tokio::test]
+    async fn supersede_chain_outcomes_over_http() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+
+        let (_, body) = send(
+            &app,
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({
+                    "agent": "a", "scope": "s", "content": "old truth"
+                }),
+            ),
+        )
+        .await;
+        let a_id = parse(&body)["data"]["id"].as_str().expect("id").to_string();
+
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({
+                    "agent": "b", "scope": "s", "content": "new truth", "supersedes": a_id
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v = parse(&body);
+        assert_eq!(v["data"]["outcome"], "superseded");
+        let b_id = v["data"]["memory"]["id"]
+            .as_str()
+            .expect("new id")
+            .to_string();
+
+        let (_, body) = send(&app, get("/v1/memory/recall?scope=s")).await;
+        let ids: Vec<String> = parse(&body)["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec![b_id.clone()]);
+
+        let (_, body) = send(
+            &app,
+            get("/v1/memory/recall?scope=s&include_superseded=true"),
+        )
+        .await;
+        assert_eq!(parse(&body)["data"].as_array().unwrap().len(), 2);
+
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({
+                    "agent": "c", "scope": "s", "content": "competing", "supersedes": a_id
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains(&b_id), "409 body names the winner: {body}");
+
+        let (status, _) = send(
+            &app,
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({
+                    "agent": "c", "scope": "s", "content": "x", "supersedes": "nope"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn validity_params_validate_over_http() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+
+        let (status, _) = send(&app, get("/v1/memory/recall?scope=s&as_of=yesterday")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = send(
+            &app,
+            get("/v1/memory/recall?scope=s&as_of=2026-08-01T00:00:00Z&include_superseded=true"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
 

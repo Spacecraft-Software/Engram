@@ -38,6 +38,11 @@ pub struct RememberArgs {
     /// "user" | "assistant" | "system" | "note"
     #[serde(default = "default_role")]
     pub role: String,
+    /// Close this memory id's validity window (same scope) and record the
+    /// new memory as its replacement. The old row survives — recall it with
+    /// include_superseded or as_of.
+    #[serde(default)]
+    pub supersedes: Option<String>,
     pub content: String,
 }
 fn default_role() -> String {
@@ -54,6 +59,13 @@ pub struct RecallArgs {
     /// array.
     #[serde(default)]
     pub budget_tokens: Option<u32>,
+    /// Time-travel: only memories valid at this ISO 8601 UTC instant.
+    /// Mutually exclusive with include_superseded.
+    #[serde(default)]
+    pub as_of: Option<String>,
+    /// Include superseded memories — the full verbatim history.
+    #[serde(default)]
+    pub include_superseded: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -67,6 +79,13 @@ pub struct SearchArgs {
     /// array.
     #[serde(default)]
     pub budget_tokens: Option<u32>,
+    /// Time-travel: only memories valid at this ISO 8601 UTC instant.
+    /// Mutually exclusive with include_superseded.
+    #[serde(default)]
+    pub as_of: Option<String>,
+    /// Include superseded memories — the full verbatim history.
+    #[serde(default)]
+    pub include_superseded: Option<bool>,
 }
 fn default_limit() -> u32 {
     50
@@ -137,12 +156,52 @@ impl EngramMcp {
         Parameters(args): Parameters<RememberArgs>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().map_err(lock_err)?;
-        let mem = store
-            .remember(&args.agent, &args.scope, &args.role, &args.content)
-            .map_err(store_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&mem).unwrap_or_default(),
-        )]))
+        let text = match &args.supersedes {
+            Some(target) => {
+                let result = store
+                    .remember_superseding(
+                        &args.agent,
+                        &args.scope,
+                        &args.role,
+                        &args.content,
+                        target,
+                    )
+                    .map_err(store_err)?;
+                match result.outcome {
+                    crate::store::SupersedeOutcome::Superseded => {
+                        serde_json::to_string(&result).unwrap_or_default()
+                    }
+                    crate::store::SupersedeOutcome::NotFound => {
+                        return Err(McpError::invalid_params(
+                            format!("supersede target '{target}' not found in scope '{}' (supersession is scope-local)", args.scope),
+                            None,
+                        ))
+                    }
+                    crate::store::SupersedeOutcome::TargetIsRule => {
+                        return Err(McpError::invalid_params(
+                            format!("'{target}' is a rule; use rule_add/rule_retire instead"),
+                            None,
+                        ))
+                    }
+                    crate::store::SupersedeOutcome::AlreadySuperseded => {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "'{target}' was already superseded by '{}'",
+                                result.superseded_by_existing.as_deref().unwrap_or("unknown")
+                            ),
+                            None,
+                        ))
+                    }
+                }
+            }
+            None => {
+                let mem = store
+                    .remember(&args.agent, &args.scope, &args.role, &args.content)
+                    .map_err(store_err)?;
+                serde_json::to_string(&mem).unwrap_or_default()
+            }
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "Read back the last N memories for a scope, in chronological order.")]
@@ -150,8 +209,11 @@ impl EngramMcp {
         &self,
         Parameters(args): Parameters<RecallArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let validity = mcp_validity(args.as_of.as_deref(), args.include_superseded)?;
         let store = self.store.lock().map_err(lock_err)?;
-        let mems = store.recall(&args.scope, args.limit).map_err(store_err)?;
+        let mems = store
+            .recall(&args.scope, args.limit, validity)
+            .map_err(store_err)?;
         let text = match args.budget_tokens {
             Some(budget) => {
                 let (mems, report) = crate::retrieval::budget_recall(mems, budget);
@@ -170,9 +232,10 @@ impl EngramMcp {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let validity = mcp_validity(args.as_of.as_deref(), args.include_superseded)?;
         let store = self.store.lock().map_err(lock_err)?;
         let mems = store
-            .search(&args.query, args.scope.as_deref(), args.limit)
+            .search(&args.query, args.scope.as_deref(), args.limit, validity)
             .map_err(store_err)?;
         let text = match args.budget_tokens {
             Some(budget) => {
@@ -344,6 +407,34 @@ impl ServerHandler for EngramMcp {
             ),
             ..Default::default()
         }
+    }
+}
+
+/// Maps the `as_of` / `include_superseded` argument pair to a
+/// [`crate::store::Validity`], rejecting the combination and malformed
+/// timestamps as invalid params.
+fn mcp_validity(
+    as_of: Option<&str>,
+    include_superseded: Option<bool>,
+) -> Result<crate::store::Validity<'_>, McpError> {
+    match (as_of, include_superseded.unwrap_or(false)) {
+        (Some(_), true) => Err(McpError::invalid_params(
+            "as_of and include_superseded are mutually exclusive",
+            None,
+        )),
+        (Some(t), false) => {
+            t.parse::<jiff::Timestamp>().map_err(|_| {
+                McpError::invalid_params(
+                    format!(
+                        "as_of '{t}' is not an ISO 8601 UTC timestamp (e.g. 2026-08-01T12:00:00Z)"
+                    ),
+                    None,
+                )
+            })?;
+            Ok(crate::store::Validity::AsOf(t))
+        }
+        (None, true) => Ok(crate::store::Validity::All),
+        (None, false) => Ok(crate::store::Validity::Current),
     }
 }
 
@@ -534,6 +625,7 @@ mod tests {
                 scope: "mcp-test".to_string(),
                 role: "note".to_string(),
                 content: "the shuttle departs at dawn".to_string(),
+                supersedes: None,
             }))
             .await
             .expect("remember succeeds");
@@ -557,6 +649,7 @@ mod tests {
                 scope: "mcp-recall".to_string(),
                 role: "note".to_string(),
                 content: content.to_string(),
+                supersedes: None,
             }))
             .await
             .expect("remember succeeds");
@@ -567,6 +660,8 @@ mod tests {
                 scope: "mcp-recall".to_string(),
                 limit: 50,
                 budget_tokens: None,
+                as_of: None,
+                include_superseded: None,
             }))
             .await
             .expect("recall succeeds");
@@ -590,6 +685,7 @@ mod tests {
             scope: "mcp-search".to_string(),
             role: "note".to_string(),
             content: "the telemetry uplink stays synchronous".to_string(),
+            supersedes: None,
         }))
         .await
         .expect("remember succeeds");
@@ -600,6 +696,8 @@ mod tests {
                 scope: Some("mcp-search".to_string()),
                 limit: 20,
                 budget_tokens: None,
+                as_of: None,
+                include_superseded: None,
             }))
             .await
             .expect("search succeeds");
@@ -619,6 +717,7 @@ mod tests {
                 scope: "mcp-budget".to_string(),
                 role: "note".to_string(),
                 content: content.to_string(),
+                supersedes: None,
             }))
             .await
             .expect("remember succeeds");
@@ -632,6 +731,8 @@ mod tests {
                 limit: 50,
                 // Each 4-char memory estimates to 1 token; 2 fit.
                 budget_tokens: Some(2),
+                as_of: None,
+                include_superseded: None,
             }))
             .await
             .expect("recall succeeds");
@@ -661,6 +762,7 @@ mod tests {
                 scope: "mcp-search-budget".to_string(),
                 role: "note".to_string(),
                 content: content.to_string(),
+                supersedes: None,
             }))
             .await
             .expect("remember succeeds");
@@ -674,6 +776,8 @@ mod tests {
                 // The denser doc ranks first and costs 3 tokens; the longer
                 // one (10 tokens) must be dropped.
                 budget_tokens: Some(3),
+                as_of: None,
+                include_superseded: None,
             }))
             .await
             .expect("search succeeds");
@@ -802,6 +906,101 @@ mod tests {
         );
 
         server_task.abort();
+    }
+
+    // --- M2: supersession + validity -------------------------------------
+
+    #[tokio::test]
+    async fn supersedes_replaces_and_rejects_double_supersede() {
+        let (mcp, _dir) = test_mcp();
+        let first = mcp
+            .remember(Parameters(RememberArgs {
+                agent: "a".to_string(),
+                scope: "mcp-m2".to_string(),
+                role: "note".to_string(),
+                content: "old fact".to_string(),
+                supersedes: None,
+            }))
+            .await
+            .expect("remember");
+        let a_id = json_of(&first)["id"].as_str().expect("id").to_string();
+
+        let second = mcp
+            .remember(Parameters(RememberArgs {
+                agent: "b".to_string(),
+                scope: "mcp-m2".to_string(),
+                role: "note".to_string(),
+                content: "new fact".to_string(),
+                supersedes: Some(a_id.clone()),
+            }))
+            .await
+            .expect("supersede");
+        let v = json_of(&second);
+        assert_eq!(v["outcome"], "superseded");
+        assert_eq!(v["superseded_id"], a_id.as_str());
+
+        let err = mcp
+            .remember(Parameters(RememberArgs {
+                agent: "c".to_string(),
+                scope: "mcp-m2".to_string(),
+                role: "note".to_string(),
+                content: "competing".to_string(),
+                supersedes: Some(a_id),
+            }))
+            .await
+            .expect_err("double supersede is rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let current = mcp
+            .recall(Parameters(RecallArgs {
+                scope: "mcp-m2".to_string(),
+                limit: 10,
+                budget_tokens: None,
+                as_of: None,
+                include_superseded: None,
+            }))
+            .await
+            .expect("recall");
+        assert_eq!(json_of(&current).as_array().unwrap().len(), 1);
+        let all = mcp
+            .recall(Parameters(RecallArgs {
+                scope: "mcp-m2".to_string(),
+                limit: 10,
+                budget_tokens: None,
+                as_of: None,
+                include_superseded: Some(true),
+            }))
+            .await
+            .expect("recall all");
+        assert_eq!(json_of(&all).as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn as_of_is_validated_and_exclusive() {
+        let (mcp, _dir) = test_mcp();
+        let bad = mcp
+            .recall(Parameters(RecallArgs {
+                scope: "s".to_string(),
+                limit: 10,
+                budget_tokens: None,
+                as_of: Some("yesterday".to_string()),
+                include_superseded: None,
+            }))
+            .await
+            .expect_err("malformed as_of is rejected");
+        assert_eq!(bad.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let both = mcp
+            .recall(Parameters(RecallArgs {
+                scope: "s".to_string(),
+                limit: 10,
+                budget_tokens: None,
+                as_of: Some("2026-08-01T00:00:00Z".to_string()),
+                include_superseded: Some(true),
+            }))
+            .await
+            .expect_err("mutually exclusive pair is rejected");
+        assert_eq!(both.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 }
 

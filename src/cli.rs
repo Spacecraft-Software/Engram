@@ -59,6 +59,11 @@ pub enum Command {
         /// Validate and show what would be stored, without writing.
         #[arg(long)]
         dry_run: bool,
+        /// Close the validity window of this memory id (same scope) and
+        /// record the new memory as its replacement. The old row is never
+        /// deleted — recall it with --include-superseded or --as-of.
+        #[arg(long)]
+        supersedes: Option<String>,
         /// Message content. Reads stdin if omitted.
         content: Option<String>,
     },
@@ -72,6 +77,13 @@ pub enum Command {
         /// reports included/dropped.
         #[arg(long)]
         budget_tokens: Option<u32>,
+        /// Time-travel: show the memories that were valid at this ISO 8601
+        /// UTC instant (e.g. 2026-08-01T12:00:00Z).
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Include superseded memories — the full verbatim history.
+        #[arg(long, conflicts_with = "as_of")]
+        include_superseded: bool,
     },
     /// Full-text search across stored memories.
     Search {
@@ -84,6 +96,12 @@ pub enum Command {
         /// reports included/dropped.
         #[arg(long)]
         budget_tokens: Option<u32>,
+        /// Time-travel: search only memories valid at this ISO 8601 UTC instant.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Include superseded memories — the full verbatim history.
+        #[arg(long, conflicts_with = "as_of")]
+        include_superseded: bool,
     },
     /// Assemble a budget-packed context block for session start: active
     /// rules first (always included), then recency+relevance fused memories.
@@ -235,6 +253,35 @@ EXAMPLES:
         #[arg(long = "file")]
         files: Vec<std::path::PathBuf>,
         /// Report what would be written without touching any file.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Permanently delete a RETIRED rule's row (tombstones only).
+    ///
+    /// The one destructive command in engram, and deliberately CLI-only:
+    /// it exists on neither the MCP nor the HTTP surface, because
+    /// destructive operations are not agent-invocable. An active rule is
+    /// refused — retire it first.
+    #[command(after_help = "\
+EXAMPLES:
+  # Preview what would be deleted.
+  engram rule purge --id old-policy --dry-run
+
+  # Actually delete (a retired rule only; --yes is required).
+  engram rule purge --id old-policy --yes
+")]
+    Purge {
+        /// Id of the retired rule to delete permanently.
+        #[arg(long)]
+        id: String,
+        /// Scope to read. Defaults to the same cascade as `rule add`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Confirm the deletion. Required: this process may not have a TTY
+        /// to ask on, so consent must be explicit.
+        #[arg(long)]
+        yes: bool,
+        /// Report what would be deleted without touching the database.
         #[arg(long)]
         dry_run: bool,
     },

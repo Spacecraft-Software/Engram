@@ -109,6 +109,12 @@ engram rule sync
 
 # Withdraw one when it stops applying, then re-sync.
 engram rule retire --id skill-description-1000 && engram rule sync
+
+# Contradiction? Supersede instead of overwrite: the old row keeps its
+# history (valid_to + superseded_by), reads default to what is true now.
+engram remember --agent kimi --scope my-task --supersedes <old-id> "Correction: X is async."
+engram recall --scope my-task --as-of 2026-08-01T00:00:00Z   # time travel
+engram rule purge --id old-policy --yes                      # delete a retired rule (CLI-only)
 ```
 
 `sync` rewrites **only** the region between its sentinels:
@@ -210,7 +216,6 @@ storage failure. New routes should keep following that pattern.
   (no TUI yet). `json`, `jsonl`, and `csv` exist.
 - An MCP `context` tool — `context` is CLI + HTTP for now; the MCP tool lands
   at M3 (the MCP `recall`/`search` tools do accept `budget_tokens` already).
-- Purging a retired rule. Tombstones accumulate; there is no `rule purge`.
 - Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
   writes files.
 - Semantic (embedding) search — the upgrade path is `sqlite-vec` as a

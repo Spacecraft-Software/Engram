@@ -8,7 +8,7 @@
 @settitle Engram Manual
 @c %**end of header
 
-@set VERSION 0.2.0-dev
+@set VERSION 0.2.0
 @set UPDATED 2026-08-01
 
 @copying
@@ -194,7 +194,7 @@ Human mode therefore requires a real TTY on stdout.
 Every machine-mode response is wrapped in an envelope:
 
 @verbatim
-{"metadata":{"tool":"engram","version":"0.2.0-dev","command":"recall",
+{"metadata":{"tool":"engram","version":"0.2.0","command":"recall",
              "timestamp":"2026-08-01T00:00:00Z"},
  "data":...}
 @end verbatim
@@ -244,6 +244,8 @@ Internal or storage error.
 Invalid argument.
 @item 3
 Not found.
+@item 5
+Conflict --- the supersede target was already superseded.
 @end table
 
 @section engram remember
@@ -252,7 +254,7 @@ Not found.
 @cindex storing a memory
 
 @example
-engram remember --agent @var{name} --scope @var{id} [--role @var{role}] [--dry-run] [@var{content}]
+engram remember --agent @var{name} --scope @var{id} [--role @var{role}] [--supersedes @var{id}] [--dry-run] [@var{content}]
 @end example
 
 Store a verbatim message.  When @var{content} is omitted, it is read
@@ -264,16 +266,36 @@ With @code{--dry-run}, the message is validated and the would-be record
 shown, without writing anything; the machine envelope carries
 @code{"dry_run": true}.
 
+@cindex supersession
+@cindex bi-temporal validity
+With @code{--supersedes @var{id}}, the new memory replaces an earlier
+one in the @emph{same scope}: in one transaction the target's validity
+window is closed (@code{valid_to} set to the new record's timestamp,
+@code{superseded_by} set to its id) and the replacement is stored.
+Nothing is ever deleted --- reads simply default to currently-valid
+rows.  Outcomes: an unknown or cross-scope target exits 3; a rule
+target exits 2 (rules have their own lifecycle); an already-superseded
+target exits 5 with a @code{CONFLICT} error naming the winner.
+
 @section engram recall
 
 @cindex recall command
 
 @example
-engram recall --scope @var{id} [--limit @var{n}] [--budget-tokens @var{n}]
+engram recall --scope @var{id} [--limit @var{n}] [--budget-tokens @var{n}] [--as-of @var{instant} | --include-superseded]
 @end example
 
 Read back the last @var{n} messages for a scope, in chronological
 order.  @code{--limit} defaults to 50.
+
+@cindex time travel
+@cindex as-of queries
+By default only currently-valid memories are returned (superseded rows
+are hidden).  @code{--as-of @var{instant}} (ISO 8601 UTC, e.g.@:
+@code{2026-08-01T12:00:00Z}) time-travels to the memories that were
+valid at that instant; @code{--include-superseded} returns the full
+verbatim history.  The two are mutually exclusive.  @command{engram
+search} accepts the same pair.
 
 @cindex budget, token
 @cindex token budget
@@ -383,6 +405,23 @@ engram rule retire --id @var{kebab-id} [--scope @var{id}]
 Withdraw a rule so it stops being binding.  The rule is tombstoned, not
 deleted (@pxref{Rules}).  Retiring an unknown id is an error (exit
 code 3).
+
+@subsection rule purge
+
+@cindex purge, rule
+@cindex deleting a rule
+
+@example
+engram rule purge --id @var{kebab-id} [--scope @var{id}] --yes [--dry-run]
+@end example
+
+Permanently delete a @emph{retired} rule's row --- the one true delete
+in Engram, and deliberately CLI-only: it exists on neither the MCP nor
+the HTTP surface, because destructive operations are not
+agent-invocable.  An active rule is refused (exit 2; retire it first),
+an unknown id exits 3, and without @code{--yes} nothing is deleted
+(the process may not have a TTY to ask on, so consent must be
+explicit).  @code{--dry-run} previews the deletion.
 
 @subsection rule sync
 
@@ -535,13 +574,22 @@ responses carry the same metadata envelope as the CLI's machine mode.
 @item POST /v1/memory
 @cindex POST /v1/memory
 Store a memory.  Body: @code{@{"agent": @dots{}, "scope": @dots{},
-"content": @dots{}@}} (optional @code{role}).  Returns @code{400} if
-@code{content} is empty or whitespace-only, @code{200} with the stored
-Memory in the envelope on success, @code{500} on a storage error.
+"content": @dots{}@}} (optional @code{role}, optional
+@code{supersedes}).  Returns @code{400} if @code{content} is empty or
+whitespace-only, @code{200} with the stored Memory in the envelope on
+success, @code{500} on a storage error.  With @code{supersedes}: the
+target's validity window is closed in the same transaction; @code{404}
+for an unknown or cross-scope target, @code{400} for a rule target,
+and @code{409 Conflict} when the target was already superseded (the
+message names the winning id).
 
-@item GET /v1/memory/recall?scope=&limit=&budget_tokens=
+@item GET /v1/memory/recall?scope=&limit=&budget_tokens=&as_of=&include_superseded=
 @cindex GET /v1/memory/recall
-Fetch the last N memories for a scope, chronological order.  With
+Fetch the last N memories for a scope, chronological order.  Reads
+default to currently-valid rows; @code{as_of} (ISO 8601 UTC)
+time-travels and @code{include_superseded=true} shows the full history
+(@code{400} if the pair is combined or the instant is malformed ---
+@code{search} accepts the same parameters).  With
 @code{budget_tokens}, results are packed to the token budget
 (newest-first priority, chronological output) and the envelope carries
 @code{metadata.budget} --- the same behavior as

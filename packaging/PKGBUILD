@@ -7,7 +7,7 @@
 
 pkgname=engram
 # PKGBUILD forbids hyphens in pkgver; 0.2.0-dev is spelled 0.2.0.dev.
-pkgver=0.2.0.dev
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Shared verbatim chat memory for multi-model LLM pipelines (SQLite FTS5; CLI, MCP, HTTP)"
 arch=('x86_64' 'aarch64')

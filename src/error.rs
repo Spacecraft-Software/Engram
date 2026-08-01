@@ -10,10 +10,6 @@ use serde::Serialize;
 pub enum ErrorCode {
     NotFound,
     InvalidArgument,
-    #[expect(
-        dead_code,
-        reason = "emitted by M2 supersession (already-superseded targets)"
-    )]
     Conflict,
     InternalError,
     StorageError,
@@ -58,7 +54,7 @@ impl AppError {
         )
     }
 
-    #[expect(dead_code, reason = "used by M2 supersession error paths")]
+    #[expect(dead_code, reason = "wired at M3 when `get` surfaces a not-found path")]
     pub fn not_found(what: &str) -> Self {
         Self::new(
             ErrorCode::NotFound,

@@ -29,6 +29,82 @@ pub struct Memory {
     /// and never edited, so they carry only `created_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// Bi-temporal validity start. `created_at` is transaction time (when the
+    /// row was written); `valid_from`/`valid_to` bound when the statement was
+    /// *true*. `None` means "since `created_at`" — queries use
+    /// `COALESCE(valid_from, created_at)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// Bi-temporal validity end. `None` means currently valid — which is how
+    /// every row written before supersession existed stays valid by
+    /// construction. Set (to the superseding write's timestamp) when the
+    /// memory has been superseded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Id of the memory that superseded this one. Set together with
+    /// `valid_to` by [`Store::remember_superseding`], never independently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+}
+
+/// Which slice of the bi-temporal history a read should see.
+///
+/// `status` (the rules lifecycle column) is a separate axis entirely:
+/// supersession never touches it, and this filter never reads it.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Validity<'a> {
+    /// Only currently valid rows (`valid_to IS NULL`) — the default view.
+    #[default]
+    Current,
+    /// Rows that were valid at the given ISO 8601 UTC instant: time travel
+    /// over the validity dimension.
+    AsOf(&'a str),
+    /// Every row, superseded or not — the full verbatim history.
+    All,
+}
+
+/// Outcome of a [`Store::remember_superseding`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupersedeOutcome {
+    /// The target's validity window was closed and the new memory recorded.
+    Superseded,
+    /// No memory with that id exists in the caller's scope. Supersession is
+    /// scope-local, so a target in another scope also reports this.
+    NotFound,
+    /// The target is a rule row. Rules have their own lifecycle
+    /// (`rule add` / `rule retire`) and are never superseded through here.
+    TargetIsRule,
+    /// The target was already superseded; nothing was written.
+    AlreadySuperseded,
+}
+
+/// Result of a superseding write, mirroring the [`RuleRetire`] outcome shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct SupersedeResult {
+    pub outcome: SupersedeOutcome,
+    /// The newly stored memory — present only on [`SupersedeOutcome::Superseded`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+    /// Id of the memory whose validity window was closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_id: Option<String>,
+    /// On [`SupersedeOutcome::AlreadySuperseded`]: the id that already
+    /// superseded the target, so the caller can name the winner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by_existing: Option<String>,
+}
+
+/// Outcome of a [`Store::rule_purge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PurgeOutcome {
+    /// The retired rule's row (and its FTS entry) was permanently deleted.
+    Purged,
+    /// The rule exists but is still active; retire it first.
+    NotRetired,
+    /// No rule with this id exists in this scope.
+    NotFound,
 }
 
 /// A durable project rule — the read model over rule-shaped `memories` rows.
@@ -177,6 +253,9 @@ impl Store {
             created_at: crate::time::now_iso8601(),
             rule_id: None,
             updated_at: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
         };
         self.conn.execute(
             "INSERT INTO memories (id, agent, scope, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -185,47 +264,177 @@ impl Store {
         Ok(mem)
     }
 
+    /// Stores a new memory and closes the validity window of the memory it
+    /// contradicts, in one transaction.
+    ///
+    /// Supersession is **scope-local**: the target is looked up by
+    /// `(id, scope)`, so a target living in another scope reports
+    /// [`SupersedeOutcome::NotFound`] — contradiction resolution never crosses
+    /// scope boundaries. Rules are rejected ([`SupersedeOutcome::TargetIsRule`]);
+    /// they have their own lifecycle (`rule add` / `rule retire`). A target
+    /// whose window is already closed reports
+    /// [`SupersedeOutcome::AlreadySuperseded`] and names the existing winner.
+    /// On every non-`Superseded` outcome nothing is written.
+    ///
+    /// One timestamp serves both sides — the new row's `created_at` and the
+    /// target's `valid_to` — so the chain has no gap and no overlap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the transaction fails.
+    pub fn remember_superseding(
+        &self,
+        agent: &str,
+        scope: &str,
+        role: &str,
+        content: &str,
+        supersedes: &str,
+    ) -> rusqlite::Result<SupersedeResult> {
+        // Read-then-write, so wrap both in a transaction (mirroring
+        // `rule_add`): two processes sharing the file must not race between
+        // the target check and the paired INSERT+UPDATE.
+        let tx = self.conn.unchecked_transaction()?;
+
+        let target: Option<(Option<String>, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT rule_id, valid_to, superseded_by FROM memories WHERE id = ?1 AND scope = ?2",
+                params![supersedes, scope],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+
+        // Dropping `tx` on the early returns rolls back, but nothing was
+        // written on those paths anyway.
+        let Some((rule_id, valid_to, superseded_by)) = target else {
+            return Ok(SupersedeResult {
+                outcome: SupersedeOutcome::NotFound,
+                memory: None,
+                superseded_id: None,
+                superseded_by_existing: None,
+            });
+        };
+        if rule_id.is_some() {
+            return Ok(SupersedeResult {
+                outcome: SupersedeOutcome::TargetIsRule,
+                memory: None,
+                superseded_id: None,
+                superseded_by_existing: None,
+            });
+        }
+        if valid_to.is_some() {
+            return Ok(SupersedeResult {
+                outcome: SupersedeOutcome::AlreadySuperseded,
+                memory: None,
+                superseded_id: None,
+                superseded_by_existing: superseded_by,
+            });
+        }
+
+        // One `now` for both sides: the target's window closes exactly where
+        // the replacement's record begins.
+        let now = crate::time::now_iso8601();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent: agent.to_string(),
+            scope: scope.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: now.clone(),
+            rule_id: None,
+            updated_at: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+        };
+        tx.execute(
+            "INSERT INTO memories (id, agent, scope, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![mem.id, mem.agent, mem.scope, mem.role, mem.content, mem.created_at],
+        )?;
+        tx.execute(
+            "UPDATE memories SET valid_to = ?1, superseded_by = ?2 WHERE id = ?3",
+            params![now, mem.id, supersedes],
+        )?;
+        tx.commit()?;
+
+        Ok(SupersedeResult {
+            outcome: SupersedeOutcome::Superseded,
+            memory: Some(mem),
+            superseded_id: Some(supersedes.to_string()),
+            superseded_by_existing: None,
+        })
+    }
+
     /// Most recent memories in a scope, oldest last-N, chronological order.
     ///
     /// Rules are stored in this same table and are returned here alongside
     /// messages — recalling a scope should surface the policy that governs it.
-    /// Use [`Store::rules`] when only rules are wanted.
-    pub fn recall(&self, scope: &str, limit: u32) -> rusqlite::Result<Vec<Memory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, agent, scope, role, content, created_at, rule_id, updated_at FROM memories
-             WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![scope, limit], row_to_memory)?;
+    /// Use [`Store::rules`] when only rules are wanted. `validity` selects
+    /// which slice of the bi-temporal history is visible.
+    pub fn recall(
+        &self,
+        scope: &str,
+        limit: u32,
+        validity: Validity<'_>,
+    ) -> rusqlite::Result<Vec<Memory>> {
+        let (clause, as_of) = validity_filter(validity, "", 3);
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories
+             WHERE scope = ?1 {clause} ORDER BY created_at DESC LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&scope, &limit];
+        if let Some(t) = as_of.as_ref() {
+            bind.push(t);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), row_to_memory)?;
         let mut out: Vec<Memory> = rows.collect::<Result<_, _>>()?;
         out.reverse(); // chronological for reading back into a prompt
         Ok(out)
     }
 
     /// Full-text search across all scopes, or restricted to one scope.
+    /// `validity` selects which slice of the bi-temporal history is visible.
     pub fn search(
         &self,
         query: &str,
         scope: Option<&str>,
         limit: u32,
+        validity: Validity<'_>,
     ) -> rusqlite::Result<Vec<Memory>> {
         let query = &sanitize_fts_query(query);
+        // The validity columns live on the memories side of the FTS join,
+        // hence the `m.` qualifier.
+        let (clause, as_of) = validity_filter(validity, "m.", if scope.is_some() { 4 } else { 3 });
         let sql = if scope.is_some() {
-            "SELECT m.id, m.agent, m.scope, m.role, m.content, m.created_at, m.rule_id, m.updated_at
-             FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
-             WHERE memories_fts MATCH ?1 AND m.scope = ?2
-             ORDER BY rank LIMIT ?3"
+            format!(
+                "SELECT {MEMORY_COLUMNS_M} FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
+                 WHERE memories_fts MATCH ?1 AND m.scope = ?2 {clause}
+                 ORDER BY rank LIMIT ?3"
+            )
         } else {
-            "SELECT m.id, m.agent, m.scope, m.role, m.content, m.created_at, m.rule_id, m.updated_at
-             FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
-             WHERE memories_fts MATCH ?1
-             ORDER BY rank LIMIT ?2"
+            format!(
+                "SELECT {MEMORY_COLUMNS_M} FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
+                 WHERE memories_fts MATCH ?1 {clause}
+                 ORDER BY rank LIMIT ?2"
+            )
         };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = if let Some(s) = scope {
-            stmt.query_map(params![query, s, limit], row_to_memory)?
-        } else {
-            stmt.query_map(params![query, limit], row_to_memory)?
-        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![query];
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        bind.push(&limit);
+        if let Some(t) = as_of.as_ref() {
+            bind.push(t);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), row_to_memory)?;
         rows.collect()
     }
 
@@ -268,15 +477,17 @@ impl Store {
 
         // Rule rows live in the same table and come back from both recall
         // and search; they are already in the rules section, so they are not
-        // memory candidates.
+        // memory candidates. Both channels read `Validity::Current`: a
+        // session-start context block asserts what is true now, and a
+        // superseded memory is by definition no longer that.
         let recency: Vec<Memory> = self
-            .recall(scope, limit)?
+            .recall(scope, limit, Validity::Current)?
             .into_iter()
             .filter(|m| m.rule_id.is_none())
             .collect();
         let relevance: Vec<Memory> = match query {
             Some(q) => self
-                .search(q, Some(scope), limit)?
+                .search(q, Some(scope), limit, Validity::Current)?
                 .into_iter()
                 .filter(|m| m.rule_id.is_none())
                 .collect(),
@@ -365,15 +576,23 @@ impl Store {
             reason = "wired into the surfaces at M3 (MCP `get` tool, GET /v1/memory/:id)"
         )
     )]
-    pub fn get(&self, id: &str) -> rusqlite::Result<Option<Memory>> {
+    pub fn get(&self, id: &str, validity: Validity<'_>) -> rusqlite::Result<Option<Memory>> {
+        let (clause, as_of) = validity_filter(validity, "", 2);
+        let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1 {clause}");
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&id];
+        if let Some(t) = as_of.as_ref() {
+            bind.push(t);
+        }
         self.conn
-            .query_row(
-                "SELECT id, agent, scope, role, content, created_at, rule_id, updated_at FROM memories WHERE id = ?1",
-                params![id],
-                row_to_memory,
-            )
+            .query_row(&sql, rusqlite::params_from_iter(bind), row_to_memory)
             .map(Some)
-            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })
     }
 
     /// Creates a rule, or updates the existing rule with the same
@@ -521,6 +740,44 @@ impl Store {
         })
     }
 
+    /// Permanently deletes a **retired** rule's row.
+    ///
+    /// The one true delete in the store, and it only reaches tombstones: an
+    /// active rule is refused (`NotRetired` — retire it first), and ordinary
+    /// messages are unreachable here by construction. The `memories_ad`
+    /// trigger scrubs the FTS index entry. Deliberately CLI-only at the
+    /// surfaces: destructive operations are not agent-invocable.
+    pub fn rule_purge(&self, scope: &str, rule_id: &str) -> rusqlite::Result<PurgeOutcome> {
+        let tx = self.conn.unchecked_transaction()?;
+        let status: Option<Option<String>> = tx
+            .query_row(
+                "SELECT status FROM memories WHERE scope = ?1 AND rule_id = ?2",
+                params![scope, rule_id],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        let outcome = match status {
+            None => PurgeOutcome::NotFound,
+            Some(s) if s.as_deref() == Some(crate::rules::STATUS_RETIRED) => {
+                tx.execute(
+                    "DELETE FROM memories WHERE scope = ?1 AND rule_id = ?2 AND status = ?3",
+                    params![scope, rule_id, crate::rules::STATUS_RETIRED],
+                )?;
+                PurgeOutcome::Purged
+            }
+            Some(_) => PurgeOutcome::NotRetired,
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
     /// Active rules for a scope, ordered by `rule_id`.
     ///
     /// The ordering is by id rather than by time so that [`crate::rules::render_block`]
@@ -589,6 +846,19 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "status") {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN status TEXT;")?;
     }
+    // Bi-temporal validity (M2). All nullable: NULL valid_to == currently
+    // valid, so every pre-existing row is valid by construction; NULL
+    // valid_from reads as created_at via COALESCE. `status` above remains
+    // exclusively the rules lifecycle column — supersession never touches it.
+    if !columns.iter().any(|c| c == "valid_from") {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN valid_from TEXT;")?;
+    }
+    if !columns.iter().any(|c| c == "valid_to") {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN valid_to TEXT;")?;
+    }
+    if !columns.iter().any(|c| c == "superseded_by") {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
+    }
     // Partial index: enforces one rule per (scope, rule_id) without constraining
     // ordinary messages, which all have a NULL rule_id.
     conn.execute_batch(
@@ -619,6 +889,35 @@ fn sanitize_fts_query(raw: &str) -> String {
         .join(" ")
 }
 
+/// The full `memories` column list every read shares, in [`row_to_memory`]
+/// order. One definition so a future column lands everywhere at once.
+const MEMORY_COLUMNS: &str =
+    "id, agent, scope, role, content, created_at, rule_id, updated_at, valid_from, valid_to, superseded_by";
+
+/// [`MEMORY_COLUMNS`] with the `m.` qualifier for the FTS join.
+const MEMORY_COLUMNS_M: &str =
+    "m.id, m.agent, m.scope, m.role, m.content, m.created_at, m.rule_id, m.updated_at, m.valid_from, m.valid_to, m.superseded_by";
+
+/// SQL fragment + optional bind value for a [`Validity`] filter.
+///
+/// `prefix` qualifies the columns (`"m."` on the FTS join); `param` is the
+/// 1-based numbered placeholder the `AsOf` instant binds to. The placeholder
+/// appears twice in the clause — SQLite binds both occurrences to the same
+/// value, which is why numbered (not anonymous) parameters are used here.
+fn validity_filter(validity: Validity<'_>, prefix: &str, param: usize) -> (String, Option<String>) {
+    match validity {
+        Validity::Current => (format!("AND {prefix}valid_to IS NULL"), None),
+        Validity::AsOf(t) => (
+            format!(
+                "AND COALESCE({prefix}valid_from, {prefix}created_at) <= ?{param} \
+                 AND ({prefix}valid_to IS NULL OR {prefix}valid_to > ?{param})"
+            ),
+            Some(t.to_string()),
+        ),
+        Validity::All => (String::new(), None),
+    }
+}
+
 fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     Ok(Memory {
         id: row.get(0)?,
@@ -629,6 +928,9 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         created_at: row.get(5)?,
         rule_id: row.get(6)?,
         updated_at: row.get(7)?,
+        valid_from: row.get(8)?,
+        valid_to: row.get(9)?,
+        superseded_by: row.get(10)?,
     })
 }
 
@@ -670,6 +972,29 @@ mod tests {
         let columns = table_columns(&store.conn, "memories").expect("columns");
         assert!(columns.iter().any(|c| c == "rule_id"));
         assert!(columns.iter().any(|c| c == "updated_at"));
+        // M2 bi-temporal columns arrive through the same migration path.
+        assert!(columns.iter().any(|c| c == "valid_from"));
+        assert!(columns.iter().any(|c| c == "valid_to"));
+        assert!(columns.iter().any(|c| c == "superseded_by"));
+    }
+
+    #[test]
+    fn legacy_rows_recall_as_currently_valid_after_migration() {
+        // A row written before the bi-temporal columns existed has NULL in
+        // all three — which must read as "currently valid".
+        let store = store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO memories (id, agent, scope, role, content, created_at)
+                 VALUES ('legacy-1', 'old-agent', 'demo', 'note', 'Pre-M2 row.', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert legacy row");
+        let current = store.recall("demo", 10, Validity::Current).expect("recall");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, "legacy-1");
+        assert!(current[0].valid_to.is_none());
     }
 
     #[test]
@@ -728,6 +1053,10 @@ mod tests {
             !json.contains("rule_id"),
             "plain memories must serialize exactly as before"
         );
+        // The bi-temporal keys are equally absent on a plain row.
+        assert!(!json.contains("valid_from"));
+        assert!(!json.contains("valid_to"));
+        assert!(!json.contains("superseded_by"));
     }
 
     #[test]
@@ -816,7 +1145,7 @@ mod tests {
             .rule_add("claude-code", "demo", "no-panics", "No panics.")
             .expect("add");
 
-        let recalled = store.recall("demo", 50).expect("recall");
+        let recalled = store.recall("demo", 50, Validity::Current).expect("recall");
         assert_eq!(recalled.len(), 2);
         assert!(recalled.iter().any(|m| m.role == crate::rules::ROLE));
     }
@@ -858,7 +1187,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
 
-        let all = store.recall("demo", 50).expect("recall");
+        let all = store.recall("demo", 50, Validity::Current).expect("recall");
         let contents: Vec<_> = all.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             contents,
@@ -871,7 +1200,9 @@ mod tests {
             ]
         );
 
-        let last3 = store.recall("demo", 3).expect("recall limited");
+        let last3 = store
+            .recall("demo", 3, Validity::Current)
+            .expect("recall limited");
         let contents: Vec<_> = last3.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             contents,
@@ -883,7 +1214,10 @@ mod tests {
     #[test]
     fn recall_of_an_empty_scope_is_empty_not_an_error() {
         let store = Store::open_in_memory().expect("open");
-        assert!(store.recall("nothing-here", 10).expect("recall").is_empty());
+        assert!(store
+            .recall("nothing-here", 10, Validity::Current)
+            .expect("recall")
+            .is_empty());
     }
 
     #[test]
@@ -906,7 +1240,9 @@ mod tests {
             .remember("a", "s3", "note", "no match here at all")
             .expect("remember");
 
-        let across = store.search("alpha", None, 10).expect("search all scopes");
+        let across = store
+            .search("alpha", None, 10, Validity::Current)
+            .expect("search all scopes");
         assert_eq!(across.len(), 2, "scope=None must search every scope");
         assert_eq!(
             across[0].scope, "s1",
@@ -915,14 +1251,14 @@ mod tests {
         assert_eq!(across[1].scope, "s2");
 
         let scoped = store
-            .search("alpha", Some("s2"), 10)
+            .search("alpha", Some("s2"), 10, Validity::Current)
             .expect("search one scope");
         assert_eq!(scoped.len(), 1, "scope=Some must filter to that scope");
         assert_eq!(scoped[0].scope, "s2");
 
         assert_eq!(
             store
-                .search("alpha", None, 1)
+                .search("alpha", None, 1, Validity::Current)
                 .expect("search limited")
                 .len(),
             1
@@ -947,9 +1283,11 @@ mod tests {
                 .expect("remember");
             // Query with the raw adversarial text itself: sanitize_fts_query must
             // keep FTS5 from reading any of it as query syntax.
-            let hits = store.search(content, Some(&scope), 10).unwrap_or_else(|e| {
-                panic!("query {content:?} must not be an FTS5 syntax error: {e}")
-            });
+            let hits = store
+                .search(content, Some(&scope), 10, Validity::Current)
+                .unwrap_or_else(|e| {
+                    panic!("query {content:?} must not be an FTS5 syntax error: {e}")
+                });
             assert_eq!(hits.len(), 1, "query {content:?} should find its own row");
             assert_eq!(hits[0].content, *content);
         }
@@ -964,7 +1302,7 @@ mod tests {
         store
             .remember("a", "demo", "note", "content")
             .expect("remember");
-        assert!(store.search("", None, 10).is_err());
+        assert!(store.search("", None, 10, Validity::Current).is_err());
     }
 
     #[test]
@@ -974,12 +1312,15 @@ mod tests {
             .remember("a", "demo", "note", "findable")
             .expect("remember");
         let found = store
-            .get(&mem.id)
+            .get(&mem.id, Validity::Current)
             .expect("get")
             .expect("known id must be Some");
         assert_eq!(found.id, mem.id);
         assert_eq!(found.content, "findable");
-        assert!(store.get("no-such-id").expect("get unknown").is_none());
+        assert!(store
+            .get("no-such-id", Validity::Current)
+            .expect("get unknown")
+            .is_none());
     }
 
     #[test]
@@ -992,7 +1333,11 @@ mod tests {
             .expect("remember multibyte");
         assert_eq!(mem.content, multibyte);
         assert_eq!(
-            store.get(&mem.id).expect("get").expect("row").content,
+            store
+                .get(&mem.id, Validity::Current)
+                .expect("get")
+                .expect("row")
+                .content,
             multibyte
         );
 
@@ -1001,7 +1346,14 @@ mod tests {
         let mem = store
             .remember("a", "demo", "note", &big)
             .expect("remember 10 KiB");
-        assert_eq!(store.get(&mem.id).expect("get").expect("row").content, big);
+        assert_eq!(
+            store
+                .get(&mem.id, Validity::Current)
+                .expect("get")
+                .expect("row")
+                .content,
+            big
+        );
     }
 
     // ---- Context-assembly tests -----------------------------------------
@@ -1147,5 +1499,183 @@ mod tests {
         assert_eq!(ctx.memories.len(), 1);
         assert_eq!(ctx.memories[0].content, "an ordinary message");
         assert_eq!(ctx.budget.channels[&"rules"], 1);
+    }
+
+    #[test]
+    fn supersession_chain_supports_time_travel() {
+        let store = Store::open_in_memory().expect("open");
+        let a = store
+            .remember("claude-code", "demo", "note", "shared-term version one")
+            .expect("remember A");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let t1 = crate::time::now_iso8601();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let b = store
+            .remember_superseding("codex", "demo", "note", "shared-term version two", &a.id)
+            .expect("supersede A");
+        let b_mem = b.memory.expect("B stored");
+        assert!(matches!(b.outcome, SupersedeOutcome::Superseded));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let t2 = crate::time::now_iso8601();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let c = store
+            .remember_superseding(
+                "kimi",
+                "demo",
+                "note",
+                "shared-term version three",
+                &b_mem.id,
+            )
+            .expect("supersede B");
+        let c_mem = c.memory.expect("C stored");
+
+        // Current view: only C.
+        let current = store
+            .recall("demo", 10, Validity::Current)
+            .expect("recall current");
+        assert_eq!(
+            current.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![c_mem.id.as_str()]
+        );
+
+        // Time travel: A at t1, B at t2.
+        let at_t1 = store
+            .recall("demo", 10, Validity::AsOf(&t1))
+            .expect("as-of t1");
+        assert_eq!(
+            at_t1.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![a.id.as_str()]
+        );
+        let at_t2 = store
+            .recall("demo", 10, Validity::AsOf(&t2))
+            .expect("as-of t2");
+        assert_eq!(
+            at_t2.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![b_mem.id.as_str()]
+        );
+
+        // Full history: all three, chronological.
+        let all = store.recall("demo", 10, Validity::All).expect("recall all");
+        assert_eq!(all.len(), 3);
+
+        // The chain has no gap: A's window closes exactly where B begins.
+        let a_row = store
+            .get(&a.id, Validity::All)
+            .expect("get")
+            .expect("A exists");
+        assert_eq!(a_row.superseded_by.as_deref(), Some(b_mem.id.as_str()));
+        assert_eq!(a_row.valid_to.as_deref(), Some(b_mem.created_at.as_str()));
+
+        // Search respects the same filter.
+        let hits = store
+            .search("shared-term", Some("demo"), 10, Validity::Current)
+            .expect("search current");
+        assert_eq!(
+            hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![c_mem.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn supersede_guards_reject_bad_targets_without_writing() {
+        let store = Store::open_in_memory().expect("open");
+        let a = store
+            .remember("claude-code", "demo", "note", "the fact")
+            .expect("remember");
+        store
+            .rule_add("claude-code", "demo", "some-rule", "Policy.")
+            .expect("rule");
+        let count = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .expect("count")
+        };
+        let before = count(&store);
+
+        // Unknown id, and a real id in the wrong scope, both report NotFound.
+        let missing = store
+            .remember_superseding("x", "demo", "note", "new", "no-such-id")
+            .expect("call");
+        assert!(matches!(missing.outcome, SupersedeOutcome::NotFound));
+        let wrong_scope = store
+            .remember_superseding("x", "other-scope", "note", "new", &a.id)
+            .expect("call");
+        assert!(matches!(wrong_scope.outcome, SupersedeOutcome::NotFound));
+
+        // A rule row is never superseded through here.
+        let rule_row_id: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE rule_id = 'some-rule'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rule row id");
+        let rule_target = store
+            .remember_superseding("x", "demo", "note", "new", &rule_row_id)
+            .expect("call");
+        assert!(matches!(
+            rule_target.outcome,
+            SupersedeOutcome::TargetIsRule
+        ));
+
+        // Double supersede: second attempt names the winner and writes nothing.
+        let b = store
+            .remember_superseding("x", "demo", "note", "replacement", &a.id)
+            .expect("supersede");
+        let b_id = b.memory.expect("stored").id;
+        let after_valid = count(&store);
+        let dup = store
+            .remember_superseding("x", "demo", "note", "competing replacement", &a.id)
+            .expect("call");
+        assert!(matches!(dup.outcome, SupersedeOutcome::AlreadySuperseded));
+        assert_eq!(dup.superseded_by_existing.as_deref(), Some(b_id.as_str()));
+
+        // Failure outcomes inserted nothing.
+        assert_eq!(count(&store), after_valid);
+        assert_eq!(after_valid, before + 1); // only B was ever added
+    }
+
+    #[test]
+    fn rule_purge_deletes_tombstones_only() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .rule_add(
+                "a",
+                "demo",
+                "doomed",
+                "Temporary policy with searchable-marker.",
+            )
+            .expect("add");
+
+        // Active rule: refused.
+        assert_eq!(
+            store.rule_purge("demo", "doomed").expect("purge"),
+            PurgeOutcome::NotRetired
+        );
+        // Unknown rule: reported as such.
+        assert_eq!(
+            store.rule_purge("demo", "ghost").expect("purge"),
+            PurgeOutcome::NotFound
+        );
+
+        store.rule_retire("demo", "doomed").expect("retire");
+        assert_eq!(
+            store.rule_purge("demo", "doomed").expect("purge"),
+            PurgeOutcome::Purged
+        );
+
+        // Gone from the tombstone list AND from the FTS index.
+        assert!(store
+            .rules_including_retired("demo")
+            .expect("list")
+            .is_empty());
+        assert!(store
+            .search("searchable-marker", Some("demo"), 10, Validity::All)
+            .expect("search")
+            .is_empty());
     }
 }

@@ -66,7 +66,7 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 ## Storage: SQLite + FTS5
 
 **Schema:**
-- `memories` table: id (PK), agent, scope, role, content, created_at, rule_id (nullable), updated_at (nullable), status (nullable — `active`/`retired`; NULL means active)
+- `memories` table: id (PK), agent, scope, role, content, created_at, rule_id (nullable), updated_at (nullable), status (nullable — `active`/`retired`; NULL means active), plus the bi-temporal trio `valid_from`/`valid_to`/`superseded_by` (all nullable; NULL `valid_to` means currently valid, so every pre-supersession row stays valid by construction; `created_at` is transaction time, `valid_*` is validity time). `status` is exclusively the rules axis; supersession never touches it.
 - `memories_fts` virtual table (FTS5): full-text index on `content`, kept in sync via `AFTER INSERT/DELETE/UPDATE` triggers
 - Indices: `idx_memories_scope`, `idx_memories_created_at` (for recall queries); `idx_memories_rule` — **partial** unique index on `(scope, rule_id) WHERE rule_id IS NOT NULL`, enforcing one rule per id per scope without constraining ordinary messages
 - Migration: `migrate()` in `store.rs` probes `pragma_table_info` before each `ALTER TABLE` (SQLite has no `ADD COLUMN IF NOT EXISTS`), so opening a pre-rules database upgrades it in place. Both new columns are nullable — every pre-existing row is a message, which has neither.
@@ -98,6 +98,7 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 - `rule add --id <kebab-id> [--scope <id>] [--agent <name>] [<text>]` — record or revise a rule (stdin if text omitted)
 - `rule list [--scope <id>] [--include-retired]` — rules in effect, ordered by id
 - `rule retire --id <kebab-id> [--scope <id>]` — withdraw a rule (tombstone; re-adding reinstates)
+- `rule purge --id <kebab-id> [--scope <id>] --yes [--dry-run]` — permanently delete a **retired** rule's row (the one true delete; CLI-only — destructive ops are not agent-invocable)
 - `rule sync [--scope <id>] [--file <path>]... [--dry-run]` — render rules into `AGENTS.md`/`CLAUDE.md`
 - `mcp` — run as MCP server (stdio)
 - `serve [--addr <ip:port>]` — run HTTP server (default `127.0.0.1:8420`)
@@ -166,7 +167,6 @@ Still missing:
 
 - An MCP `context` tool (lands at M3). Budgeting on MCP `recall`/`search` already exists via the optional `budget_tokens` argument — when set, the tool returns `{"memories": [...], "budget": {...}}` instead of the plain array.
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore` (no TUI yet).
-- Purging retired rules — tombstones accumulate, and there is no `rule purge`.
 - Semantic (embedding) search — upgrade path is `sqlite-vec` as a loadable extension.
 - Authentication on the HTTP surface (currently `127.0.0.1`-only, no bearer check).
 

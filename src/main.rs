@@ -45,6 +45,7 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             scope,
             role,
             dry_run,
+            supersedes,
             content,
         } => {
             let content = match content.or_else(read_stdin) {
@@ -63,17 +64,24 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             };
             if dry_run {
                 // Validation passed; echo the would-be memory without writing.
+                // The supersede target is NOT verified here — the plan is a
+                // preview, not a transaction.
                 let plan = serde_json::json!({
                     "actions": [{
                         "action": "remember",
                         "agent": agent,
                         "scope": scope,
                         "role": role,
+                        "supersedes": supersedes,
                         "content": content,
                     }],
                     "summary": format!(
-                        "Would store 1 '{role}' memory ({} chars) in scope '{scope}'",
-                        content.chars().count()
+                        "Would store 1 '{role}' memory ({} chars) in scope '{scope}'{}",
+                        content.chars().count(),
+                        match &supersedes {
+                            Some(id) => format!(", superseding {id} (target not verified)"),
+                            None => String::new(),
+                        }
                     ),
                 });
                 emit_ok(
@@ -83,25 +91,70 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 return 0;
             }
             let guard = store.lock().expect("store lock poisoned");
-            match guard.remember(&agent, &scope, &role, &content) {
-                Ok(mem) => {
-                    emit_ok(Response::new("engram memory remember", mem), mode);
-                    0
+            match supersedes {
+                Some(target) => {
+                    match guard.remember_superseding(&agent, &scope, &role, &content, &target) {
+                        Ok(result) => match result.outcome {
+                            store::SupersedeOutcome::Superseded => {
+                                emit_ok(Response::new("engram memory remember", result), mode);
+                                0
+                            }
+                            store::SupersedeOutcome::NotFound => fail(
+                                AppError::new(
+                                    error::ErrorCode::NotFound,
+                                    3,
+                                    format!("no memory '{target}' in scope '{scope}' (supersession is scope-local)"),
+                                    format!("list ids with `engram recall --scope {scope}`"),
+                                ),
+                                mode,
+                            ),
+                            store::SupersedeOutcome::TargetIsRule => fail(
+                                AppError::new(
+                                    error::ErrorCode::InvalidArgument,
+                                    2,
+                                    format!("'{target}' is a rule; rules are never superseded here"),
+                                    "rules have their own lifecycle: `engram rule add` revises, `engram rule retire` withdraws",
+                                ),
+                                mode,
+                            ),
+                            store::SupersedeOutcome::AlreadySuperseded => fail(
+                                AppError::new(
+                                    error::ErrorCode::Conflict,
+                                    5,
+                                    format!(
+                                        "'{target}' was already superseded by '{}'",
+                                        result.superseded_by_existing.as_deref().unwrap_or("unknown")
+                                    ),
+                                    "supersede the current winner instead, or recall --include-superseded to inspect the chain",
+                                ),
+                                mode,
+                            ),
+                        },
+                        Err(e) => fail(AppError::from(e), mode),
+                    }
                 }
-                Err(e) => {
-                    let err = AppError::from(e);
-                    emit_error(&err, mode);
-                    err.exit_code
-                }
+                None => match guard.remember(&agent, &scope, &role, &content) {
+                    Ok(mem) => {
+                        emit_ok(Response::new("engram memory remember", mem), mode);
+                        0
+                    }
+                    Err(e) => fail(AppError::from(e), mode),
+                },
             }
         }
         Command::Recall {
             scope,
             limit,
             budget_tokens,
+            as_of,
+            include_superseded,
         } => {
+            let validity = match resolve_validity(as_of.as_deref(), include_superseded) {
+                Ok(v) => v,
+                Err(e) => return fail(e, mode),
+            };
             let guard = store.lock().expect("store lock poisoned");
-            match guard.recall(&scope, limit) {
+            match guard.recall(&scope, limit, validity) {
                 Ok(mems) => {
                     match budget_tokens {
                         Some(budget) => {
@@ -129,9 +182,15 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             scope,
             limit,
             budget_tokens,
+            as_of,
+            include_superseded,
         } => {
+            let validity = match resolve_validity(as_of.as_deref(), include_superseded) {
+                Ok(v) => v,
+                Err(e) => return fail(e, mode),
+            };
             let guard = store.lock().expect("store lock poisoned");
-            match guard.search(&query, scope.as_deref(), limit) {
+            match guard.search(&query, scope.as_deref(), limit, validity) {
                 Ok(mems) => {
                     match budget_tokens {
                         Some(budget) => {
@@ -215,9 +274,17 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 "website": "https://Engram.SpacecraftSoftware.org/",
                 "commands": [
                     "remember", "recall", "search", "context",
-                    "rule add", "rule list", "rule retire", "rule sync",
+                    "rule add", "rule list", "rule retire", "rule sync", "rule purge",
                     "save-chat", "mcp", "serve", "schema", "describe"
                 ],
+                "supersession": {
+                    "description": "remember --supersedes closes the target's validity window \
+                                    (valid_to + superseded_by) instead of deleting; reads default \
+                                    to currently-valid rows.",
+                    "scope_local": true,
+                    "escape_hatches": ["--include-superseded", "--as-of <ISO8601>"],
+                    "rule_purge": "CLI-only; deletes retired-rule tombstones only"
+                },
                 "transports": ["cli", "mcp-stdio", "http"],
                 "storage": "sqlite+fts5, single shared file",
                 "output": {
@@ -249,7 +316,9 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
         }
         Command::SaveChat { scope, file, model } => {
             let guard = store.lock().expect("store lock poisoned");
-            match guard.recall(&scope, u32::MAX) {
+            // A chat archive wants the full verbatim history, superseded
+            // rows included — save-chat is a record, not a context view.
+            match guard.recall(&scope, u32::MAX, store::Validity::All) {
                 Ok(mems) => {
                     if mems.is_empty() {
                         let err = AppError::new(
@@ -520,6 +589,94 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
             emit_ok(resp, mode);
             0
         }
+
+        RuleAction::Purge {
+            id,
+            scope,
+            yes,
+            dry_run,
+        } => {
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
+            let guard = store.lock().expect("store lock poisoned");
+            // Classify first so --dry-run and the --yes gate both report the
+            // real outcome without touching the row.
+            let listed = match guard.rules_including_retired(&resolved.name) {
+                Ok(r) => r,
+                Err(e) => return fail(AppError::from(e), mode),
+            };
+            let target = listed.into_iter().find(|r| r.rule_id == id);
+            match target {
+                None => fail(
+                    AppError::new(
+                        error::ErrorCode::NotFound,
+                        3,
+                        format!("no rule '{id}' in scope '{}'", resolved.name),
+                        "list the ids with `engram rule list --include-retired`",
+                    ),
+                    mode,
+                ),
+                Some(rule) if !rule.retired => fail(
+                    AppError::new(
+                        error::ErrorCode::InvalidArgument,
+                        2,
+                        format!("rule '{id}' is still active; purge deletes tombstones only"),
+                        format!("retire it first: engram rule purge needs `engram rule retire --id {id}` before it"),
+                    ),
+                    mode,
+                ),
+                Some(rule) => {
+                    if dry_run {
+                        let plan = serde_json::json!({
+                            "actions": [{
+                                "action": "purge-rule",
+                                "rule_id": rule.rule_id,
+                                "scope": resolved.name,
+                                "text": rule.text,
+                            }],
+                            "summary": format!(
+                                "Would permanently delete retired rule '{id}' from scope '{}'",
+                                resolved.name
+                            ),
+                        });
+                        emit_ok(
+                            Response::new("engram rule purge --dry-run", plan).with_dry_run(),
+                            mode,
+                        );
+                        return 0;
+                    }
+                    if !yes {
+                        // Wizard Fallback: this process may not have a TTY to
+                        // ask on, so consent must arrive as a flag.
+                        return fail(
+                            AppError::new(
+                                error::ErrorCode::InvalidArgument,
+                                2,
+                                "refusing to purge without --yes",
+                                format!("engram rule purge --id {id} --scope {} --yes", resolved.name),
+                            ),
+                            mode,
+                        );
+                    }
+                    match guard.rule_purge(&resolved.name, &id) {
+                        Ok(outcome) => {
+                            let result = serde_json::json!({
+                                "rule_id": id,
+                                "scope": resolved.name,
+                                "scope_origin": resolved.origin,
+                                "outcome": outcome,
+                                "purged_text": rule.text,
+                            });
+                            emit_ok(Response::new("engram rule purge", result), mode);
+                            0
+                        }
+                        Err(e) => fail(AppError::from(e), mode),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -531,6 +688,34 @@ fn read_stdin() -> Option<String> {
         return None;
     }
     Some(buf)
+}
+
+/// Maps the `--as-of` / `--include-superseded` pair to a [`store::Validity`],
+/// validating the timestamp shape (§14: ISO 8601 UTC). clap's
+/// `conflicts_with` already rules out both being set on the CLI.
+#[expect(
+    clippy::result_large_err,
+    reason = "the Err is a one-shot CLI-argument failure on a cold path; boxing AppError would ripple through every handler for no measurable gain"
+)]
+fn resolve_validity(
+    as_of: Option<&str>,
+    include_superseded: bool,
+) -> Result<store::Validity<'_>, AppError> {
+    match as_of {
+        Some(t) => {
+            if t.parse::<jiff::Timestamp>().is_err() {
+                return Err(AppError::new(
+                    error::ErrorCode::InvalidArgument,
+                    2,
+                    format!("--as-of '{t}' is not an ISO 8601 UTC timestamp"),
+                    "use the form 2026-08-01T12:00:00Z",
+                ));
+            }
+            Ok(store::Validity::AsOf(t))
+        }
+        None if include_superseded => Ok(store::Validity::All),
+        None => Ok(store::Validity::Current),
+    }
 }
 
 fn scope_error(e: std::io::Error) -> AppError {

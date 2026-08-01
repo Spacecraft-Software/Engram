@@ -220,6 +220,9 @@ mod tests {
             created_at: created_at.to_string(),
             rule_id: None,
             updated_at: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
         }
     }
 

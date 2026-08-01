@@ -617,3 +617,221 @@ fn schema_and_describe_are_valid_json() {
         "describe must advertise jsonl, got {formats:?}"
     );
 }
+
+// --- M2: bi-temporal supersession ---------------------------------------
+
+#[test]
+fn supersede_round_trip_and_time_filters() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+
+    let out = engram(&db)
+        .args(["remember", "--agent", "a", "--scope", "s", "old truth"])
+        .assert()
+        .success();
+    let a_id = parse_single_line_json(&out.get_output().stdout)["data"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Supersede it.
+    let out = engram(&db)
+        .args([
+            "remember",
+            "--agent",
+            "b",
+            "--scope",
+            "s",
+            "--supersedes",
+            &a_id,
+            "new truth",
+        ])
+        .assert()
+        .success();
+    let env = parse_single_line_json(&out.get_output().stdout);
+    assert_eq!(env["data"]["outcome"], "superseded");
+    assert_eq!(env["data"]["superseded_id"], a_id.as_str());
+    let b_id = env["data"]["memory"]["id"]
+        .as_str()
+        .expect("new id")
+        .to_string();
+
+    // Default recall: only the replacement.
+    let out = engram(&db)
+        .args(["recall", "--scope", "s"])
+        .assert()
+        .success();
+    let mems = parse_single_line_json(&out.get_output().stdout)["data"].clone();
+    let ids: Vec<&str> = mems
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![b_id.as_str()]);
+
+    // Full history via --include-superseded; the old row carries the chain.
+    let out = engram(&db)
+        .args(["recall", "--scope", "s", "--include-superseded"])
+        .assert()
+        .success();
+    let mems = parse_single_line_json(&out.get_output().stdout)["data"].clone();
+    assert_eq!(mems.as_array().unwrap().len(), 2);
+    let old = mems
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == a_id.as_str())
+        .expect("old row");
+    assert_eq!(old["superseded_by"], b_id.as_str());
+    assert!(old["valid_to"].is_string());
+
+    // Double supersede: conflict, exit 5.
+    let out = engram(&db)
+        .args([
+            "remember",
+            "--agent",
+            "c",
+            "--scope",
+            "s",
+            "--supersedes",
+            &a_id,
+            "competing",
+        ])
+        .assert()
+        .failure()
+        .code(5);
+    let err = parse_single_line_json(&out.get_output().stderr);
+    assert_eq!(err["error"]["code"], "CONFLICT");
+    assert_eq!(err["error"]["exit_code"], 5);
+
+    // Unknown target: exit 3.
+    let out = engram(&db)
+        .args([
+            "remember",
+            "--agent",
+            "c",
+            "--scope",
+            "s",
+            "--supersedes",
+            "nope",
+            "x",
+        ])
+        .assert()
+        .failure()
+        .code(3);
+    let err = parse_single_line_json(&out.get_output().stderr);
+    assert_eq!(err["error"]["code"], "NOT_FOUND");
+}
+
+#[test]
+fn as_of_validates_and_conflicts_with_include_superseded() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+
+    // Malformed timestamp: structured exit 2.
+    let out = engram(&db)
+        .args(["recall", "--scope", "s", "--as-of", "yesterday"])
+        .assert()
+        .failure()
+        .code(2);
+    let err = parse_single_line_json(&out.get_output().stderr);
+    assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
+
+    // clap enforces mutual exclusion (usage error, exit 2).
+    engram(&db)
+        .args([
+            "recall",
+            "--scope",
+            "s",
+            "--as-of",
+            "2026-08-01T00:00:00Z",
+            "--include-superseded",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn rule_purge_deletes_tombstones_only_and_needs_consent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "purge-scope";
+
+    engram(&db)
+        .args([
+            "rule",
+            "add",
+            "--id",
+            "doomed",
+            "--scope",
+            scope,
+            "Temporary policy.",
+        ])
+        .assert()
+        .success();
+
+    // Active rule: refused.
+    engram(&db)
+        .args(["rule", "purge", "--id", "doomed", "--scope", scope, "--yes"])
+        .assert()
+        .failure()
+        .code(2);
+
+    engram(&db)
+        .args(["rule", "retire", "--id", "doomed", "--scope", scope])
+        .assert()
+        .success();
+
+    // No --yes: refused with the full invocation in the hint.
+    let out = engram(&db)
+        .args(["rule", "purge", "--id", "doomed", "--scope", scope])
+        .assert()
+        .failure()
+        .code(2);
+    let err = parse_single_line_json(&out.get_output().stderr);
+    assert!(err["error"]["hint"].as_str().unwrap().contains("--yes"));
+
+    // Dry run: previewed, not deleted.
+    let out = engram(&db)
+        .args([
+            "rule",
+            "purge",
+            "--id",
+            "doomed",
+            "--scope",
+            scope,
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    let env = parse_single_line_json(&out.get_output().stdout);
+    assert_eq!(env["metadata"]["dry_run"], true);
+    assert_eq!(env["data"]["actions"][0]["action"], "purge-rule");
+
+    // Real purge.
+    let out = engram(&db)
+        .args(["rule", "purge", "--id", "doomed", "--scope", scope, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        parse_single_line_json(&out.get_output().stdout)["data"]["outcome"],
+        "purged"
+    );
+
+    // Gone even from the tombstone view; unknown id now exits 3.
+    let out = engram(&db)
+        .args(["rule", "list", "--scope", scope, "--include-retired"])
+        .assert()
+        .success();
+    assert_eq!(
+        parse_single_line_json(&out.get_output().stdout)["data"]["count"],
+        0
+    );
+    engram(&db)
+        .args(["rule", "purge", "--id", "doomed", "--scope", scope, "--yes"])
+        .assert()
+        .failure()
+        .code(3);
+}
