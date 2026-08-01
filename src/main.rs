@@ -23,7 +23,7 @@ use store::Store;
 
 fn main() {
     let cli = Cli::parse();
-    let mode = resolve_mode(cli.json, cli.no_color);
+    let mode = resolve_mode(cli.format, cli.json, cli.no_color, cli.accessible);
 
     let store = match Store::open(&cli.db) {
         Ok(s) => Arc::new(Mutex::new(s)),
@@ -39,7 +39,13 @@ fn main() {
 
 fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
     match command {
-        Command::Remember { agent, scope, role, content } => {
+        Command::Remember {
+            agent,
+            scope,
+            role,
+            dry_run,
+            content,
+        } => {
             let content = match content.or_else(read_stdin) {
                 Some(c) => c,
                 None => {
@@ -54,6 +60,27 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                     )
                 }
             };
+            if dry_run {
+                // Validation passed; echo the would-be memory without writing.
+                let plan = serde_json::json!({
+                    "actions": [{
+                        "action": "remember",
+                        "agent": agent,
+                        "scope": scope,
+                        "role": role,
+                        "content": content,
+                    }],
+                    "summary": format!(
+                        "Would store 1 '{role}' memory ({} chars) in scope '{scope}'",
+                        content.chars().count()
+                    ),
+                });
+                emit_ok(
+                    Response::new("engram memory remember --dry-run", plan).with_dry_run(),
+                    mode,
+                );
+                return 0;
+            }
             let guard = store.lock().expect("store lock poisoned");
             match guard.remember(&agent, &scope, &role, &content) {
                 Ok(mem) => {
@@ -81,7 +108,11 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 }
             }
         }
-        Command::Search { query, scope, limit } => {
+        Command::Search {
+            query,
+            scope,
+            limit,
+        } => {
             let guard = store.lock().expect("store lock poisoned");
             match guard.search(&query, scope.as_deref(), limit) {
                 Ok(mems) => {
@@ -135,6 +166,13 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 ],
                 "transports": ["cli", "mcp-stdio", "http"],
                 "storage": "sqlite+fts5, single shared file",
+                "output": {
+                    "formats": ["json", "jsonl", "csv"],
+                    "jsonl": "first line is the metadata envelope with data:null, then one line per record",
+                    "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
+                    "dry_run": "remember and rule sync accept --dry-run; the envelope carries metadata.dry_run=true",
+                    "accessible": "--accessible or SPACECRAFT_A11Y=1 (Standard §18); status tags [OK]/[ERROR] are present in every human mode"
+                },
                 "rules": {
                     "description": "Durable project policy, stored once and rendered into the \
                                     markdown files agent harnesses auto-load.",
@@ -166,7 +204,7 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                         emit_error(&err, mode);
                         return err.exit_code;
                     }
-                    
+
                     match handle_save_chat(&scope, mems, file, model) {
                         Ok(result) => {
                             emit_ok(Response::new("engram memory save-chat", result), mode);
@@ -180,7 +218,7 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                                 "check filesystem permissions and directory configuration",
                             );
                             emit_error(&err, mode);
-                            return err.exit_code;
+                            err.exit_code
                         }
                     }
                 }
@@ -234,7 +272,12 @@ struct RuleSyncResult {
 
 fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
     match action {
-        RuleAction::Add { id, scope, agent, text } => {
+        RuleAction::Add {
+            id,
+            scope,
+            agent,
+            text,
+        } => {
             let text = match text {
                 Some(t) => t,
                 None => match read_stdin() {
@@ -254,13 +297,23 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
             };
             if let Err(reason) = rules::validate_rule_id(&id) {
                 return fail(
-                    AppError::new(error::ErrorCode::InvalidArgument, 2, reason, "use a short kebab-case id, e.g. skill-description-1000"),
+                    AppError::new(
+                        error::ErrorCode::InvalidArgument,
+                        2,
+                        reason,
+                        "use a short kebab-case id, e.g. skill-description-1000",
+                    ),
                     mode,
                 );
             }
             if let Err(reason) = rules::validate_rule_text(&text) {
                 return fail(
-                    AppError::new(error::ErrorCode::InvalidArgument, 2, reason, "state the rule as plain prose"),
+                    AppError::new(
+                        error::ErrorCode::InvalidArgument,
+                        2,
+                        reason,
+                        "state the rule as plain prose",
+                    ),
                     mode,
                 );
             }
@@ -286,7 +339,10 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
             }
         }
 
-        RuleAction::List { scope, include_retired } => {
+        RuleAction::List {
+            scope,
+            include_retired,
+        } => {
             let resolved = match rules::resolve_scope(scope.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return fail(scope_error(e), mode),
@@ -346,7 +402,11 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
             }
         }
 
-        RuleAction::Sync { scope, files, dry_run } => {
+        RuleAction::Sync {
+            scope,
+            files,
+            dry_run,
+        } => {
             let resolved = match rules::resolve_scope(scope.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return fail(scope_error(e), mode),
@@ -386,7 +446,11 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
                 dry_run,
                 files: written,
             };
-            emit_ok(Response::new("engram rule sync", result), mode);
+            let resp = Response::new("engram rule sync", result);
+            // metadata.dry_run mirrors data.dry_run so the envelope contract
+            // is uniform with `remember --dry-run` (validation-safety §4).
+            let resp = if dry_run { resp.with_dry_run() } else { resp };
+            emit_ok(resp, mode);
             0
         }
     }
@@ -432,11 +496,11 @@ fn handle_save_chat(
     model: Option<String>,
 ) -> Result<SaveChatResult, Box<dyn std::error::Error>> {
     let current_dir = std::env::current_dir()?;
-    
+
     // Ensure chat directory exists
     let chat_dir = current_dir.join("chat");
     std::fs::create_dir_all(&chat_dir)?;
-    
+
     // Ensure chat/ is gitignored
     let gitignore_path = current_dir.join(".gitignore");
     let mut gitignore_content = if gitignore_path.exists() {
@@ -444,8 +508,11 @@ fn handle_save_chat(
     } else {
         String::new()
     };
-    
-    if !gitignore_content.lines().any(|l| l.trim() == "chat" || l.trim() == "chat/") {
+
+    if !gitignore_content
+        .lines()
+        .any(|l| l.trim() == "chat" || l.trim() == "chat/")
+    {
         if !gitignore_content.ends_with('\n') && !gitignore_content.is_empty() {
             gitignore_content.push('\n');
         }
@@ -472,13 +539,13 @@ fn handle_save_chat(
 
     let exists = target_file.exists();
     let mut file_content = String::new();
-    
+
     if exists {
         // Read existing content and strip trailing @bye to support clean append
         let existing = std::fs::read_to_string(&target_file)?;
         let trimmed = existing.trim();
-        if trimmed.ends_with("@bye") {
-            file_content = trimmed[..trimmed.len() - 4].to_string();
+        if let Some(stripped) = trimmed.strip_suffix("@bye") {
+            file_content = stripped.to_string();
         } else {
             file_content = existing;
         }
@@ -490,18 +557,24 @@ fn handle_save_chat(
 
     // Sign the block
     let sign_timestamp = crate::time::now_iso8601();
-    file_content.push_str(&format!("@c Signed by: {} on {}\n", model_name, sign_timestamp));
+    file_content.push_str(&format!(
+        "@c Signed by: {} on {}\n",
+        model_name, sign_timestamp
+    ));
     file_content.push_str(&format!("@chapter Chat history for scope: {}\n\n", scope));
 
     let num_saved = mems.len();
     for mem in mems {
-        file_content.push_str(&format!("@section Message by {} ({}) at {}\n", mem.agent, mem.role, mem.created_at));
+        file_content.push_str(&format!(
+            "@section Message by {} ({}) at {}\n",
+            mem.agent, mem.role, mem.created_at
+        ));
         file_content.push_str(&format!("{}\n\n", escape_texinfo(&mem.content)));
     }
 
     file_content.push_str("@bye\n");
     std::fs::write(&target_file, file_content)?;
-    
+
     Ok(SaveChatResult {
         scope: scope.to_string(),
         file_path: target_file.to_string_lossy().to_string(),
@@ -525,12 +598,113 @@ fn escape_texinfo(s: &str) -> String {
 
 // Rust guideline compliant 2026-05-18
 
-
 fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
-    if mode.is_machine() {
-        println!("{}", serde_json::to_string(&resp).unwrap());
+    match mode {
+        OutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&resp).expect("Response serializes")
+            );
+        }
+        OutputMode::Jsonl => emit_jsonl(&resp),
+        OutputMode::Csv => emit_csv(&resp),
+        OutputMode::HumanWithColor | OutputMode::HumanNoColor => {
+            // Status tag to stderr (never color-only, §18.2.1); the data
+            // payload alone goes to stdout (§7 stdout/stderr separation).
+            let command = resp.metadata.command.clone();
+            if mode == OutputMode::HumanWithColor {
+                use owo_colors::OwoColorize;
+                // Acid Lime per the Steelbore Modern palette (§11).
+                eprintln!("{} {command}", "[OK]".truecolor(180, 255, 0).bold());
+            } else {
+                eprintln!("[OK] {command}");
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resp).expect("Response serializes")
+            );
+        }
+    }
+}
+
+/// `--format jsonl`: first line is the envelope metadata with `data: null`,
+/// then one line per record (list payloads) or one line with the whole
+/// payload (object payloads). Documented in `engram describe`.
+fn emit_jsonl<T: serde::Serialize>(resp: &Response<T>) {
+    let value = serde_json::to_value(resp).expect("Response serializes");
+    let metadata = &value["metadata"];
+    println!(
+        "{}",
+        serde_json::json!({ "metadata": metadata, "data": null })
+    );
+    match &value["data"] {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                println!("{item}");
+            }
+        }
+        data => println!("{data}"),
+    }
+}
+
+/// `--format csv`: RFC 4180 rows of the data records on stdout; the envelope
+/// metadata goes to stderr as one line of JSON (CSV has no envelope).
+fn emit_csv<T: serde::Serialize>(resp: &Response<T>) {
+    let value = serde_json::to_value(resp).expect("Response serializes");
+    eprintln!("{}", serde_json::json!({ "metadata": &value["metadata"] }));
+    let records: Vec<serde_json::Map<String, serde_json::Value>> = match &value["data"] {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|i| i.as_object().cloned())
+            .collect(),
+        serde_json::Value::Object(obj) => vec![obj.clone()],
+        other => {
+            println!("value");
+            println!("{}", csv_escape(&scalar_to_string(other)));
+            return;
+        }
+    };
+    let Some(first) = records.first() else { return };
+    // serde_json preserves struct field order, so the first record's keys are
+    // the stable header. Records missing a key emit an empty field.
+    let headers: Vec<&String> = first.keys().collect();
+    println!(
+        "{}",
+        headers
+            .iter()
+            .map(|h| csv_escape(h))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for record in &records {
+        let row: Vec<String> = headers
+            .iter()
+            .map(|h| {
+                record
+                    .get(*h)
+                    .map(|v| csv_escape(&scalar_to_string(v)))
+                    .unwrap_or_default()
+            })
+            .collect();
+        println!("{}", row.join(","));
+    }
+}
+
+fn scalar_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// RFC 4180: quote fields containing commas, quotes, or line breaks; double
+/// embedded quotes.
+fn csv_escape(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
     } else {
-        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+        field.to_string()
     }
 }
 
@@ -538,6 +712,6 @@ fn emit_error(err: &AppError, mode: OutputMode) {
     if mode.is_machine() {
         err.emit_to_stderr();
     } else {
-        err.emit_human();
+        err.emit_human(mode == OutputMode::HumanWithColor);
     }
 }

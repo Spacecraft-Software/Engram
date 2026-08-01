@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad & Spacecraft Software
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+max_width = 100
+edition = "2021"

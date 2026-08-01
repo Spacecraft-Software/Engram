@@ -10,13 +10,20 @@ raw text out, full-text searchable.
 
 ## Status
 
-Builds and runs against the pinned `rmcp` 0.16. The MCP stdio handshake
-tolerates a leading non-`initialize` probe (some hosts, e.g. Antigravity,
-send a proprietary discovery request first) — see `src/mcp.rs`.
+**0.2.0-dev.** Builds and runs against the pinned `rmcp` 0.16. The MCP stdio
+handshake tolerates a leading non-`initialize` probe (some hosts, e.g.
+Antigravity, send a proprietary discovery request first) — see `src/mcp.rs`.
 
-`cargo test` covers the rules subsystem: upsert semantics, the schema
-migration, and the markdown sync splice. The memory surfaces are still
-exercised by hand rather than by tests.
+`cargo test` covers the rules subsystem (upsert semantics, the schema
+migration, the markdown sync splice) **and** the memory surfaces (integration
+tests in `tests/cli.rs`). CI is active (`.github/workflows/ci.yml`: rustfmt,
+clippy, tests). Packaging manifests are present (`packaging/guix.scm`,
+`packaging/default.nix`, `packaging/PKGBUILD`), and a Texinfo manual skeleton
+lives in `doc/`.
+
+**Breaking change at 0.2.0:** every HTTP route now returns real status codes
+(400/404/500). Migration hint: check the response status — errors no longer
+arrive as `200` with an `{"error":...}` body.
 
 ## Quick start
 
@@ -29,6 +36,17 @@ cargo build --release
 
 Point another agent's pipeline stage at the same `--db engram.db` and it
 reads the same memories back.
+
+Machine output beyond the default JSON envelope: `--format jsonl` streams one
+metadata line then one line per record; `--format csv` writes RFC 4180 rows to
+stdout with the metadata as a JSON line on stderr. `remember --dry-run`
+validates and shows what would be stored without writing.
+
+```sh
+./target/release/engram recall --scope majestic-adr-023 --format jsonl
+./target/release/engram recall --scope majestic-adr-023 --format csv
+./target/release/engram remember --agent claude-code --scope majestic-adr-023 --dry-run "Would store this."
+```
 
 MCP (stdio), for wiring into Claude Code / Codex / any MCP client:
 
@@ -148,10 +166,10 @@ curl -s -XDELETE "localhost:8420/v1/rules/signed-commits?scope=engram"
 curl -s -XPOST localhost:8420/v1/rules/sync -d '{"scope":"engram"}'
 ```
 
-`DELETE` retires (soft-deletes) rather than erases, per above. These routes
-return real status codes — 400 on a malformed id or empty text, 404 on an
-unknown rule — unlike the older `/v1/memory*` routes, which answer `200` with an
-`{"error":...}` body. New routes should follow the rule routes' pattern.
+`DELETE` retires (soft-deletes) rather than erases, per above. As of 0.2.0
+**all** routes — rules and memory alike — return real status codes: 400 on a
+malformed id, empty text, or empty `content`; 404 on an unknown rule; 500 on
+storage failure. New routes should keep following that pattern.
 
 > **`POST /v1/rules/sync` writes to your filesystem.** It is the only route that
 > touches anything outside the database. Target paths come from the server
@@ -163,22 +181,13 @@ unknown rule — unlike the older `/v1/memory*` routes, which answer `200` with 
 
 ## What's deliberately not here yet
 
-- `--format yaml|csv|jsonl|explore` — only `--json` and human text exist.
-  Extend `output::mode` and `output::envelope` when you need the rest.
-- `--dry-run` on `remember` (it's not really destructive, but the CLI Standard §3 says
-  every write command SHOULD accept it — add a no-op path if you want strict
-  compliance). `rule sync` already has one.
+- `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore`
+  (no TUI yet). `json`, `jsonl`, and `csv` exist.
 - Purging a retired rule. Tombstones accumulate; there is no `rule purge`.
-- Proper status codes on the older `/v1/memory*` routes (they answer `200` with
-  an error body). The `/v1/rules*` routes do it correctly — fixing the memory
-  routes to match is a breaking change awaiting a version bump.
 - Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
   writes files.
-- Packaging manifests (`packaging/guix.scm`, `packaging/default.nix`,
-  `packaging/PKGBUILD`), Texinfo manual.
 - Semantic (embedding) search — the upgrade path is `sqlite-vec` as a
   loadable extension alongside FTS5, not a replacement for it.
-- Auth on the HTTP surface.
 
 ## License
 

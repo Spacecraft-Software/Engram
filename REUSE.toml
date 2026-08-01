@@ -4,9 +4,9 @@ version = 1
 
 # Every committed file in Engram is software-class under Standard §4.1.1 — the
 # crate itself, its manifests, and the posture/agent documentation that ships
-# with and describes it. There is no document-class deliverable here yet; when
-# the Texinfo manual lands, add a later, more specific annotation marking
-# `doc/*.texi` as CC-BY-SA-4.0 (and ship LICENSES/CC-BY-SA-4.0.txt with it).
+# with and describes it — except the Texinfo manual, which is document-class;
+# a later, more specific annotation below marks `doc/*.texi` as CC-BY-SA-4.0
+# (with LICENSES/CC-BY-SA-4.0.txt shipped alongside).
 #
 # `precedence = "override"` is load-bearing, not boilerplate:
 #
@@ -26,3 +26,16 @@ path = "**"
 precedence = "override"
 SPDX-FileCopyrightText = "2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
 SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# The Texinfo manual is the one document-class deliverable (Standard §4.1.1):
+# CC-BY-SA-4.0. This annotation comes after the `**` block above and, being
+# later, wins for the paths it names. The `.texi` also carries the same tags
+# inline as `@c` comments (house style, spacecraft-texinfo-document); this
+# entry keeps the override table consistent with them. `doc/Makefile` is
+# software-class and stays GPL-3.0-or-later via its inline header and the
+# `**` annotation.
+[[annotations]]
+path = "doc/*.texi"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
+SPDX-License-Identifier = "CC-BY-SA-4.0"

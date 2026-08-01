@@ -1,6 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Mohamed Hammad & Spacecraft Software
 // SPDX-License-Identifier: GPL-3.0-or-later
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Machine output formats — spacecraft-cli-standard §3 `--format`.
+/// `yaml` is deferred (serde_yaml is archived); `explore` has no TUI yet.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    /// Single JSON document with the metadata envelope (default machine mode).
+    Json,
+    /// Newline-delimited JSON: one metadata line, then one line per record.
+    Jsonl,
+    /// RFC 4180 CSV of the data records; metadata goes to stderr as JSON.
+    Csv,
+}
 
 /// Engram — shared verbatim chat memory for multi-model LLM pipelines.
 /// Maintained by Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
@@ -17,8 +29,18 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Machine output format (json, jsonl, csv). Overrides mode auto-detection.
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<Format>,
+
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Accessible output (Standard §18): plain linear text, no color, status
+    /// tags. Also enabled by SPACECRAFT_A11Y=1; SPACECRAFT_A11Y=0 disables
+    /// auto-detection but this flag still wins.
+    #[arg(long, global = true)]
+    pub accessible: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -34,6 +56,9 @@ pub enum Command {
         scope: String,
         #[arg(long, default_value = "note")]
         role: String,
+        /// Validate and show what would be stored, without writing.
+        #[arg(long)]
+        dry_run: bool,
         /// Message content. Reads stdin if omitted.
         content: Option<String>,
     },
@@ -190,4 +215,3 @@ EXAMPLES:
 }
 
 // Rust guideline compliant 2026-05-18
-

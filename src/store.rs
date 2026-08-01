@@ -88,7 +88,27 @@ impl Store {
     /// Opens (creating if needed) the shared database file. Point every
     /// agent at the same path — that's the entire "shared memory" story.
     pub fn open(path: &std::path::Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+        Self::init(Connection::open(path)?)
+    }
+
+    /// Opens a private in-memory database with exactly the same pragmas,
+    /// schema, and migration as [`Store::open`]. Nothing is persisted and
+    /// nothing is shared between connections — intended for tests and other
+    /// ephemeral consumers that want the real schema without a file.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "test constructor; only in-crate tests call it today"
+        )
+    )]
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    /// Shared body of [`Store::open`] and [`Store::open_in_memory`]: one
+    /// place for pragmas + schema + migration, so the two cannot drift.
+    fn init(conn: Connection) -> rusqlite::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
@@ -126,7 +146,13 @@ impl Store {
         Ok(Self { conn })
     }
 
-    pub fn remember(&self, agent: &str, scope: &str, role: &str, content: &str) -> rusqlite::Result<Memory> {
+    pub fn remember(
+        &self,
+        agent: &str,
+        scope: &str,
+        role: &str,
+        content: &str,
+    ) -> rusqlite::Result<Memory> {
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             agent: agent.to_string(),
@@ -161,7 +187,12 @@ impl Store {
     }
 
     /// Full-text search across all scopes, or restricted to one scope.
-    pub fn search(&self, query: &str, scope: Option<&str>, limit: u32) -> rusqlite::Result<Vec<Memory>> {
+    pub fn search(
+        &self,
+        query: &str,
+        scope: Option<&str>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Memory>> {
         let query = &sanitize_fts_query(query);
         let sql = if scope.is_some() {
             "SELECT m.id, m.agent, m.scope, m.role, m.content, m.created_at, m.rule_id, m.updated_at
@@ -183,6 +214,13 @@ impl Store {
         rows.collect()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "wired into the surfaces at M3 (MCP `get` tool, GET /v1/memory/:id)"
+        )
+    )]
     pub fn get(&self, id: &str) -> rusqlite::Result<Option<Memory>> {
         self.conn
             .query_row(
@@ -205,7 +243,13 @@ impl Store {
     /// # Errors
     ///
     /// Returns the underlying `rusqlite` error if the transaction fails.
-    pub fn rule_add(&self, agent: &str, scope: &str, rule_id: &str, text: &str) -> rusqlite::Result<RuleUpsert> {
+    pub fn rule_add(
+        &self,
+        agent: &str,
+        scope: &str,
+        rule_id: &str,
+        text: &str,
+    ) -> rusqlite::Result<RuleUpsert> {
         let now = crate::time::now_iso8601();
         // Read-then-write, so wrap both in a transaction: two processes sharing
         // the database file could otherwise interleave and lose one edit.
@@ -218,7 +262,13 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map(Some)
-            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })?;
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
 
         let (created, created_at) = match &existing {
             Some((id, created_at)) => {
@@ -284,11 +334,20 @@ impl Store {
                 params![scope, rule_id],
                 |row| {
                     let status: Option<String> = row.get(1)?;
-                    Ok((row.get(0)?, status.as_deref() == Some(crate::rules::STATUS_RETIRED)))
+                    Ok((
+                        row.get(0)?,
+                        status.as_deref() == Some(crate::rules::STATUS_RETIRED),
+                    ))
                 },
             )
             .map(Some)
-            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })?;
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
 
         let outcome = match &existing {
             None => RetireOutcome::NotFound,
@@ -306,9 +365,16 @@ impl Store {
         let rule = if outcome == RetireOutcome::NotFound {
             None
         } else {
-            self.rules_including_retired(scope)?.into_iter().find(|r| r.rule_id == rule_id)
+            self.rules_including_retired(scope)?
+                .into_iter()
+                .find(|r| r.rule_id == rule_id)
         };
-        Ok(RuleRetire { rule_id: rule_id.to_string(), scope: scope.to_string(), outcome, rule })
+        Ok(RuleRetire {
+            rule_id: rule_id.to_string(),
+            scope: scope.to_string(),
+            outcome,
+            rule,
+        })
     }
 
     /// Active rules for a scope, ordered by `rule_id`.
@@ -465,15 +531,26 @@ mod tests {
     #[test]
     fn rule_add_upserts_instead_of_appending() {
         let store = store();
-        let first = store.rule_add("claude-code", "demo", "no-panics", "Original.").expect("add");
+        let first = store
+            .rule_add("claude-code", "demo", "no-panics", "Original.")
+            .expect("add");
         assert!(first.created);
 
-        let second = store.rule_add("codex", "demo", "no-panics", "Revised.").expect("update");
+        let second = store
+            .rule_add("codex", "demo", "no-panics", "Revised.")
+            .expect("update");
         assert!(!second.created);
-        assert_eq!(second.rule.created_at, first.rule.created_at, "created_at must survive an edit");
+        assert_eq!(
+            second.rule.created_at, first.rule.created_at,
+            "created_at must survive an edit"
+        );
 
         let rules = store.rules("demo").expect("list");
-        assert_eq!(rules.len(), 1, "re-adding an id must not produce a second rule");
+        assert_eq!(
+            rules.len(),
+            1,
+            "re-adding an id must not produce a second rule"
+        );
         assert_eq!(rules[0].text, "Revised.");
         assert_eq!(rules[0].agent, "codex");
     }
@@ -485,7 +562,12 @@ mod tests {
         store.rule_add("a", "demo", "alpha", "A.").expect("add");
         store.rule_add("a", "other", "beta", "B.").expect("add");
 
-        let ids: Vec<_> = store.rules("demo").expect("list").into_iter().map(|r| r.rule_id).collect();
+        let ids: Vec<_> = store
+            .rules("demo")
+            .expect("list")
+            .into_iter()
+            .map(|r| r.rule_id)
+            .collect();
         assert_eq!(ids, vec!["alpha", "zeta"]);
         assert_eq!(store.rules("other").expect("list").len(), 1);
     }
@@ -493,66 +575,288 @@ mod tests {
     #[test]
     fn rules_do_not_leak_into_plain_memory_output_as_nulls() {
         let store = store();
-        let mem = store.remember("claude-code", "demo", "note", "A message.").expect("remember");
+        let mem = store
+            .remember("claude-code", "demo", "note", "A message.")
+            .expect("remember");
         assert!(mem.rule_id.is_none());
         let json = serde_json::to_string(&mem).expect("serialize");
-        assert!(!json.contains("rule_id"), "plain memories must serialize exactly as before");
+        assert!(
+            !json.contains("rule_id"),
+            "plain memories must serialize exactly as before"
+        );
     }
 
     #[test]
     fn retiring_hides_a_rule_without_erasing_it() {
         let store = store();
-        store.rule_add("claude-code", "demo", "old-policy", "Superseded.").expect("add");
+        store
+            .rule_add("claude-code", "demo", "old-policy", "Superseded.")
+            .expect("add");
 
         let retired = store.rule_retire("demo", "old-policy").expect("retire");
         assert_eq!(retired.outcome, RetireOutcome::Retired);
-        assert!(store.rules("demo").expect("list").is_empty(), "retired rules must not be binding");
+        assert!(
+            store.rules("demo").expect("list").is_empty(),
+            "retired rules must not be binding"
+        );
 
         let all = store.rules_including_retired("demo").expect("list all");
         assert_eq!(all.len(), 1, "the tombstone must survive");
         assert!(all[0].retired);
-        assert_eq!(all[0].text, "Superseded.", "text must be preserved for the record");
+        assert_eq!(
+            all[0].text, "Superseded.",
+            "text must be preserved for the record"
+        );
     }
 
     #[test]
     fn retiring_is_idempotent_and_reports_a_missing_rule() {
         let store = store();
-        store.rule_add("claude-code", "demo", "x", "Text.").expect("add");
+        store
+            .rule_add("claude-code", "demo", "x", "Text.")
+            .expect("add");
 
-        assert_eq!(store.rule_retire("demo", "x").expect("retire").outcome, RetireOutcome::Retired);
         assert_eq!(
-            store.rule_retire("demo", "x").expect("retire again").outcome,
+            store.rule_retire("demo", "x").expect("retire").outcome,
+            RetireOutcome::Retired
+        );
+        assert_eq!(
+            store
+                .rule_retire("demo", "x")
+                .expect("retire again")
+                .outcome,
             RetireOutcome::AlreadyRetired
         );
-        assert_eq!(store.rule_retire("demo", "ghost").expect("retire ghost").outcome, RetireOutcome::NotFound);
+        assert_eq!(
+            store
+                .rule_retire("demo", "ghost")
+                .expect("retire ghost")
+                .outcome,
+            RetireOutcome::NotFound
+        );
     }
 
     #[test]
     fn re_adding_a_retired_rule_reinstates_it() {
         let store = store();
-        store.rule_add("claude-code", "demo", "x", "Original.").expect("add");
+        store
+            .rule_add("claude-code", "demo", "x", "Original.")
+            .expect("add");
         store.rule_retire("demo", "x").expect("retire");
 
         // The id is the rule's identity, so re-adding must reinstate rather than
         // collide with the unique index or leave a hidden retired duplicate.
-        let re_added = store.rule_add("claude-code", "demo", "x", "Back, revised.").expect("re-add");
+        let re_added = store
+            .rule_add("claude-code", "demo", "x", "Back, revised.")
+            .expect("re-add");
         assert!(!re_added.created, "the original row is reused");
         assert!(!re_added.rule.retired);
 
         let active = store.rules("demo").expect("list");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].text, "Back, revised.");
-        assert_eq!(store.rules_including_retired("demo").expect("all").len(), 1, "no duplicate row");
+        assert_eq!(
+            store.rules_including_retired("demo").expect("all").len(),
+            1,
+            "no duplicate row"
+        );
     }
 
     #[test]
     fn recall_surfaces_rules_alongside_messages() {
         let store = store();
-        store.remember("claude-code", "demo", "note", "A message.").expect("remember");
-        store.rule_add("claude-code", "demo", "no-panics", "No panics.").expect("add");
+        store
+            .remember("claude-code", "demo", "note", "A message.")
+            .expect("remember");
+        store
+            .rule_add("claude-code", "demo", "no-panics", "No panics.")
+            .expect("add");
 
         let recalled = store.recall("demo", 50).expect("recall");
         assert_eq!(recalled.len(), 2);
         assert!(recalled.iter().any(|m| m.role == crate::rules::ROLE));
+    }
+
+    // ---- Memory-surface tests -------------------------------------------
+    //
+    // These use `Store::open_in_memory()` — the production constructor path
+    // (pragmas + schema + migrate), not the legacy-schema fixture above.
+
+    #[test]
+    fn remember_returns_a_well_formed_memory() {
+        let store = Store::open_in_memory().expect("open");
+        let mem = store
+            .remember("claude-code", "demo", "note", "Hello.")
+            .expect("remember");
+        uuid::Uuid::parse_str(&mem.id).expect("id must be a UUID");
+        assert_eq!(mem.agent, "claude-code");
+        assert_eq!(mem.scope, "demo");
+        assert_eq!(mem.role, "note");
+        assert_eq!(mem.content, "Hello.");
+        assert!(
+            mem.created_at.ends_with('Z'),
+            "ISO 8601 UTC, got {}",
+            mem.created_at
+        );
+        assert!(mem.rule_id.is_none());
+        assert!(mem.updated_at.is_none());
+    }
+
+    #[test]
+    fn recall_is_chronological_and_limit_keeps_the_most_recent() {
+        let store = Store::open_in_memory().expect("open");
+        for i in 0..5 {
+            store
+                .remember("a", "demo", "note", &format!("message {i}"))
+                .expect("remember");
+            // Distinct created_at per row: recall orders by timestamp, and two
+            // inserts within the same clock tick would make the order ambiguous.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let all = store.recall("demo", 50).expect("recall");
+        let contents: Vec<_> = all.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            [
+                "message 0",
+                "message 1",
+                "message 2",
+                "message 3",
+                "message 4"
+            ]
+        );
+
+        let last3 = store.recall("demo", 3).expect("recall limited");
+        let contents: Vec<_> = last3.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["message 2", "message 3", "message 4"],
+            "limit must keep the LAST N, still chronological"
+        );
+    }
+
+    #[test]
+    fn recall_of_an_empty_scope_is_empty_not_an_error() {
+        let store = Store::open_in_memory().expect("open");
+        assert!(store.recall("nothing-here", 10).expect("recall").is_empty());
+    }
+
+    #[test]
+    fn search_spans_scopes_filters_by_scope_ranks_and_limits() {
+        let store = Store::open_in_memory().expect("open");
+        // Short document, three hits: best BM25 rank for "alpha".
+        store
+            .remember("a", "s1", "note", "alpha alpha alpha")
+            .expect("remember");
+        // Long document, one hit: worse rank.
+        store
+            .remember(
+                "a",
+                "s2",
+                "note",
+                "alpha buried in a much longer run of entirely unrelated filler words",
+            )
+            .expect("remember");
+        store
+            .remember("a", "s3", "note", "no match here at all")
+            .expect("remember");
+
+        let across = store.search("alpha", None, 10).expect("search all scopes");
+        assert_eq!(across.len(), 2, "scope=None must search every scope");
+        assert_eq!(
+            across[0].scope, "s1",
+            "FTS5 rank orders the denser, shorter document first"
+        );
+        assert_eq!(across[1].scope, "s2");
+
+        let scoped = store
+            .search("alpha", Some("s2"), 10)
+            .expect("search one scope");
+        assert_eq!(scoped.len(), 1, "scope=Some must filter to that scope");
+        assert_eq!(scoped[0].scope, "s2");
+
+        assert_eq!(
+            store
+                .search("alpha", None, 1)
+                .expect("search limited")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn adversarial_fts_syntax_is_stored_and_searched_without_error() {
+        let store = Store::open_in_memory().expect("open");
+        let nasty = [
+            "a AND b",
+            "-negated",
+            "col:value",
+            "phrase \"quoted\" here",
+            "star*",
+            "(parens)",
+        ];
+        for (i, content) in nasty.iter().enumerate() {
+            let scope = format!("adv-{i}");
+            store
+                .remember("a", &scope, "note", content)
+                .expect("remember");
+            // Query with the raw adversarial text itself: sanitize_fts_query must
+            // keep FTS5 from reading any of it as query syntax.
+            let hits = store.search(content, Some(&scope), 10).unwrap_or_else(|e| {
+                panic!("query {content:?} must not be an FTS5 syntax error: {e}")
+            });
+            assert_eq!(hits.len(), 1, "query {content:?} should find its own row");
+            assert_eq!(hits[0].content, *content);
+        }
+    }
+
+    #[test]
+    fn search_with_an_empty_query_is_a_storage_error_today() {
+        // Documents (not blesses) current behavior: sanitize_fts_query("")
+        // yields an empty MATCH expression, which FTS5 rejects as a syntax
+        // error, so `search` surfaces Err rather than Ok(vec![]).
+        let store = Store::open_in_memory().expect("open");
+        store
+            .remember("a", "demo", "note", "content")
+            .expect("remember");
+        assert!(store.search("", None, 10).is_err());
+    }
+
+    #[test]
+    fn get_returns_some_for_known_and_none_for_unknown_ids() {
+        let store = Store::open_in_memory().expect("open");
+        let mem = store
+            .remember("a", "demo", "note", "findable")
+            .expect("remember");
+        let found = store
+            .get(&mem.id)
+            .expect("get")
+            .expect("known id must be Some");
+        assert_eq!(found.id, mem.id);
+        assert_eq!(found.content, "findable");
+        assert!(store.get("no-such-id").expect("get unknown").is_none());
+    }
+
+    #[test]
+    fn remember_preserves_content_verbatim() {
+        let store = Store::open_in_memory().expect("open");
+
+        let multibyte = "unicode: 日本語 🚀 émoji Ω\nsecond line\r\nthird\tline";
+        let mem = store
+            .remember("a", "demo", "note", multibyte)
+            .expect("remember multibyte");
+        assert_eq!(mem.content, multibyte);
+        assert_eq!(
+            store.get(&mem.id).expect("get").expect("row").content,
+            multibyte
+        );
+
+        let big = "0123456789ABCDEF".repeat(640); // exactly 10 KiB
+        assert_eq!(big.len(), 10 * 1024);
+        let mem = store
+            .remember("a", "demo", "note", &big)
+            .expect("remember 10 KiB");
+        assert_eq!(store.get(&mem.id).expect("get").expect("row").content, big);
     }
 }

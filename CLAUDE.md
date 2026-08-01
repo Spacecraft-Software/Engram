@@ -37,7 +37,7 @@ curl -s -XPOST localhost:8420/v1/memory -d '{"agent":"kimi","scope":"x","content
 curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 ```
 
-There are no tests yet — scaffold status. Compile-by-inspection only.
+`cargo test` covers the rules subsystem (unit tests in `rules.rs`/`store.rs`) and the memory surfaces (integration tests in `tests/cli.rs`). CI runs rustfmt, clippy, and the test suite via `.github/workflows/ci.yml`.
 
 ## Architecture
 
@@ -45,7 +45,7 @@ There are no tests yet — scaffold status. Compile-by-inspection only.
 
 | Surface | Entrypoint | Caller | Notes |
 |---|---|---|---|
-| **CLI** | `engram remember/recall/search/mcp/serve/schema/describe` | Command-line tools, shell scripts | Clap derive; stdin fallback for content |
+| **CLI** | `engram remember/recall/search/save-chat/mcp/serve/schema/describe` | Command-line tools, shell scripts | Clap derive; stdin fallback for content |
 | **MCP** | `engram mcp` | Claude Code, Codex, other MCP clients | rmcp 0.16 stdio; `#[tool_router]`/`#[tool_handler]` macros |
 | **HTTP** | `engram serve` | Any HTTP client (curl, Kimi, Ollama Cloud, etc.) | Axum; `127.0.0.1:8420` only; no auth |
 
@@ -55,10 +55,10 @@ There are no tests yet — scaffold status. Compile-by-inspection only.
 - `rules.rs` — durable project rules: scope resolution, markdown rendering, sentinel-block sync
 - `cli.rs` — clap command/argument definitions (`Command` enum, `Cli` struct)
 - `mcp.rs` — MCP server (`#[tool_router]` registration, `#[tool_handler]` impls)
-- `http.rs` — Axum HTTP server (routes: POST `/v1/memory`, GET `/v1/memory/recall`, `GET /health`, etc.)
+- `http.rs` — Axum HTTP server (routes: POST `/v1/memory`, GET `/v1/memory/recall`, GET `/v1/memory/search`, GET `/v1/health`, the `/v1/rules*` family)
 - `error.rs` — `AppError` enum; error codes (InvalidArgument, DbError, etc.), exit codes, structured error emission
 - `output/` — Output formatting and envelope
-  - `mode.rs` — `OutputMode` (Human, Json); detection logic (--json, env vars, TTY)
+  - `mode.rs` — `OutputMode` and `Format` (json, jsonl, csv); detection logic (`--format`/`--json`, env vars, TTY)
   - `envelope.rs` — `Response<T>` struct for all command outputs
 - `time.rs` — ISO 8601 UTC timestamp generation via `jiff` (never local time)
 
@@ -82,16 +82,17 @@ There are no tests yet — scaffold status. Compile-by-inspection only.
   // SPDX-License-Identifier: GPL-3.0-or-later
   ```
 - **Timestamps:** ISO 8601 UTC only (via `jiff`, never local time). Suffix with `Z` if needed.
-- **CLI shape:** Per the Spacecraft Software Dual-Mode Self-Documenting CLI Standard (v1.0.0) — all commands emit structured output, `--json` flag or non-TTY stdout triggers machine mode (JSON to stdout, structured errors to stderr).
+- **CLI shape:** Per the Spacecraft Software Dual-Mode Self-Documenting CLI Standard (v1.0.0) — all commands emit structured output. Mode cascade: explicit `--format`/`--json` > agent env vars (`AI_AGENT`/`AGENT` set non-empty, `CI` truthy) > non-TTY stdout ⇒ machine mode (JSON to stdout, structured errors to stderr).
 - **Envelopes:** Every command/route returns `Response<T>` (operation name, data, optional error).
 - **Role defaults:** `"note"` on all surfaces. Alternatives: `"user"`, `"assistant"`, `"system"`.
 
 ## Command reference
 
 **CLI:**
-- `remember --agent <name> --scope <id> [--role <role>] [<content>]` — store a message (or read from stdin)
+- `remember --agent <name> --scope <id> [--role <role>] [--dry-run] [<content>]` — store a message (or read from stdin); `--dry-run` validates and shows what would be stored without writing
 - `recall --scope <id> [--limit <n>]` — fetch last N messages for a scope (default 50)
 - `search <query> [--scope <id>] [--limit <n>]` — full-text search (default limit 20)
+- `save-chat --scope <id> [--file <path>] [--model <name>]` — export a scope's full history to a Texinfo file. `--file` defaults to `chat/<timestamp>.texi`; an existing file is appended to (a new signed chapter), and `chat/` is added to `.gitignore` automatically. `--model` names the signing model (falls back to `MODEL`/`LLM_MODEL`/`AI_AGENT`/`AGENT` env vars)
 - `rule add --id <kebab-id> [--scope <id>] [--agent <name>] [<text>]` — record or revise a rule (stdin if text omitted)
 - `rule list [--scope <id>] [--include-retired]` — rules in effect, ordered by id
 - `rule retire --id <kebab-id> [--scope <id>]` — withdraw a rule (tombstone; re-adding reinstates)
@@ -103,8 +104,10 @@ There are no tests yet — scaffold status. Compile-by-inspection only.
 
 **Global flags:**
 - `--db <path>` — database file (env: `ENGRAM_DB`, default: `engram.db`)
-- `--json` — machine output (single-line JSON)
+- `--json` — machine output; alias for `--format json`
+- `--format <json|jsonl|csv>` — machine output format, overrides mode auto-detection. `jsonl`: first line is `{"metadata":...,"data":null}`, then one line per record (arrays) or one line with the object. `csv`: RFC 4180 rows on stdout (header from the first record's keys), metadata as one JSON line on stderr. `yaml`/`explore` are deferred
 - `--no-color` — disable colors (respects `NO_COLOR` env var)
+- `--accessible` — accessible output per Standard §18: plain linear text, no color, status tags. Also enabled by `SPACECRAFT_A11Y=1`; the flag wins over `SPACECRAFT_A11Y=0`
 
 ## Rules (`src/rules.rs`)
 
@@ -127,7 +130,7 @@ Rules are on all three surfaces. HTTP routes: `POST /v1/rules`, `GET /v1/rules` 
 
 Two HTTP notes worth carrying forward:
 
-- **Status codes.** The rule routes return real ones (400 malformed, 404 unknown rule) via the `ApiResult`/`ok`/`err` helpers in `http.rs`. The older `/v1/memory*` handlers answer `200 OK` with an `{"error":...}` body — a defect kept only because fixing it breaks callers. Copy the rule routes when adding endpoints.
+- **Status codes.** As of 0.2.0, **all** routes return real status codes via the `ApiResult`/`ok`/`err` helpers in `http.rs` — 400 on a malformed request (e.g. empty/whitespace `content` on `POST /v1/memory`), 404 on an unknown rule, 500 on storage failure. This was a deliberate breaking change: the 0.1.x `/v1/memory*` handlers answered `200 OK` with an `{"error":...}` body, and callers that only parsed the body must now check the HTTP status. Keep following this pattern when adding endpoints.
 - **Path-param syntax.** Routes use `:rule_id`, not `{rule_id}`. axum is pinned at 0.7 (matchit 0.7), where the brace form compiles but matches only the literal string, so the route silently never fires. Change to braces when upgrading to axum 0.8+.
 
 `POST /v1/rules/sync` is the only route that writes outside the database. Targets derive from the server process's cwd, never from caller input (no traversal surface), and the CLI's `--file` override is deliberately not exposed. With the no-auth posture this means any local process can rewrite that project's `AGENTS.md`/`CLAUDE.md`.
@@ -137,7 +140,8 @@ Two HTTP notes worth carrying forward:
 - `ENGRAM_DB` — override database path
 - `ENGRAM_SCOPE` — default scope for `rule` commands
 - `ENGRAM_AGENT` — default `--agent` for `rule add`
-- `AI_AGENT`, `AGENT`, `CI` — trigger machine output mode (detected for structured logging in CI/agent contexts)
+- `AI_AGENT`, `AGENT` (set non-empty), `CI` (truthy) — trigger machine output mode (detected for structured logging in CI/agent contexts)
+- `SPACECRAFT_A11Y` — `1` enables accessible output, `0` disables auto-detection (`--accessible` still wins)
 - `NO_COLOR` — disable colors
 
 ## Agent usage
@@ -150,18 +154,18 @@ In Claude Code or other multi-model pipelines:
 
 4. **Call `rule_list`** at session start to load standing policy, and `rule_add` + `rule_sync` when the user states a requirement that must hold in future sessions (as opposed to a fact about this one).
 
-All three surfaces (CLI, MCP, HTTP) hit the same `Store`, so memories are shared across deployment modes. Rules are CLI + MCP only.
+All three surfaces (CLI, MCP, HTTP) hit the same `Store`, so memories are shared across deployment modes. Rules are on all three surfaces too.
 
 ## What's not yet implemented
 
-- Format options (`--format yaml|csv|jsonl`); only `--json` and human text exist.
-- `--dry-run` on `remember` (Standard §3 calls for it on every write command). `rule sync` has one.
+Landed in 0.2.0 (no longer gaps): `--format jsonl|csv`, `remember --dry-run`, real status codes on **all** HTTP routes (a breaking change — see the HTTP notes above), packaging manifests (`packaging/`), the Texinfo manual skeleton (`doc/engram.texi`), `CREDITS.md`, CI, and tests over the memory surfaces.
+
+Still missing:
+
+- `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore` (no TUI yet).
 - Purging retired rules — tombstones accumulate, and there is no `rule purge`.
-- Correct status codes on the older `/v1/memory*` routes (breaking change, awaits a version bump).
-- Packaging manifests (Guix, Nix, PKGBUILD), Texinfo manual, `CREDITS.md`.
 - Semantic (embedding) search — upgrade path is `sqlite-vec` as a loadable extension.
 - Authentication on the HTTP surface (currently `127.0.0.1`-only, no bearer check).
-- CI and formatter config. Tests exist for the rules subsystem only (`cargo test`, 11 unit tests in `rules.rs` and `store.rs`); the memory surfaces have none.
 
 ## See also
 

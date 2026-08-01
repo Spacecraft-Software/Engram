@@ -9,7 +9,7 @@ cargo build --release                    # LTO, 1 codegen unit, panic=abort
 cargo doc -p rmcp --open                 # verify rmcp 0.16 macro shape if build fails
 ```
 
-No tests yet, no CI, no formatter config. Scaffold — compiles-by-inspection.
+`cargo test` covers the rules subsystem (unit tests in `rules.rs`/`store.rs`) and the memory surfaces (integration tests in `tests/cli.rs`). CI: `.github/workflows/ci.yml` (rustfmt, clippy, tests). Formatter config: `rustfmt.toml`.
 
 ## Architecture
 
@@ -17,18 +17,21 @@ No tests yet, no CI, no formatter config. Scaffold — compiles-by-inspection.
 
 | Surface | Entrypoint | Notes |
 |---|---|---|
-| CLI | `engram remember/recall/search/mcp/serve/schema/describe` | clap derive, stdin fallback for content |
+| CLI | `engram remember/recall/search/save-chat/mcp/serve/schema/describe` | clap derive, stdin fallback for content |
 | MCP | `engram mcp` | rmcp 0.16 stdio, `#[tool_router]`/`#[tool_handler]` macros |
 | HTTP | `engram serve` | axum, `127.0.0.1:8420`, no auth |
 
 ## CLI quirks
 
-- `remember` content: positional **or** stdin pipe. No content → error exit 2.
-- `--json` flag OR any of `AI_AGENT`, `AGENT`, `CI` env vars OR non-TTY stdout → machine output (single-line JSON to stdout, structured error to stderr).
+- `remember` content: positional **or** stdin pipe. No content → error exit 2. `--dry-run` validates and shows what would be stored without writing.
+- Mode cascade: explicit `--format`/`--json` > `AI_AGENT`/`AGENT` set non-empty or `CI` truthy > non-TTY stdout → machine output (single-line JSON to stdout, structured error to stderr).
+- `--format <json|jsonl|csv>` (global; `--json` is an alias for `--format json`). `jsonl`: first line `{"metadata":...,"data":null}`, then one line per record. `csv`: RFC 4180 rows on stdout, metadata as one JSON line on stderr. `yaml`/`explore` deferred.
+- `--accessible` (global): plain linear output per Standard §18. Also via `SPACECRAFT_A11Y=1`; the flag wins over `SPACECRAFT_A11Y=0`.
+- `save-chat --scope S [--file PATH] [--model NAME]`: export a scope's history to Texinfo. Default `chat/<timestamp>.texi`; appends to an existing file; auto-gitignores `chat/`. `--model` falls back to `MODEL`/`LLM_MODEL`/`AI_AGENT`/`AGENT`.
 - `ENGRAM_DB` env var for db path (default: `engram.db`).
 - `--no-color` respects `NO_COLOR` convention.
 - `describe` subcommand prints JSON capability manifest (CLI Standard introspection).
-- `schema` prints JSON Schema for the `Memory` type.
+- `schema` prints JSON Schema for engram's data types, as `{"Memory": ..., "Rule": ...}`.
 
 ## Storage
 
@@ -81,9 +84,10 @@ engram rule sync [--scope S] [--file PATH]... [--dry-run]
   follow with `rule sync` or the files keep asserting the retired rule.
 - MCP tools: `rule_add`, `rule_list`, `rule_retire`, `rule_sync`.
 - HTTP: `POST /v1/rules`, `GET /v1/rules` (`?scope=`, `?include_retired=`),
-  `DELETE /v1/rules/:rule_id` (retires; soft), `POST /v1/rules/sync`. These
-  return real status codes (400/404); the older `/v1/memory*` routes wrongly
-  answer `200` with an error body — follow the rule routes, not those.
+  `DELETE /v1/rules/:rule_id` (retires; soft), `POST /v1/rules/sync`. As of
+  0.2.0 **all** routes — rules and `/v1/memory*` alike — return real status
+  codes (400/404/500); errors no longer arrive as `200` with an error body
+  (breaking change — check the HTTP status, not just the body).
   `POST /v1/rules/sync` is the only route that writes outside the database;
   paths derive from the server's cwd, never from caller input, and the CLI's
   `--file` override is intentionally not exposed.
@@ -99,4 +103,4 @@ engram rule sync [--scope S] [--file PATH]... [--dry-run]
 - Call `recall` at session start for that scope.
 - Call `search` before asserting something was already decided.
 - CLI, MCP, and HTTP hit the same `Store`; behavior is identical for
-  remember/recall/search. Rules are CLI + MCP only.
+  remember/recall/search. Rules are on all three surfaces too.

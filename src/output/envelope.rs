@@ -21,6 +21,10 @@ pub struct Metadata {
     pub pagination: Option<Pagination>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_agent: Option<String>,
+    /// Present (and `true`) only on `--dry-run` responses — the
+    /// spacecraft-cli-standard validation-safety §4 contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,13 +44,27 @@ impl<T: Serialize> Response<T> {
                 timestamp: crate::time::now_iso8601(),
                 pagination: None,
                 tool_agent: detect_tool_agent(),
+                dry_run: None,
             },
             data,
         }
     }
 
+    #[expect(
+        dead_code,
+        reason = "pagination lands with the M1/M3 list-shaped endpoints"
+    )]
     pub fn with_pagination(mut self, page: u32, per_page: u32, total: u64) -> Self {
-        self.metadata.pagination = Some(Pagination { page, per_page, total });
+        self.metadata.pagination = Some(Pagination {
+            page,
+            per_page,
+            total,
+        });
+        self
+    }
+
+    pub fn with_dry_run(mut self) -> Self {
+        self.metadata.dry_run = Some(true);
         self
     }
 }
@@ -55,7 +73,13 @@ impl<T: Serialize> Response<T> {
 /// never used to change output shape (the JSON schema stays identical
 /// regardless of which agent is calling).
 fn detect_tool_agent() -> Option<String> {
-    for var in ["CLAUDECODE", "CURSOR_AGENT", "GEMINI_CLI", "AI_AGENT", "AGENT"] {
+    for var in [
+        "CLAUDECODE",
+        "CURSOR_AGENT",
+        "GEMINI_CLI",
+        "AI_AGENT",
+        "AGENT",
+    ] {
         if std::env::var(var).is_ok() {
             return Some(var.to_ascii_lowercase().replace('_', "-"));
         }

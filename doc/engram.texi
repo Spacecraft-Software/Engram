@@ -1,0 +1,655 @@
+\input texinfo   @c -*- texinfo -*-
+@c SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+@c SPDX-License-Identifier: CC-BY-SA-4.0
+@c %**start of header
+@setfilename engram.info
+@documentencoding UTF-8
+@documentlanguage en
+@settitle Engram Manual
+@c %**end of header
+
+@set VERSION 0.2.0-dev
+@set UPDATED 2026-08-01
+
+@copying
+This manual is for Engram (version @value{VERSION}, updated
+@value{UPDATED}), the shared verbatim chat memory store for multi-model
+LLM pipelines.
+
+Copyright @copyright{} 2026 Mohamed Hammad & Spacecraft Software.
+Contact: @email{Mohamed.Hammad@@SpacecraftSoftware.org}.
+Project page: @uref{https://Engram.SpacecraftSoftware.org/}.
+
+@quotation
+This manual is licensed under the Creative Commons
+Attribution-ShareAlike 4.0 International license (CC-BY-SA-4.0).  You
+may copy, redistribute, and adapt it for any purpose, provided you give
+appropriate credit and distribute any adapted material under the same
+license.  See @uref{https://creativecommons.org/licenses/by-sa/4.0/} for
+the full terms.
+@end quotation
+@end copying
+
+@dircategory Software development
+@direntry
+* Engram: (engram).             Shared verbatim chat memory for multi-model LLM pipelines.
+@end direntry
+
+@titlepage
+@title Engram
+@subtitle Shared verbatim chat memory for multi-model LLM pipelines
+@subtitle Version @value{VERSION}
+@author Mohamed Hammad (@email{Mohamed.Hammad@@SpacecraftSoftware.org})
+@page
+@vskip 0pt plus 1filll
+@insertcopying
+@end titlepage
+
+@contents
+
+@ifnottex
+@node Top
+@top Engram
+
+@insertcopying
+@end ifnottex
+
+@menu
+* Introduction::            What Engram is and the three surfaces.
+* Invocation::              The command-line interface.
+* MCP Server::              The seven Model Context Protocol tools.
+* HTTP API::                Routes and their status-code behavior.
+* Environment Variables::   Every variable Engram reads.
+* Rules::                   Durable project policy.
+* Index::                   Concept index.
+@end menu
+
+@node Introduction
+@chapter Introduction
+
+@cindex introduction
+@cindex memory store, shared
+@cindex pipelines, multi-model
+@cindex verbatim memory
+
+Engram is a shared verbatim chat memory store for multi-model LLM
+pipelines.  It keeps decisions, facts, and design rationale in a single
+SQLite file --- with FTS5 full-text search --- that multiple models and
+agents can read from and write to.  Memory persists across the stages
+of a pipeline without requiring LLM calls to encode or retrieve
+context: what was stored is returned verbatim.
+
+@cindex SQLite
+@cindex FTS5
+@cindex full-text search
+
+@section The three surfaces
+
+@cindex surfaces, the three
+Engram exposes one store through three surfaces.  All three dispatch to
+the same underlying storage, so a memory written on any surface is
+immediately visible to the other two.
+
+@table @asis
+@item CLI
+@cindex CLI surface
+The @command{engram} command-line tool, for shell scripts, hooks, and
+direct use.  @xref{Invocation}.
+
+@item MCP
+@cindex MCP surface
+A Model Context Protocol server over stdio (@command{engram mcp}), for
+Claude Code, Codex, and other MCP clients.  @xref{MCP Server}.
+
+@item HTTP
+@cindex HTTP surface
+A local-only HTTP API (@command{engram serve}), for any HTTP client:
+@command{curl}, Kimi, Ollama Cloud, and so on.  @xref{HTTP API}.
+@end table
+
+@section Memories and rules
+
+@cindex memories versus rules
+Engram stores two kinds of durable state.  A @dfn{memory} records what
+happened --- a decision, a fact, a piece of rationale --- scoped to a
+project, task, or run identifier.  A @dfn{rule} states what must keep
+being true: durable project policy that outlives any one session.
+Rules are covered in their own chapter (@pxref{Rules}).
+
+@node Invocation
+@chapter Invocation
+
+@cindex invocation
+@cindex command line
+
+The general form is:
+
+@example
+engram [@var{global-options}] @var{command} [@var{command-options}] [@var{args}]
+@end example
+
+@section Global options
+
+@cindex global options
+@cindex options, global
+
+@table @code
+@item --db @var{path}
+@cindex database path
+Path to the shared SQLite database.  Defaults to @file{engram.db}; the
+@env{ENGRAM_DB} environment variable overrides the default.  All agents
+should point at the same file (or the same @command{engram serve}
+instance) to actually share memory.
+
+@item --json
+@cindex JSON output
+Alias for @code{--format json}.
+
+@item --format @var{format}
+@cindex output formats
+Machine output format: @code{json}, @code{jsonl}, or @code{csv}.
+Overrides mode auto-detection.  (@code{yaml} is deferred.)
+
+@item --no-color
+@cindex colors, disabling
+Disable colored output.  The @env{NO_COLOR} environment variable has
+the same effect.
+
+@item --accessible
+@cindex accessible output
+@cindex accessibility
+Accessible output (Standard @U{00A7}18): plain linear text, no color,
+status tags.  Also enabled by @env{SPACECRAFT_A11Y}=1;
+@env{SPACECRAFT_A11Y}=0 disables auto-detection, but this flag still
+wins.
+@end table
+
+@section Output modes
+
+@cindex output modes
+@cindex machine mode
+@cindex mode cascade
+
+Engram is a dual-mode CLI: human-readable text on a terminal, machine
+output everywhere else.  The mode cascade, from strongest to weakest:
+
+@enumerate
+@item
+An explicit @code{--format} or @code{--json} flag always wins.
+
+@item
+Otherwise, machine (JSON) mode is selected when @env{AI_AGENT} or
+@env{AGENT} is set non-empty, or when @env{CI} is truthy.
+
+@item
+Otherwise, machine (JSON) mode is selected when stdout is not a TTY.
+@end enumerate
+
+Human mode therefore requires a real TTY on stdout.
+
+@subsection The metadata envelope
+
+@cindex envelope, metadata
+@cindex metadata envelope
+Every machine-mode response is wrapped in an envelope:
+
+@verbatim
+{"metadata":{"tool":"engram","version":"0.2.0-dev","command":"recall",
+             "timestamp":"2026-08-01T00:00:00Z"},
+ "data":...}
+@end verbatim
+
+The @code{metadata} object carries @code{tool}, @code{version},
+@code{command}, and an ISO 8601 UTC @code{timestamp}; it optionally
+carries @code{tool_agent} (when an agent environment was detected) and
+@code{dry_run} (on dry runs).  The payload is under @code{data}.
+
+@subsection JSON Lines output
+
+@cindex JSONL
+@cindex JSON Lines
+With @code{--format jsonl}, the first line is the metadata envelope
+with @code{"data": null}; then, for array results, one line follows per
+record --- or, for a single object, one line with that object.
+
+@subsection CSV output
+
+@cindex CSV
+@cindex RFC 4180
+With @code{--format csv}, the data records are emitted as RFC 4180 CSV
+rows on stdout, with the header row derived from the first record's
+keys.  The metadata envelope goes to stderr as one JSON line.
+
+@subsection Errors and exit codes
+
+@cindex errors, structured
+@cindex exit codes
+In machine mode, errors are a single line of JSON on stderr:
+
+@verbatim
+{"error":{"code":"...","exit_code":2,"message":"...","hint":"...",
+          "timestamp":"...","command":"...","docs_url":"..."}}
+@end verbatim
+
+Exit codes:
+
+@table @code
+@item 0
+Success.
+@item 1
+Internal or storage error.
+@item 2
+Invalid argument.
+@item 3
+Not found.
+@end table
+
+@section engram remember
+
+@cindex remember command
+@cindex storing a memory
+
+@example
+engram remember --agent @var{name} --scope @var{id} [--role @var{role}] [--dry-run] [@var{content}]
+@end example
+
+Store a verbatim message.  When @var{content} is omitted, it is read
+from stdin.  @code{--role} defaults to @code{note} (alternatives:
+@code{user}, @code{assistant}, @code{system}).
+
+@cindex dry run
+With @code{--dry-run}, the message is validated and the would-be record
+shown, without writing anything; the machine envelope carries
+@code{"dry_run": true}.
+
+@section engram recall
+
+@cindex recall command
+
+@example
+engram recall --scope @var{id} [--limit @var{n}]
+@end example
+
+Read back the last @var{n} messages for a scope, in chronological
+order.  @code{--limit} defaults to 50.
+
+@section engram search
+
+@cindex search command
+
+@example
+engram search @var{query} [--scope @var{id}] [--limit @var{n}]
+@end example
+
+Full-text (FTS5) search across stored memories, optionally restricted
+to one scope.  @code{--limit} defaults to 20.  Query tokens are
+sanitized --- each is matched as a quoted phrase --- so arbitrary input
+cannot inject FTS5 syntax.
+
+@section engram rule
+
+@cindex rule command
+
+Durable project rules --- policy that outlives a session
+(@pxref{Rules} for the concept and invariants).
+
+@subsection rule add
+
+@example
+engram rule add --id @var{kebab-id} [--scope @var{id}] [--agent @var{name}] [@var{text}]
+@end example
+
+Record a rule, or revise the existing rule with the same @code{--id}
+(an upsert --- never a second, competing copy).  @var{text} is read
+from stdin when omitted.  @code{--agent} defaults to
+@env{ENGRAM_AGENT}, else @code{engram-cli}.  Storing a rule does not
+surface it to anyone --- follow with @command{engram rule sync}.
+
+@subsection rule list
+
+@example
+engram rule list [--scope @var{id}] [--include-retired]
+@end example
+
+List the rules in effect for a scope, ordered by id.
+@code{--include-retired} also shows withdrawn rules, flagged with
+@code{"retired": true}.
+
+@subsection rule retire
+
+@example
+engram rule retire --id @var{kebab-id} [--scope @var{id}]
+@end example
+
+Withdraw a rule so it stops being binding.  The rule is tombstoned, not
+deleted (@pxref{Rules}).  Retiring an unknown id is an error (exit
+code 3).
+
+@subsection rule sync
+
+@example
+engram rule sync [--scope @var{id}] [--file @var{path}]@dots{} [--dry-run]
+@end example
+
+Render the scope's rules into @file{AGENTS.md} and @file{CLAUDE.md}
+(or the given @code{--file} targets, repeatable).  Only the region
+between the engram sentinels is rewritten.  With @code{--dry-run},
+reports what would be written without touching any file.
+
+@section engram mcp
+
+@cindex mcp command
+
+@example
+engram mcp [--db @var{path}]
+@end example
+
+Run as an MCP server over stdio.  @xref{MCP Server}.
+
+@section engram serve
+
+@cindex serve command
+
+@example
+engram serve [--addr @var{ip:port}] [--db @var{path}]
+@end example
+
+Run the HTTP API.  @code{--addr} defaults to @code{127.0.0.1:8420}.
+@xref{HTTP API}.
+
+@section engram schema
+
+@cindex schema command
+@cindex introspection
+
+@example
+engram schema
+@end example
+
+Print the JSON Schema for Engram's data types, as
+@code{@{"Memory": @dots{}, "Rule": @dots{}@}} (CLI Standard
+introspection).
+
+@section engram describe
+
+@cindex describe command
+@cindex capability manifest
+
+@example
+engram describe
+@end example
+
+Print the machine-readable CLI Standard capability manifest (JSON).
+
+@section engram save-chat
+
+@cindex save-chat command
+@cindex chat history, exporting
+
+@example
+engram save-chat --scope @var{id} [--file @var{path}] [--model @var{name}]
+@end example
+
+Save a complete chat history for a scope to a Texinfo file.
+@code{--file} defaults to @file{chat/@var{timestamp}.texi};
+@code{--model} records an optional signature model/agent name (for
+example @code{gpt-5.6-pro}).
+
+@node MCP Server
+@chapter MCP Server
+
+@cindex MCP server
+@cindex Model Context Protocol
+@cindex stdio transport
+
+@command{engram mcp} runs a Model Context Protocol server over stdio,
+suitable for wiring into Claude Code, Codex, and other MCP clients:
+
+@example
+engram mcp --db /path/to/engram.db
+@end example
+
+The server exposes seven tools.  The memory tools mirror the CLI
+commands of the same names; the rule tools mirror @command{engram
+rule}.
+
+@table @code
+@item remember
+@cindex remember tool (MCP)
+Store a verbatim chat message in shared memory, scoped to a
+project/task/run id.  @code{role} defaults to @code{note}.
+
+@item recall
+@cindex recall tool (MCP)
+Read back the last N memories for a scope, in chronological order
+(default limit 50).
+
+@item search
+@cindex search tool (MCP)
+Full-text search across stored memories, optionally restricted to one
+scope (default limit 20).
+
+@item rule_add
+@cindex rule_add tool (MCP)
+Record a durable project rule, or revise the existing rule with the
+same @code{rule_id}.  @code{agent} defaults to @code{mcp-client}.
+
+@item rule_list
+@cindex rule_list tool (MCP)
+List the durable rules in effect for a scope, ordered by
+@code{rule_id}.  Call at session start to load standing policy.
+
+@item rule_retire
+@cindex rule_retire tool (MCP)
+Withdraw a rule so it stops being binding.  Tombstones rather than
+deletes.
+
+@item rule_sync
+@cindex rule_sync tool (MCP)
+Render a scope's rules into @file{AGENTS.md} and @file{CLAUDE.md} at
+the project root.
+@end table
+
+@cindex scope, under MCP
+One caution: the rule tools' scope cascade (@pxref{Rules}) resolves
+against the @emph{server process's} working directory, not the
+client's.  A shared server therefore needs an explicit @code{scope}
+argument on every rule call.
+
+@node HTTP API
+@chapter HTTP API
+
+@cindex HTTP API
+@cindex routes
+
+@command{engram serve} binds a local-only HTTP API --- default
+@code{127.0.0.1:8420}, no authentication.  Do not expose it beyond the
+loopback interface.
+
+@cindex status codes
+As of 0.2.0, @emph{all} routes return real HTTP status codes (a
+deliberate breaking change: before 0.2.0 the @code{/v1/memory*}
+handlers answered @code{200 OK} with an error body).  Success
+responses carry the same metadata envelope as the CLI's machine mode.
+
+@table @code
+@item POST /v1/memory
+@cindex POST /v1/memory
+Store a memory.  Body: @code{@{"agent": @dots{}, "scope": @dots{},
+"content": @dots{}@}} (optional @code{role}).  Returns @code{400} if
+@code{content} is empty or whitespace-only, @code{200} with the stored
+Memory in the envelope on success, @code{500} on a storage error.
+
+@item GET /v1/memory/recall?scope=&limit=
+@cindex GET /v1/memory/recall
+Fetch the last N memories for a scope, chronological order.
+
+@item GET /v1/memory/search?query=&scope=&limit=
+@cindex GET /v1/memory/search
+Full-text search, optionally scoped.
+
+@item POST /v1/rules
+@cindex POST /v1/rules
+Create or revise a rule (re-using a @code{rule_id} updates in place).
+Returns @code{400} for an invalid id or text.
+
+@item GET /v1/rules
+@cindex GET /v1/rules
+Active rules for a scope (@code{?scope=}); @code{?include_retired=}
+adds tombstoned rules.
+
+@item DELETE /v1/rules/:rule_id
+@cindex DELETE /v1/rules/:rule_id
+Retire (tombstone --- soft delete) a rule.  Returns @code{404} for an
+unknown rule, @code{200} with the outcome on success.
+
+@item POST /v1/rules/sync
+@cindex POST /v1/rules/sync
+Render the scope's rules into @file{AGENTS.md} and @file{CLAUDE.md}.
+This is the only route that writes outside the database; targets
+derive from the server process's working directory, never from caller
+input.
+
+@item GET /v1/health
+@cindex GET /v1/health
+Liveness probe.
+@end table
+
+@node Environment Variables
+@chapter Environment Variables
+
+@cindex environment variables
+
+@table @env
+@item ENGRAM_DB
+@cindex ENGRAM_DB
+Database file path; overrides the @file{engram.db} default (the
+@code{--db} flag overrides both).
+
+@item ENGRAM_SCOPE
+@cindex ENGRAM_SCOPE
+Default scope for the @command{rule} commands, consulted by the scope
+cascade (@pxref{Rules}).
+
+@item ENGRAM_AGENT
+@cindex ENGRAM_AGENT
+Default @code{--agent} for @command{rule add} (falling back to
+@code{engram-cli}).
+
+@item AI_AGENT
+@itemx AGENT
+@cindex AI_AGENT
+@cindex AGENT
+Presence-based agent detection: set to any non-empty value, they
+select machine output mode (and record @code{tool_agent} in the
+envelope).
+
+@item CI
+@cindex CI
+Truthy-based: selects machine output mode when set to a non-empty
+value other than @code{0} or @code{false} (case-insensitive).
+
+@item NO_COLOR
+@cindex NO_COLOR
+Set non-empty, disables colored output (same as @code{--no-color}).
+
+@item SPACECRAFT_A11Y
+@cindex SPACECRAFT_A11Y
+Accessible output toggle (Standard @U{00A7}18): @code{0} is an explicit
+off; any other non-empty value enables accessible mode.  The
+@code{--accessible} flag always wins.
+@end table
+
+@node Rules
+@chapter Rules
+
+@cindex rules, durable
+@cindex policy, durable
+
+A memory records what happened; a @dfn{rule} states what must keep
+being true.  Rules are durable project policy: stored once, revised in
+place, and rendered into the markdown files agent harnesses load
+automatically, so the policy keeps applying without anyone remembering
+to restate it.  Rules are available on all three surfaces.
+
+@section Invariants
+
+@cindex invariants, rules
+Four invariants worth not breaking:
+
+@enumerate
+@item
+@cindex sync, as delivery
+@emph{Sync is the delivery mechanism, not an export.}  A row in SQLite
+never reaches a model's context.  Rendering into @file{AGENTS.md} and
+@file{CLAUDE.md} --- files harnesses auto-load --- is what makes a rule
+take effect.
+
+@item
+@emph{The rendered block is a pure function of the rules.}  No
+generation timestamp; rules ordered by @code{rule_id}.  That makes
+sync idempotent (unchanged rules mean no write) and therefore safe in
+a hook or commit gate.
+
+@item
+@emph{Add upserts.}  Re-using a @code{rule_id} revises in place;
+@code{created_at} survives, @code{updated_at} moves.  Two competing
+copies of a rule are worse than none.
+
+@item
+@cindex tombstone
+@emph{Retire tombstones, never deletes.}  A retired rule disappears
+from listings and synced files but stays in the database and remains
+searchable --- ``we used to require this'' is worth keeping.
+Re-running @command{rule add} with the same id reinstates it.
+Retiring is idempotent; an unknown id is an error (exit code 3 on the
+CLI, @code{404} over HTTP), not a silent success.
+@end enumerate
+
+@section Sentinels
+
+@cindex sentinels
+@cindex managed block
+The rendered block sits between HTML-comment sentinels; only that
+region is ever rewritten, and everything outside it is preserved
+verbatim:
+
+@verbatim
+<!-- engram:rules:begin ... -->
+   ... rendered rules ...
+<!-- engram:rules:end -->
+@end verbatim
+
+Rule text containing @code{engram:rules:} is rejected at write time
+--- it would terminate its own block.  An opening sentinel with no
+closing one is treated as a mangled block and replaced wholesale.
+
+@section Scope cascade
+
+@cindex scope cascade
+@cindex scope_origin
+When @code{--scope} is not given, the scope resolves through a
+cascade, and the chosen origin is reported as @code{scope_origin}:
+
+@enumerate
+@item
+The explicit @code{--scope} argument.
+@item
+The @env{ENGRAM_SCOPE} environment variable.
+@item
+The git working-tree basename.
+@item
+The current directory basename.
+@end enumerate
+
+Under MCP this cascade resolves against the server process's working
+directory, so a shared server needs an explicit scope
+(@pxref{MCP Server}).
+
+@node Index
+@unnumbered Index
+
+@cindex index
+@printindex cp
+
+@bye

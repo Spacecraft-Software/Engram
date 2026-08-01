@@ -10,6 +10,10 @@ use serde::Serialize;
 pub enum ErrorCode {
     NotFound,
     InvalidArgument,
+    #[expect(
+        dead_code,
+        reason = "emitted by M2 supersession (already-superseded targets)"
+    )]
     Conflict,
     InternalError,
     StorageError,
@@ -28,7 +32,12 @@ pub struct AppError {
 }
 
 impl AppError {
-    pub fn new(code: ErrorCode, exit_code: i32, message: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub fn new(
+        code: ErrorCode,
+        exit_code: i32,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
         Self {
             code,
             exit_code,
@@ -49,6 +58,7 @@ impl AppError {
         )
     }
 
+    #[expect(dead_code, reason = "used by M2 supersession error paths")]
     pub fn not_found(what: &str) -> Self {
         Self::new(
             ErrorCode::NotFound,
@@ -68,10 +78,23 @@ impl AppError {
         eprintln!("{line}");
     }
 
-    pub fn emit_human(&self) {
+    /// Human-readable error to stderr. The `[ERROR]` tag is always present so
+    /// status is never carried by color alone (Standard §18.2.1); `color`
+    /// follows the resolved output mode, honoring `--no-color`/`NO_COLOR`.
+    pub fn emit_human(&self, color: bool) {
         use owo_colors::OwoColorize;
-        eprintln!("{}: {}", "error".red().bold(), self.message.red());
-        eprintln!("       {}: {}", "hint".yellow(), self.hint);
+        if color {
+            // Mars Red / Plasma Magenta per the Steelbore Modern palette (§11).
+            eprintln!(
+                "{} {}",
+                "[ERROR]".truecolor(255, 59, 59).bold(),
+                self.message
+            );
+            eprintln!("        {}: {}", "hint".truecolor(228, 69, 255), self.hint);
+        } else {
+            eprintln!("[ERROR] {}", self.message);
+            eprintln!("        hint: {}", self.hint);
+        }
     }
 }
 
