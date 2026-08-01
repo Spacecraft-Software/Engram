@@ -84,6 +84,21 @@ pub struct RuleUpsert {
     pub created: bool,
 }
 
+/// A budget-packed context block assembled by [`Store::context`]: the
+/// scope's active rules first, then the memories that fit the remaining
+/// budget.
+#[derive(Debug, Serialize)]
+pub struct ContextResult {
+    /// Active rules for the scope — always all of them, even over budget.
+    pub rules: Vec<Rule>,
+    /// Included memories, in chronological order for prompt reading.
+    pub memories: Vec<Memory>,
+    /// Estimated token cost of the rules section.
+    pub rules_tokens: u32,
+    /// What was kept, what was cut, and by which yardstick.
+    pub budget: crate::retrieval::BudgetReport,
+}
+
 impl Store {
     /// Opens (creating if needed) the shared database file. Point every
     /// agent at the same path — that's the entire "shared memory" story.
@@ -212,6 +227,135 @@ impl Store {
             stmt.query_map(params![query, limit], row_to_memory)?
         };
         rows.collect()
+    }
+
+    /// Assembles a budget-packed context block for session start.
+    ///
+    /// Rules come first and are **always all included**, even when they alone
+    /// exceed `budget_tokens` — policy is never silently dropped; the caller
+    /// can see the overrun in the returned [`crate::retrieval::BudgetReport`].
+    /// Memories are then packed into whatever budget remains.
+    ///
+    /// Candidate *selection* order is newest-first recency when there is no
+    /// query, or the reciprocal-rank fusion of the recency channel
+    /// (newest-first) with the FTS relevance channel (rank order) when there
+    /// is one. *Presentation* is different: the included memories are
+    /// re-sorted chronologically, because a prompt reads best oldest-first
+    /// even though packing priority favors the newest and most relevant.
+    ///
+    /// A whitespace-only `query` is treated as no query at all — `search`
+    /// would reject the degenerate FTS expression with an error. Rule rows
+    /// that `recall`/`search` surface are skipped as candidates: they are
+    /// already in the rules section and must not be double-counted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if any query fails.
+    pub fn context(
+        &self,
+        scope: &str,
+        query: Option<&str>,
+        limit: u32,
+        budget_tokens: u32,
+    ) -> rusqlite::Result<ContextResult> {
+        use crate::retrieval::{estimate_tokens, greedy_pack, BudgetReport, ESTIMATOR, RRF_K};
+        use std::collections::{BTreeMap, HashMap, HashSet};
+
+        let rules = self.rules(scope)?;
+        let rules_tokens: u32 = rules.iter().map(|r| estimate_tokens(&r.text)).sum();
+
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+
+        // Rule rows live in the same table and come back from both recall
+        // and search; they are already in the rules section, so they are not
+        // memory candidates.
+        let recency: Vec<Memory> = self
+            .recall(scope, limit)?
+            .into_iter()
+            .filter(|m| m.rule_id.is_none())
+            .collect();
+        let relevance: Vec<Memory> = match query {
+            Some(q) => self
+                .search(q, Some(scope), limit)?
+                .into_iter()
+                .filter(|m| m.rule_id.is_none())
+                .collect(),
+            None => Vec::new(),
+        };
+        let recency_count = recency.len();
+        let relevance_count = relevance.len();
+
+        // Selection priority: fused when a query ran, plain newest-first
+        // otherwise. `rrf_fuse` dedupes ids across channels by construction.
+        let priority_ids: Vec<String> = if query.is_some() {
+            let recency_channel: Vec<String> = recency.iter().rev().map(|m| m.id.clone()).collect();
+            let relevance_channel: Vec<String> = relevance.iter().map(|m| m.id.clone()).collect();
+            crate::retrieval::rrf_fuse(&[recency_channel, relevance_channel], RRF_K)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        } else {
+            recency.iter().rev().map(|m| m.id.clone()).collect()
+        };
+
+        // Union of both channels, keyed by id so an id appearing in both is
+        // included once.
+        let mut pool: HashMap<String, Memory> = HashMap::new();
+        for m in recency.into_iter().chain(relevance) {
+            pool.entry(m.id.clone()).or_insert(m);
+        }
+
+        let remaining = budget_tokens.saturating_sub(rules_tokens);
+        // Every priority id is in the pool by construction (both feed from
+        // the same fetches), so the filter_map is belt-and-braces only.
+        let costed: Vec<(&str, u32)> = priority_ids
+            .iter()
+            .filter_map(|id| {
+                pool.get(id.as_str())
+                    .map(|m| (id.as_str(), estimate_tokens(&m.content)))
+            })
+            .collect();
+        let pack = greedy_pack(&costed, remaining);
+        let included_ids: HashSet<String> = pack
+            .included
+            .iter()
+            .map(|&index| costed[index].0.to_string())
+            .collect();
+
+        // Presentation order: chronological (with id as a deterministic
+        // tie-break), regardless of the selection priority above.
+        let mut memories: Vec<Memory> = pool
+            .into_values()
+            .filter(|m| included_ids.contains(&m.id))
+            .collect();
+        memories.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let mut channels: BTreeMap<&'static str, usize> = BTreeMap::new();
+        channels.insert("rules", rules.len());
+        channels.insert("recency", recency_count);
+        if query.is_some() {
+            channels.insert("fts", relevance_count);
+        }
+
+        let budget = BudgetReport {
+            requested_tokens: budget_tokens,
+            estimator: ESTIMATOR,
+            estimated_tokens: rules_tokens + pack.tokens,
+            included: rules.len() + memories.len(),
+            dropped: pack.dropped_ids.len(),
+            dropped_ids: pack.dropped_ids,
+            channels,
+        };
+        Ok(ContextResult {
+            rules,
+            memories,
+            rules_tokens,
+            budget,
+        })
     }
 
     #[cfg_attr(
@@ -858,5 +1002,150 @@ mod tests {
             .remember("a", "demo", "note", &big)
             .expect("remember 10 KiB");
         assert_eq!(store.get(&mem.id).expect("get").expect("row").content, big);
+    }
+
+    // ---- Context-assembly tests -----------------------------------------
+
+    /// Stores `content` and pauses so the next row gets a strictly later
+    /// `created_at` — recall orders by timestamp.
+    fn remember_spaced(store: &Store, scope: &str, content: &str) {
+        store
+            .remember("test-agent", scope, "note", content)
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    #[test]
+    fn context_always_includes_rules_even_when_they_alone_exceed_the_budget() {
+        let store = Store::open_in_memory().expect("open");
+        // 100 chars => 25 estimated tokens, well past the budget of 10.
+        let rule_text = "R".repeat(100);
+        store
+            .rule_add("test-agent", "ctx", "big-rule", &rule_text)
+            .expect("add rule");
+        remember_spaced(&store, "ctx", "a message");
+        remember_spaced(&store, "ctx", "another message");
+
+        let ctx = store.context("ctx", None, 50, 10).expect("context");
+        assert_eq!(ctx.rules.len(), 1, "policy is never silently dropped");
+        assert!(
+            ctx.rules_tokens > 10,
+            "rules alone exceed the requested budget"
+        );
+        assert!(
+            ctx.memories.is_empty(),
+            "no budget remains for any memory: {:?}",
+            ctx.memories
+        );
+        assert_eq!(ctx.budget.included, 1, "the rule is the only included item");
+        assert_eq!(ctx.budget.dropped, 2, "both memories were dropped");
+        assert_eq!(ctx.budget.estimated_tokens, ctx.rules_tokens);
+    }
+
+    #[test]
+    fn context_without_query_selects_newest_first_and_presents_chronologically() {
+        let store = Store::open_in_memory().expect("open");
+        // Four 6-token messages (21–24 chars each) against a 12-token budget:
+        // only the newest two fit.
+        for content in [
+            "irrelevant chatter one",
+            "irrelevant chatter two",
+            "irrelevant chatter three",
+            "irrelevant chatter four",
+        ] {
+            remember_spaced(&store, "ctx-recency", content);
+        }
+
+        let ctx = store.context("ctx-recency", None, 50, 12).expect("context");
+        let contents: Vec<&str> = ctx.memories.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["irrelevant chatter three", "irrelevant chatter four"],
+            "selection is newest-first, presentation is chronological"
+        );
+        assert_eq!(ctx.budget.dropped, 2);
+        assert_eq!(ctx.budget.channels[&"recency"], 4);
+        assert!(
+            !ctx.budget.channels.contains_key("fts"),
+            "no query ran, so no fts channel is reported"
+        );
+    }
+
+    #[test]
+    fn context_with_query_rescues_an_old_relevant_memory_recency_would_drop() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "ctx-fused";
+        // Oldest message is the only one matching the query; every message
+        // estimates to 6 tokens, and the budget fits exactly two.
+        remember_spaced(&store, scope, "launch window at dawn");
+        for content in [
+            "irrelevant chatter one",
+            "irrelevant chatter two",
+            "irrelevant chatter three",
+            "irrelevant chatter four",
+        ] {
+            remember_spaced(&store, scope, content);
+        }
+
+        let without_query = store.context(scope, None, 50, 12).expect("context");
+        assert!(
+            !without_query
+                .memories
+                .iter()
+                .any(|m| m.content.contains("launch")),
+            "pure recency at this budget drops the oldest message"
+        );
+
+        let with_query = store
+            .context(scope, Some("launch"), 50, 12)
+            .expect("context with query");
+        assert!(
+            with_query
+                .memories
+                .iter()
+                .any(|m| m.content == "launch window at dawn"),
+            "the fts channel pulls the old-but-relevant memory back in: {:?}",
+            with_query.memories
+        );
+        assert_eq!(
+            with_query.memories[0].content, "launch window at dawn",
+            "presentation stays chronological, so the oldest comes first"
+        );
+        assert_eq!(with_query.budget.channels[&"fts"], 1);
+        assert_eq!(with_query.budget.channels[&"recency"], 5);
+
+        // A whitespace-only query is treated as no query, not a search error.
+        let blank = store.context(scope, Some("   "), 50, 12).expect("context");
+        assert!(!blank.budget.channels.contains_key("fts"));
+    }
+
+    #[test]
+    fn context_never_lists_rule_rows_among_memories() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "ctx-rules";
+        store
+            .rule_add(
+                "test-agent",
+                scope,
+                "no-port-eight",
+                "never expose port eight thousand",
+            )
+            .expect("add rule");
+        remember_spaced(&store, scope, "an ordinary message");
+
+        // Generous budget; the query matches the rule text, so search
+        // surfaces the rule row — it must still be filtered from memories.
+        let ctx = store
+            .context(scope, Some("expose port"), 50, 1000)
+            .expect("context");
+        assert_eq!(ctx.rules.len(), 1);
+        assert!(
+            ctx.memories.iter().all(|m| m.rule_id.is_none()),
+            "rule rows are already in the rules section: {:?}",
+            ctx.memories
+        );
+        assert_eq!(ctx.memories.len(), 1);
+        assert_eq!(ctx.memories[0].content, "an ordinary message");
+        assert_eq!(ctx.budget.channels[&"rules"], 1);
     }
 }

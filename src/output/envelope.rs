@@ -25,6 +25,10 @@ pub struct Metadata {
     /// spacecraft-cli-standard validation-safety §4 contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<bool>,
+    /// Present only when the caller asked for token budgeting: what was
+    /// kept, what was cut, and by which estimator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::retrieval::BudgetReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +49,7 @@ impl<T: Serialize> Response<T> {
                 pagination: None,
                 tool_agent: detect_tool_agent(),
                 dry_run: None,
+                budget: None,
             },
             data,
         }
@@ -65,6 +70,11 @@ impl<T: Serialize> Response<T> {
 
     pub fn with_dry_run(mut self) -> Self {
         self.metadata.dry_run = Some(true);
+        self
+    }
+
+    pub fn with_budget(mut self, b: crate::retrieval::BudgetReport) -> Self {
+        self.metadata.budget = Some(b);
         self
     }
 }

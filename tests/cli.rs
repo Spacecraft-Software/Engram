@@ -488,6 +488,112 @@ fn rule_sync_dry_run_writes_no_files() {
 }
 
 #[test]
+fn recall_budget_tokens_drops_the_oldest_and_reports_it() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "budget-scope";
+
+    // Each 4-char memory estimates to 1 token (ceil(chars/4)).
+    remember(&db, "a", scope, "aaaa");
+    remember(&db, "a", scope, "bbbb");
+    remember(&db, "a", scope, "cccc");
+
+    let assert = engram(&db)
+        .args(["recall", "--scope", scope, "--budget-tokens", "2"])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+
+    let contents: Vec<&str> = envelope["data"]
+        .as_array()
+        .expect("recall data is an array")
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        contents,
+        ["bbbb", "cccc"],
+        "a 2-token budget keeps the newest two, still chronological"
+    );
+
+    let budget = &envelope["metadata"]["budget"];
+    assert_eq!(budget["estimator"], "chars-div-4");
+    assert_eq!(budget["included"], 2);
+    assert_eq!(budget["dropped"], 1);
+    assert!(
+        !budget["dropped_ids"]
+            .as_array()
+            .expect("dropped_ids is an array")
+            .is_empty(),
+        "the dropped memory is named"
+    );
+
+    // Without --budget-tokens the envelope is byte-identical to before:
+    // no budget field at all.
+    let assert = engram(&db)
+        .args(["recall", "--scope", scope])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert!(
+        envelope["metadata"]["budget"].is_null(),
+        "no budget requested, so none serialized"
+    );
+}
+
+#[test]
+fn context_assembles_rules_then_memories_with_a_budget_report() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "context-scope";
+
+    engram(&db)
+        .args([
+            "rule",
+            "add",
+            "--id",
+            "context-first",
+            "--scope",
+            scope,
+            "--agent",
+            "tester",
+            "Load context at session start.",
+        ])
+        .assert()
+        .success();
+    remember(&db, "a", scope, "the reactor stays at 80 percent");
+    remember(&db, "a", scope, "coolant loop two is offline");
+
+    let assert = engram(&db)
+        .args(["context", "--scope", scope])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+
+    assert_eq!(envelope["metadata"]["command"], "engram context");
+    assert!(
+        envelope["metadata"]["budget"].is_object(),
+        "metadata carries the budget report"
+    );
+
+    let data = &envelope["data"];
+    assert_eq!(data["scope"], scope);
+    assert_eq!(data["scope_origin"], "explicit");
+    let rules = data["rules"].as_array().expect("data.rules is an array");
+    assert_eq!(rules.len(), 1, "the recorded rule leads the block");
+    assert_eq!(rules[0]["rule_id"], "context-first");
+    let memories = data["memories"]
+        .as_array()
+        .expect("data.memories is an array");
+    assert_eq!(memories.len(), 2, "both memories fit the default budget");
+    assert_eq!(
+        memories[0]["content"], "the reactor stays at 80 percent",
+        "memories are presented chronologically"
+    );
+    assert!(data["budget"].is_object(), "data carries the report too");
+}
+
+#[test]
 fn schema_and_describe_are_valid_json() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");

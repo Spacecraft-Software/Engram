@@ -49,6 +49,11 @@ pub struct RecallArgs {
     pub scope: String,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Pack results to a token budget (chars/4 estimate). When set, the
+    /// result is `{"memories": [...], "budget": {...}}` instead of a plain
+    /// array.
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -57,6 +62,11 @@ pub struct SearchArgs {
     pub scope: Option<String>,
     #[serde(default = "default_search_limit")]
     pub limit: u32,
+    /// Pack results to a token budget (chars/4 estimate). When set, the
+    /// result is `{"memories": [...], "budget": {...}}` instead of a plain
+    /// array.
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 fn default_limit() -> u32 {
     50
@@ -142,9 +152,15 @@ impl EngramMcp {
     ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().map_err(lock_err)?;
         let mems = store.recall(&args.scope, args.limit).map_err(store_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&mems).unwrap_or_default(),
-        )]))
+        let text = match args.budget_tokens {
+            Some(budget) => {
+                let (mems, report) = crate::retrieval::budget_recall(mems, budget);
+                serde_json::json!({ "memories": mems, "budget": report }).to_string()
+            }
+            // No budget requested: the plain array, exactly as before.
+            None => serde_json::to_string(&mems).unwrap_or_default(),
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(
@@ -158,9 +174,14 @@ impl EngramMcp {
         let mems = store
             .search(&args.query, args.scope.as_deref(), args.limit)
             .map_err(store_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&mems).unwrap_or_default(),
-        )]))
+        let text = match args.budget_tokens {
+            Some(budget) => {
+                let (mems, report) = crate::retrieval::budget_search(mems, budget);
+                serde_json::json!({ "memories": mems, "budget": report }).to_string()
+            }
+            None => serde_json::to_string(&mems).unwrap_or_default(),
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(
@@ -545,6 +566,7 @@ mod tests {
             .recall(Parameters(RecallArgs {
                 scope: "mcp-recall".to_string(),
                 limit: 50,
+                budget_tokens: None,
             }))
             .await
             .expect("recall succeeds");
@@ -577,6 +599,7 @@ mod tests {
                 query: "synchronous".to_string(),
                 scope: Some("mcp-search".to_string()),
                 limit: 20,
+                budget_tokens: None,
             }))
             .await
             .expect("search succeeds");
@@ -585,6 +608,82 @@ mod tests {
         let hits = v.as_array().expect("search returns an array");
         assert_eq!(hits.len(), 1, "one hit for 'synchronous'");
         assert_eq!(hits[0]["content"], "the telemetry uplink stays synchronous");
+    }
+
+    #[tokio::test]
+    async fn recall_with_budget_returns_report_and_drops_the_oldest() {
+        let (mcp, _dir) = test_mcp();
+        for content in ["aaaa", "bbbb", "cccc"] {
+            mcp.remember(Parameters(RememberArgs {
+                agent: "test-agent".to_string(),
+                scope: "mcp-budget".to_string(),
+                role: "note".to_string(),
+                content: content.to_string(),
+            }))
+            .await
+            .expect("remember succeeds");
+            // Distinct created_at per row: recall orders by timestamp.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let result = mcp
+            .recall(Parameters(RecallArgs {
+                scope: "mcp-budget".to_string(),
+                limit: 50,
+                // Each 4-char memory estimates to 1 token; 2 fit.
+                budget_tokens: Some(2),
+            }))
+            .await
+            .expect("recall succeeds");
+
+        let v = json_of(&result);
+        let mems = v["memories"].as_array().expect("budgeted recall wraps");
+        let contents: Vec<&str> = mems.iter().filter_map(|m| m["content"].as_str()).collect();
+        assert_eq!(contents, ["bbbb", "cccc"], "the oldest memory is dropped");
+        assert_eq!(v["budget"]["estimator"], "chars-div-4");
+        assert_eq!(v["budget"]["included"], 2);
+        assert_eq!(v["budget"]["dropped"], 1);
+        assert_eq!(
+            v["budget"]["dropped_ids"]
+                .as_array()
+                .expect("dropped_ids is an array")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn search_with_budget_keeps_rank_order_and_reports_drops() {
+        let (mcp, _dir) = test_mcp();
+        for content in ["alpha alpha", "alpha buried in longer filler text here"] {
+            mcp.remember(Parameters(RememberArgs {
+                agent: "test-agent".to_string(),
+                scope: "mcp-search-budget".to_string(),
+                role: "note".to_string(),
+                content: content.to_string(),
+            }))
+            .await
+            .expect("remember succeeds");
+        }
+
+        let result = mcp
+            .search(Parameters(SearchArgs {
+                query: "alpha".to_string(),
+                scope: Some("mcp-search-budget".to_string()),
+                limit: 20,
+                // The denser doc ranks first and costs 3 tokens; the longer
+                // one (10 tokens) must be dropped.
+                budget_tokens: Some(3),
+            }))
+            .await
+            .expect("search succeeds");
+
+        let v = json_of(&result);
+        let mems = v["memories"].as_array().expect("budgeted search wraps");
+        assert_eq!(mems.len(), 1);
+        assert_eq!(mems[0]["content"], "alpha alpha");
+        assert_eq!(v["budget"]["dropped"], 1);
+        assert_eq!(v["budget"]["channels"]["fts"], 2);
     }
 
     #[tokio::test]

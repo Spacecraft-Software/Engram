@@ -201,8 +201,10 @@ Every machine-mode response is wrapped in an envelope:
 
 The @code{metadata} object carries @code{tool}, @code{version},
 @code{command}, and an ISO 8601 UTC @code{timestamp}; it optionally
-carries @code{tool_agent} (when an agent environment was detected) and
-@code{dry_run} (on dry runs).  The payload is under @code{data}.
+carries @code{tool_agent} (when an agent environment was detected),
+@code{dry_run} (on dry runs), and @code{budget} (when token budgeting
+was requested --- see @command{engram recall} below).  The payload is
+under @code{data}.
 
 @subsection JSON Lines output
 
@@ -267,24 +269,81 @@ shown, without writing anything; the machine envelope carries
 @cindex recall command
 
 @example
-engram recall --scope @var{id} [--limit @var{n}]
+engram recall --scope @var{id} [--limit @var{n}] [--budget-tokens @var{n}]
 @end example
 
 Read back the last @var{n} messages for a scope, in chronological
 order.  @code{--limit} defaults to 50.
+
+@cindex budget, token
+@cindex token budget
+With @code{--budget-tokens}, the results are packed to a token budget:
+the newest messages have priority, so when the budget bites it is the
+@emph{oldest} that are dropped, and the surviving messages are still
+returned in chronological order.  Token costs are estimated as
+@code{ceil(characters / 4)} (minimum 1) --- a multi-model pipeline has
+no single correct tokenizer, so Engram uses this crude heuristic and
+names it in the response: the envelope gains @code{metadata.budget}
+with @code{estimator} (@code{"chars-div-4"}),
+@code{requested_tokens}, @code{estimated_tokens} (included items
+only), @code{included}, @code{dropped}, @code{dropped_ids}, and
+per-channel candidate counts under @code{channels}.  Without the flag,
+the output is byte-identical to earlier releases.
 
 @section engram search
 
 @cindex search command
 
 @example
-engram search @var{query} [--scope @var{id}] [--limit @var{n}]
+engram search @var{query} [--scope @var{id}] [--limit @var{n}] [--budget-tokens @var{n}]
 @end example
 
 Full-text (FTS5) search across stored memories, optionally restricted
 to one scope.  @code{--limit} defaults to 20.  Query tokens are
 sanitized --- each is matched as a quoted phrase --- so arbitrary input
 cannot inject FTS5 syntax.
+
+With @code{--budget-tokens}, the ranked results are packed to a token
+budget in rank order --- relevance ordering is the point of a search
+result, so it is both the packing priority and the output order.  An
+over-budget hit is dropped and later, smaller hits are still tried.
+The envelope reports the same @code{metadata.budget} object as
+@command{engram recall}.
+
+@section engram context
+
+@cindex context command
+@cindex session start
+@cindex reciprocal rank fusion
+
+@example
+engram context [--scope @var{id}] [--query @var{q}] [--budget-tokens @var{n}] [--limit @var{n}]
+@end example
+
+Assemble a budget-packed context block for session start: the scope's
+active rules first, then memories fused from recency and relevance.
+@code{--budget-tokens} defaults to 3000; @code{--limit} (candidates
+fetched per channel) defaults to 50.  @code{--scope} resolves through
+the same cascade as the @command{rule} commands (@pxref{Rules}).
+
+The rules are @emph{always all included}, even when they alone exceed
+the budget --- policy is never silently dropped; the overrun is
+visible in the budget report.  Memories are then packed into whatever
+budget remains.
+
+Without @code{--query}, memories are selected newest-first.  With
+@code{--query}, the recency channel (newest first) and the full-text
+relevance channel (rank order) are fused with reciprocal rank fusion
+(@code{k = 60}), so an old-but-relevant memory can displace a
+new-but-irrelevant one.  Selection order and presentation order
+differ by design: whichever way a memory earned its slot, the
+included memories are presented chronologically, which is how a
+prompt reads best.  Rule rows surfaced by recall or search are
+skipped as candidates --- they already lead the block.
+
+The data carries @code{rules}, @code{memories}, @code{rules_tokens},
+and the @code{budget} report; the envelope repeats the report as
+@code{metadata.budget}.
 
 @section engram rule
 
@@ -480,13 +539,29 @@ Store a memory.  Body: @code{@{"agent": @dots{}, "scope": @dots{},
 @code{content} is empty or whitespace-only, @code{200} with the stored
 Memory in the envelope on success, @code{500} on a storage error.
 
-@item GET /v1/memory/recall?scope=&limit=
+@item GET /v1/memory/recall?scope=&limit=&budget_tokens=
 @cindex GET /v1/memory/recall
-Fetch the last N memories for a scope, chronological order.
+Fetch the last N memories for a scope, chronological order.  With
+@code{budget_tokens}, results are packed to the token budget
+(newest-first priority, chronological output) and the envelope carries
+@code{metadata.budget} --- the same behavior as
+@code{engram recall --budget-tokens} (@pxref{Invocation}).
 
 @item GET /v1/memory/search?query=&scope=&limit=
 @cindex GET /v1/memory/search
-Full-text search, optionally scoped.
+Full-text search, optionally scoped.  @code{budget_tokens} packs the
+ranked results to a token budget, in rank order.
+
+@item GET /v1/context?scope=&query=&budget_tokens=&limit=
+@cindex GET /v1/context
+A budget-packed context block for session start: active rules first
+(always all included, even over budget), then recency+relevance fused
+memories --- the same data shape as @command{engram context}
+(@pxref{Invocation}).  @code{scope} resolves through the rule-command
+cascade against the server process's working directory when omitted;
+@code{budget_tokens} defaults to 3000 and @code{limit} to 50.  An
+unknown scope yields @code{200} with empty rules and memories, not an
+error.  Returns @code{500} on a storage failure.
 
 @item POST /v1/rules
 @cindex POST /v1/rules

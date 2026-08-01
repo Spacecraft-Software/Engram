@@ -17,13 +17,15 @@ cargo doc -p rmcp --open                 # verify rmcp 0.16 macro shape if build
 
 | Surface | Entrypoint | Notes |
 |---|---|---|
-| CLI | `engram remember/recall/search/save-chat/mcp/serve/schema/describe` | clap derive, stdin fallback for content |
+| CLI | `engram remember/recall/search/context/save-chat/mcp/serve/schema/describe` | clap derive, stdin fallback for content |
 | MCP | `engram mcp` | rmcp 0.16 stdio, `#[tool_router]`/`#[tool_handler]` macros |
 | HTTP | `engram serve` | axum, `127.0.0.1:8420`, no auth |
 
 ## CLI quirks
 
 - `remember` content: positional **or** stdin pipe. No content → error exit 2. `--dry-run` validates and shows what would be stored without writing.
+- `recall`/`search` accept `--budget-tokens N`: results are packed to a token budget (estimator `chars-div-4` — ceil(Unicode chars / 4), min 1; no single tokenizer is correct across models). Recall packs newest-first (oldest drop) but output stays chronological; search packs in rank order. The envelope then carries `metadata.budget` (`requested_tokens`, `estimator`, `estimated_tokens`, `included`, `dropped`, `dropped_ids`, `channels`). Without the flag, output is byte-identical to before. Same `budget_tokens` argument exists on the MCP `recall`/`search` tools (result becomes `{"memories": [...], "budget": {...}}`) and the HTTP recall/search routes.
+- `context [--scope S] [--query Q] [--budget-tokens N=3000] [--limit N=50]`: one-shot session-start block — active rules first (**always all included**, even over budget), then memories packed into the remainder. No query → newest-first selection; with `--query` → reciprocal rank fusion (k=60) of the recency and FTS channels. Presentation is chronological either way. Scope resolves via the rule-command cascade. Also `GET /v1/context` over HTTP; no MCP context tool yet (M3).
 - Mode cascade: explicit `--format`/`--json` > `AI_AGENT`/`AGENT` set non-empty or `CI` truthy > non-TTY stdout → machine output (single-line JSON to stdout, structured error to stderr).
 - `--format <json|jsonl|csv>` (global; `--json` is an alias for `--format json`). `jsonl`: first line `{"metadata":...,"data":null}`, then one line per record. `csv`: RFC 4180 rows on stdout, metadata as one JSON line on stderr. `yaml`/`explore` deferred.
 - `--accessible` (global): plain linear output per Standard §18. Also via `SPACECRAFT_A11Y=1`; the flag wins over `SPACECRAFT_A11Y=0`.
@@ -100,7 +102,7 @@ engram rule sync [--scope S] [--file PATH]... [--dry-run]
 - Call `rule_retire` + `rule_sync` when the user withdraws one. Do not hand-edit
   the managed block to remove a rule; the next sync would restore it.
 - Call `remember` after any decision, fact, or rationale — scope to project/task/run id.
-- Call `recall` at session start for that scope.
+- Call `recall` at session start for that scope — or `context` for rules + budget-packed memories in one call.
 - Call `search` before asserting something was already decided.
 - CLI, MCP, and HTTP hit the same `Store`; behavior is identical for
   remember/recall/search. Rules are on all three surfaces too.

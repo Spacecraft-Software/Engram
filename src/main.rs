@@ -9,6 +9,7 @@ mod error;
 mod http;
 mod mcp;
 mod output;
+mod retrieval;
 mod rules;
 mod store;
 mod time;
@@ -94,11 +95,26 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 }
             }
         }
-        Command::Recall { scope, limit } => {
+        Command::Recall {
+            scope,
+            limit,
+            budget_tokens,
+        } => {
             let guard = store.lock().expect("store lock poisoned");
             match guard.recall(&scope, limit) {
                 Ok(mems) => {
-                    emit_ok(Response::new("engram memory recall", mems), mode);
+                    match budget_tokens {
+                        Some(budget) => {
+                            let (mems, report) = retrieval::budget_recall(mems, budget);
+                            emit_ok(
+                                Response::new("engram memory recall", mems).with_budget(report),
+                                mode,
+                            );
+                        }
+                        // No budget requested: byte-identical to the
+                        // pre-budgeting output (no budget field serialized).
+                        None => emit_ok(Response::new("engram memory recall", mems), mode),
+                    }
                     0
                 }
                 Err(e) => {
@@ -112,11 +128,21 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             query,
             scope,
             limit,
+            budget_tokens,
         } => {
             let guard = store.lock().expect("store lock poisoned");
             match guard.search(&query, scope.as_deref(), limit) {
                 Ok(mems) => {
-                    emit_ok(Response::new("engram memory search", mems), mode);
+                    match budget_tokens {
+                        Some(budget) => {
+                            let (mems, report) = retrieval::budget_search(mems, budget);
+                            emit_ok(
+                                Response::new("engram memory search", mems).with_budget(report),
+                                mode,
+                            );
+                        }
+                        None => emit_ok(Response::new("engram memory search", mems), mode),
+                    }
                     0
                 }
                 Err(e) => {
@@ -124,6 +150,34 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                     emit_error(&err, mode);
                     err.exit_code
                 }
+            }
+        }
+        Command::Context {
+            scope,
+            query,
+            budget_tokens,
+            limit,
+        } => {
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
+            let guard = store.lock().expect("store lock poisoned");
+            match guard.context(&resolved.name, query.as_deref(), limit, budget_tokens) {
+                Ok(ctx) => {
+                    let report = ctx.budget.clone();
+                    let result = ContextCommandResult {
+                        scope: resolved.name,
+                        scope_origin: resolved.origin,
+                        context: ctx,
+                    };
+                    emit_ok(
+                        Response::new("engram context", result).with_budget(report),
+                        mode,
+                    );
+                    0
+                }
+                Err(e) => fail(AppError::from(e), mode),
             }
         }
         Command::Rule { action } => run_rule(action, &store, mode),
@@ -160,7 +214,7 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 "maintainer": "Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>",
                 "website": "https://Engram.SpacecraftSoftware.org/",
                 "commands": [
-                    "remember", "recall", "search",
+                    "remember", "recall", "search", "context",
                     "rule add", "rule list", "rule retire", "rule sync",
                     "save-chat", "mcp", "serve", "schema", "describe"
                 ],
@@ -171,7 +225,10 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
                     "dry_run": "remember and rule sync accept --dry-run; the envelope carries metadata.dry_run=true",
-                    "accessible": "--accessible or SPACECRAFT_A11Y=1 (Standard §18); status tags [OK]/[ERROR] are present in every human mode"
+                    "accessible": "--accessible or SPACECRAFT_A11Y=1 (Standard §18); status tags [OK]/[ERROR] are present in every human mode",
+                    "budgeting": "recall/search accept --budget-tokens and context always packs to one; \
+                                  metadata.budget reports estimator 'chars-div-4', included/dropped counts, \
+                                  dropped_ids, and per-channel candidate counts"
                 },
                 "rules": {
                     "description": "Durable project policy, stored once and rendered into the \
@@ -230,6 +287,16 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             }
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct ContextCommandResult {
+    scope: String,
+    scope_origin: rules::ScopeOrigin,
+    /// Flattened, so `data.rules` / `data.memories` / `data.budget` sit next
+    /// to the resolved scope — same shape as `GET /v1/context`.
+    #[serde(flatten)]
+    context: store::ContextResult,
 }
 
 #[derive(serde::Serialize)]

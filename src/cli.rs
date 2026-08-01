@@ -68,6 +68,10 @@ pub enum Command {
         scope: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Pack results to a token budget (chars/4 estimate); the envelope
+        /// reports included/dropped.
+        #[arg(long)]
+        budget_tokens: Option<u32>,
     },
     /// Full-text search across stored memories.
     Search {
@@ -75,6 +79,28 @@ pub enum Command {
         #[arg(long)]
         scope: Option<String>,
         #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Pack results to a token budget (chars/4 estimate); the envelope
+        /// reports included/dropped.
+        #[arg(long)]
+        budget_tokens: Option<u32>,
+    },
+    /// Assemble a budget-packed context block for session start: active
+    /// rules first (always included), then recency+relevance fused memories.
+    Context {
+        /// Scope to assemble. Defaults to ENGRAM_SCOPE, else the git
+        /// working-tree name, else the current directory name.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Optional full-text query; adds a relevance channel fused with
+        /// recency (reciprocal rank fusion) when selecting memories.
+        #[arg(long)]
+        query: Option<String>,
+        /// Token budget (chars/4 estimate) for the whole block.
+        #[arg(long, default_value_t = 3000)]
+        budget_tokens: u32,
+        /// Candidates fetched per channel before packing.
+        #[arg(long, default_value_t = 50)]
         limit: u32,
     },
     /// Durable project rules — policy that outlives a session.

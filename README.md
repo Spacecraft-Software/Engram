@@ -48,6 +48,31 @@ validates and shows what would be stored without writing.
 ./target/release/engram remember --agent claude-code --scope majestic-adr-023 --dry-run "Would store this."
 ```
 
+### Token budgeting and `context`
+
+`recall` and `search` accept `--budget-tokens N`: results are packed to a token
+budget (estimator `chars-div-4` — ceil(characters / 4); no single tokenizer is
+correct across a multi-model pipeline). Recall drops the *oldest* first and
+keeps the output chronological; search packs in rank order. The response
+envelope then carries `metadata.budget` — requested/estimated tokens, included
+and dropped counts, the dropped ids, and per-channel candidate counts. The same
+`budget_tokens` option exists on the MCP `recall`/`search` tools and the HTTP
+recall/search routes.
+
+`engram context` assembles a session-start block in one call: the scope's
+active rules first (**always all included**, even if they alone blow the
+budget — policy is never silently dropped), then memories packed into what
+remains. Without `--query` selection is newest-first; with `--query` the
+recency and full-text channels are fused with reciprocal rank fusion (k=60),
+so an old-but-relevant memory can beat a new-but-irrelevant one. Included
+memories are always presented chronologically.
+
+```sh
+./target/release/engram recall --scope majestic-adr-023 --budget-tokens 500
+./target/release/engram context --scope majestic-adr-023 --query "Gnomon" --budget-tokens 3000
+curl -s "localhost:8420/v1/context?scope=majestic-adr-023&budget_tokens=3000"
+```
+
 MCP (stdio), for wiring into Claude Code / Codex / any MCP client:
 
 ```sh
@@ -183,6 +208,8 @@ storage failure. New routes should keep following that pattern.
 
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore`
   (no TUI yet). `json`, `jsonl`, and `csv` exist.
+- An MCP `context` tool — `context` is CLI + HTTP for now; the MCP tool lands
+  at M3 (the MCP `recall`/`search` tools do accept `budget_tokens` already).
 - Purging a retired rule. Tombstones accumulate; there is no `rule purge`.
 - Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
   writes files.

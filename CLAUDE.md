@@ -45,17 +45,18 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 
 | Surface | Entrypoint | Caller | Notes |
 |---|---|---|---|
-| **CLI** | `engram remember/recall/search/save-chat/mcp/serve/schema/describe` | Command-line tools, shell scripts | Clap derive; stdin fallback for content |
+| **CLI** | `engram remember/recall/search/context/save-chat/mcp/serve/schema/describe` | Command-line tools, shell scripts | Clap derive; stdin fallback for content |
 | **MCP** | `engram mcp` | Claude Code, Codex, other MCP clients | rmcp 0.16 stdio; `#[tool_router]`/`#[tool_handler]` macros |
 | **HTTP** | `engram serve` | Any HTTP client (curl, Kimi, Ollama Cloud, etc.) | Axum; `127.0.0.1:8420` only; no auth |
 
 **Module structure:**
 - `main.rs` — entry point; parses CLI, instantiates `Store`, dispatches to surface handlers
-- `store.rs` — `Store` struct; SQLite schema, migration, CRUD (remember/recall/search, rule_add/rules)
+- `store.rs` — `Store` struct; SQLite schema, migration, CRUD (remember/recall/search, rule_add/rules, context)
+- `retrieval.rs` — token budgeting + retrieval assembly, pure functions (no DB handle): `estimate_tokens` (ceil(chars/4), estimator `"chars-div-4"`), `rrf_fuse` (reciprocal rank fusion, `RRF_K = 60.0`), `budget_recall`/`budget_search` (greedy drop-and-continue packing), `BudgetReport`
 - `rules.rs` — durable project rules: scope resolution, markdown rendering, sentinel-block sync
 - `cli.rs` — clap command/argument definitions (`Command` enum, `Cli` struct)
 - `mcp.rs` — MCP server (`#[tool_router]` registration, `#[tool_handler]` impls)
-- `http.rs` — Axum HTTP server (routes: POST `/v1/memory`, GET `/v1/memory/recall`, GET `/v1/memory/search`, GET `/v1/health`, the `/v1/rules*` family)
+- `http.rs` — Axum HTTP server (routes: POST `/v1/memory`, GET `/v1/memory/recall`, GET `/v1/memory/search`, GET `/v1/context`, GET `/v1/health`, the `/v1/rules*` family)
 - `error.rs` — `AppError` enum; error codes (InvalidArgument, DbError, etc.), exit codes, structured error emission
 - `output/` — Output formatting and envelope
   - `mode.rs` — `OutputMode` and `Format` (json, jsonl, csv); detection logic (`--format`/`--json`, env vars, TTY)
@@ -83,15 +84,16 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
   ```
 - **Timestamps:** ISO 8601 UTC only (via `jiff`, never local time). Suffix with `Z` if needed.
 - **CLI shape:** Per the Spacecraft Software Dual-Mode Self-Documenting CLI Standard (v1.0.0) — all commands emit structured output. Mode cascade: explicit `--format`/`--json` > agent env vars (`AI_AGENT`/`AGENT` set non-empty, `CI` truthy) > non-TTY stdout ⇒ machine mode (JSON to stdout, structured errors to stderr).
-- **Envelopes:** Every command/route returns `Response<T>` (operation name, data, optional error).
+- **Envelopes:** Every command/route returns `Response<T>` (operation name, data, optional error). When token budgeting is requested, `metadata.budget` carries a `BudgetReport`: `requested_tokens`, `estimator` (`"chars-div-4"` — ceil(Unicode chars / 4), min 1; multi-model pipelines have no single correct tokenizer), `estimated_tokens` (included items only), `included`, `dropped`, `dropped_ids`, and `channels` (candidate count per channel: `recency`/`fts`/`rules`).
 - **Role defaults:** `"note"` on all surfaces. Alternatives: `"user"`, `"assistant"`, `"system"`.
 
 ## Command reference
 
 **CLI:**
 - `remember --agent <name> --scope <id> [--role <role>] [--dry-run] [<content>]` — store a message (or read from stdin); `--dry-run` validates and shows what would be stored without writing
-- `recall --scope <id> [--limit <n>]` — fetch last N messages for a scope (default 50)
-- `search <query> [--scope <id>] [--limit <n>]` — full-text search (default limit 20)
+- `recall --scope <id> [--limit <n>] [--budget-tokens <n>]` — fetch last N messages for a scope (default 50). With `--budget-tokens`, results are packed to the budget newest-first (the oldest drop), output stays chronological, and the envelope carries `metadata.budget`
+- `search <query> [--scope <id>] [--limit <n>] [--budget-tokens <n>]` — full-text search (default limit 20). With `--budget-tokens`, results are packed in rank order and the envelope carries `metadata.budget`
+- `context [--scope <id>] [--query <q>] [--budget-tokens <n>] [--limit <n>]` — assemble a budget-packed context block for session start: active rules first (**always all included**, even over budget — policy is never silently dropped), then memories selected newest-first, or by reciprocal-rank fusion of recency+FTS relevance when `--query` is given; included memories are presented chronologically. Defaults: budget 3000, limit 50 per channel; scope resolves via the same cascade as the `rule` commands
 - `save-chat --scope <id> [--file <path>] [--model <name>]` — export a scope's full history to a Texinfo file. `--file` defaults to `chat/<timestamp>.texi`; an existing file is appended to (a new signed chapter), and `chat/` is added to `.gitignore` automatically. `--model` names the signing model (falls back to `MODEL`/`LLM_MODEL`/`AI_AGENT`/`AGENT` env vars)
 - `rule add --id <kebab-id> [--scope <id>] [--agent <name>] [<text>]` — record or revise a rule (stdin if text omitted)
 - `rule list [--scope <id>] [--include-retired]` — rules in effect, ordered by id
@@ -149,7 +151,7 @@ Two HTTP notes worth carrying forward:
 In Claude Code or other multi-model pipelines:
 
 1. **Call `remember`** after any decision, fact, or design rationale worth persisting — scope it to your project/task/run ID so related sessions can recall it.
-2. **Call `recall`** at the start of a session for that scope to load prior context (or search for specific topics).
+2. **Call `recall`** at the start of a session for that scope to load prior context (or search for specific topics) — or call `context` to get rules + budget-packed memories in one shot.
 3. **Call `search`** before asserting something was already decided — verify rather than guess.
 
 4. **Call `rule_list`** at session start to load standing policy, and `rule_add` + `rule_sync` when the user states a requirement that must hold in future sessions (as opposed to a fact about this one).
@@ -162,6 +164,7 @@ Landed in 0.2.0 (no longer gaps): `--format jsonl|csv`, `remember --dry-run`, re
 
 Still missing:
 
+- An MCP `context` tool (lands at M3). Budgeting on MCP `recall`/`search` already exists via the optional `budget_tokens` argument — when set, the tool returns `{"memories": [...], "budget": {...}}` instead of the plain array.
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore` (no TUI yet).
 - Purging retired rules — tombstones accumulate, and there is no `rule purge`.
 - Semantic (embedding) search — upgrade path is `sqlite-vec` as a loadable extension.

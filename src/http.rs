@@ -26,7 +26,13 @@ type SharedStore = Arc<Mutex<Store>>;
 type ApiResult = (StatusCode, Json<serde_json::Value>);
 
 fn ok(operation: &'static str, data: impl serde::Serialize) -> ApiResult {
-    let body = serde_json::to_value(Response::new(operation, data))
+    ok_resp(Response::new(operation, data))
+}
+
+/// Like [`ok`], but for a caller-built [`Response`] — used when the envelope
+/// needs decoration (e.g. `with_budget`) before serialization.
+fn ok_resp<T: serde::Serialize>(resp: Response<T>) -> ApiResult {
+    let body = serde_json::to_value(resp)
         .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
     (StatusCode::OK, Json(body))
 }
@@ -49,6 +55,7 @@ pub fn router(store: SharedStore) -> Router {
         .route("/v1/memory", post(remember))
         .route("/v1/memory/recall", get(recall))
         .route("/v1/memory/search", get(search))
+        .route("/v1/context", get(context))
         // Rules. DELETE maps to retire, which tombstones rather than erases —
         // documented on the handler, because the verb implies otherwise.
         .route("/v1/rules", post(rule_add).get(rule_list))
@@ -97,6 +104,9 @@ struct RecallParams {
     scope: String,
     #[serde(default = "default_limit")]
     limit: u32,
+    /// Pack results to a token budget (chars/4 estimate); the envelope
+    /// carries `metadata.budget` when set.
+    budget_tokens: Option<u32>,
 }
 fn default_limit() -> u32 {
     50
@@ -105,7 +115,13 @@ fn default_limit() -> u32 {
 async fn recall(State(store): State<SharedStore>, Query(q): Query<RecallParams>) -> ApiResult {
     let guard = store.lock().expect("store lock poisoned");
     match guard.recall(&q.scope, q.limit) {
-        Ok(mems) => ok("GET /v1/memory/recall", mems),
+        Ok(mems) => match q.budget_tokens {
+            Some(budget) => {
+                let (mems, report) = crate::retrieval::budget_recall(mems, budget);
+                ok_resp(Response::new("GET /v1/memory/recall", mems).with_budget(report))
+            }
+            None => ok("GET /v1/memory/recall", mems),
+        },
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             e,
@@ -120,6 +136,9 @@ struct SearchParams {
     scope: Option<String>,
     #[serde(default = "default_search_limit")]
     limit: u32,
+    /// Pack results to a token budget (chars/4 estimate); the envelope
+    /// carries `metadata.budget` when set.
+    budget_tokens: Option<u32>,
 }
 fn default_search_limit() -> u32 {
     20
@@ -128,7 +147,64 @@ fn default_search_limit() -> u32 {
 async fn search(State(store): State<SharedStore>, Query(q): Query<SearchParams>) -> ApiResult {
     let guard = store.lock().expect("store lock poisoned");
     match guard.search(&q.query, q.scope.as_deref(), q.limit) {
-        Ok(mems) => ok("GET /v1/memory/search", mems),
+        Ok(mems) => match q.budget_tokens {
+            Some(budget) => {
+                let (mems, report) = crate::retrieval::budget_search(mems, budget);
+                ok_resp(Response::new("GET /v1/memory/search", mems).with_budget(report))
+            }
+            None => ok("GET /v1/memory/search", mems),
+        },
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e,
+            "check that the database is readable",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct ContextParams {
+    /// Optional; resolved through the same cascade as the rule routes
+    /// (`ENGRAM_SCOPE`, git working-tree basename, cwd basename).
+    scope: Option<String>,
+    query: Option<String>,
+    #[serde(default = "default_budget_tokens")]
+    budget_tokens: u32,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+fn default_budget_tokens() -> u32 {
+    3000
+}
+
+/// `GET /v1/context` — a budget-packed context block for session start:
+/// active rules first (always included, even over budget), then
+/// recency+relevance fused memories. Same data shape as `engram context`.
+async fn context(State(store): State<SharedStore>, Query(q): Query<ContextParams>) -> ApiResult {
+    let resolved = match crate::rules::resolve_scope(q.scope.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e,
+                "pass ?scope= explicitly",
+            )
+        }
+    };
+    let guard = store.lock().expect("store lock poisoned");
+    match guard.context(&resolved.name, q.query.as_deref(), q.limit, q.budget_tokens) {
+        Ok(ctx) => {
+            let report = ctx.budget.clone();
+            let data = serde_json::json!({
+                "scope": resolved.name,
+                "scope_origin": resolved.origin,
+                "rules": ctx.rules,
+                "memories": ctx.memories,
+                "rules_tokens": ctx.rules_tokens,
+                "budget": ctx.budget,
+            });
+            ok_resp(Response::new("GET /v1/context", data).with_budget(report))
+        }
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             e,
@@ -558,6 +634,101 @@ mod tests {
             StatusCode::OK,
             "operator query must not error: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn recall_with_budget_reports_and_drops_when_tight() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+        for content in ["aaaa", "bbbb", "cccc"] {
+            let body = serde_json::json!({
+                "agent": "test-agent",
+                "scope": "http-budget",
+                "content": content,
+            });
+            let (status, text) = send(&app, post_json("/v1/memory", &body)).await;
+            assert_eq!(status, StatusCode::OK, "insert failed: {text}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Each 4-char memory estimates to 1 token; a 2-token budget keeps
+        // the newest two and drops the oldest.
+        let (status, text) = send(
+            &app,
+            get("/v1/memory/recall?scope=http-budget&budget_tokens=2"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+        let json = parse(&text);
+        let budget = &json["metadata"]["budget"];
+        assert_eq!(budget["estimator"], "chars-div-4", "budget: {json}");
+        assert_eq!(budget["included"], 2);
+        assert_eq!(budget["dropped"], 1);
+        let data = json["data"].as_array().expect("data is an array");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["content"], "bbbb", "oldest dropped: {json}");
+
+        // Without a budget the response is unchanged: no metadata.budget.
+        let (status, text) = send(&app, get("/v1/memory/recall?scope=http-budget")).await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+        assert!(
+            parse(&text)["metadata"]["budget"].is_null(),
+            "no budget requested, so none reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_returns_rules_memories_and_budget() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+        let rule = serde_json::json!({
+            "rule_id": "http-context-rule",
+            "text": "Context blocks must open with the rules.",
+            "scope": "http-context",
+        });
+        let (status, text) = send(&app, post_json("/v1/rules", &rule)).await;
+        assert_eq!(status, StatusCode::OK, "rule add failed: {text}");
+        let mem = serde_json::json!({
+            "agent": "test-agent",
+            "scope": "http-context",
+            "content": "a memory for the context block",
+        });
+        let (status, text) = send(&app, post_json("/v1/memory", &mem)).await;
+        assert_eq!(status, StatusCode::OK, "insert failed: {text}");
+
+        let (status, text) = send(&app, get("/v1/context?scope=http-context")).await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+        let json = parse(&text);
+        let data = &json["data"];
+        assert_eq!(data["scope"], "http-context");
+        assert_eq!(
+            data["rules"].as_array().expect("rules is an array").len(),
+            1,
+            "the rule leads the block: {json}"
+        );
+        let memories = data["memories"].as_array().expect("memories is an array");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["content"], "a memory for the context block");
+        assert!(
+            data["budget"].is_object(),
+            "data carries the report: {json}"
+        );
+        assert!(
+            json["metadata"]["budget"].is_object(),
+            "metadata carries it too: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_with_unknown_scope_is_200_and_empty() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+        let (status, text) = send(&app, get("/v1/context?scope=never-used")).await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+        let json = parse(&text);
+        assert_eq!(json["data"]["rules"].as_array().map(Vec::len), Some(0));
+        assert_eq!(json["data"]["memories"].as_array().map(Vec::len), Some(0));
+        assert_eq!(json["data"]["budget"]["included"], 0);
     }
 
     #[tokio::test]
