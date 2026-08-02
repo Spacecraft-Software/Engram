@@ -150,6 +150,38 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// Idle-time maintenance over the extracted-fact index.
+    ///
+    /// At M4 the only phase is --extract: run the deterministic fact
+    /// extractor (deterministic-v1 — marker-prefixed lines/sentences,
+    /// never an LLM) over the current, non-rule memories and upsert the
+    /// results into the facts index that boosts `context` and hybrid
+    /// search. Deliberately CLI-only: this command exists on neither the
+    /// MCP nor the HTTP surface — extraction is an operator's batch job,
+    /// and agents receive facts through context/hybrid ranking instead.
+    #[command(after_help = "\
+EXAMPLES:
+  # Extract facts from EVERY scope (deterministic, idempotent).
+  engram consolidate --extract
+
+  # Preview one scope first, then run it.
+  engram consolidate --extract --scope my-task --dry-run
+  engram consolidate --extract --scope my-task
+")]
+    Consolidate {
+        /// Run the fact-extraction phase. Required at M4 (dedup/decay
+        /// phases arrive at M5).
+        #[arg(long)]
+        extract: bool,
+        /// Only extract from this scope. Omitted: EVERY scope — unlike the
+        /// rule commands there is no scope cascade here, because idle-time
+        /// maintenance naturally spans the whole database.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Report what would be written without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Durable project rules — policy that outlives a session.
     ///
     /// A rule is stored once and rendered into the markdown files agent

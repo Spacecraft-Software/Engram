@@ -288,6 +288,7 @@ impl EngramMcp {
                         report.channels = std::collections::BTreeMap::from([
                             ("fts", hybrid.fts_candidates),
                             ("vector", hybrid.vector_candidates),
+                            ("facts", hybrid.facts_candidates),
                         ]);
                         serde_json::json!({ "memories": mems, "budget": report }).to_string()
                     }

@@ -71,6 +71,7 @@ memories are always presented chronologically.
 ./target/release/engram recall --scope majestic-adr-023 --budget-tokens 500
 ./target/release/engram context --scope majestic-adr-023 --query "Gnomon" --budget-tokens 3000
 curl -s "localhost:8420/v1/context?scope=majestic-adr-023&budget_tokens=3000"
+./target/release/engram consolidate --extract   # index "Decided:"/"TODO"/… lines so context + hybrid rank decisions first (deterministic, no LLM)
 ```
 
 MCP (stdio), for wiring into Claude Code / Codex / any MCP client:

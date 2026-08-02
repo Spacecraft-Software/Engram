@@ -983,3 +983,149 @@ fn rule_purge_deletes_tombstones_only_and_needs_consent() {
         .failure()
         .code(3);
 }
+
+// --- M4: extracted-fact index --------------------------------------------
+
+/// `consolidate` with no phase flag is a structured refusal, not a no-op:
+/// at M4 only `--extract` exists, and the hint says what is coming.
+#[test]
+fn consolidate_without_extract_is_invalid_argument() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+
+    let assert = engram(&db).arg("consolidate").assert().failure().code(2);
+    let err = parse_single_line_json(&assert.get_output().stderr);
+    assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(err["error"]["exit_code"], 2);
+    let hint = err["error"]["hint"].as_str().expect("hint is a string");
+    assert!(
+        hint.contains("--extract"),
+        "the hint names the missing phase flag: {hint}"
+    );
+}
+
+/// `--dry-run` reports the full extraction outcome without persisting it:
+/// the subsequent real run writes exactly what the dry run predicted.
+#[test]
+fn consolidate_extract_dry_run_counts_without_writing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "facts-dry";
+
+    remember(
+        &db,
+        "a",
+        scope,
+        "Decided: the flange protocol stays synchronous.",
+    );
+    remember(&db, "a", scope, "plain chatter with no marker anywhere");
+
+    let assert = engram(&db)
+        .args(["consolidate", "--extract", "--scope", scope, "--dry-run"])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(envelope["metadata"]["dry_run"], true);
+    assert_eq!(envelope["data"]["scanned"], 2);
+    assert_eq!(envelope["data"]["memories_with_facts"], 1);
+    assert_eq!(envelope["data"]["facts_written"], 1);
+
+    // Nothing was persisted: the real run still writes the same count (a
+    // fact already on disk would have been an upsert either way, but the
+    // channel proves absence below too).
+    let assert = engram(&db)
+        .args(["consolidate", "--extract", "--scope", scope])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert!(
+        envelope["metadata"]["dry_run"].is_null(),
+        "no dry_run marker on a real run"
+    );
+    assert_eq!(envelope["data"]["facts_written"], 1);
+}
+
+/// Deterministic ids make re-extraction an upsert: the same report on every
+/// run, and no growth in what retrieval sees.
+#[test]
+fn consolidate_extract_is_idempotent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "facts-idem";
+
+    remember(
+        &db,
+        "a",
+        scope,
+        "Decided: use the zeta coupling.\nTODO inspect the zeta coupling weld",
+    );
+    remember(&db, "a", scope, "no markers in this one");
+
+    let run = |db: &Path| -> Value {
+        let assert = engram(db)
+            .args(["consolidate", "--extract", "--scope", scope])
+            .assert()
+            .success();
+        parse_single_line_json(&assert.get_output().stdout)["data"].clone()
+    };
+    let first = run(&db);
+    assert_eq!(first["scanned"], 2);
+    assert_eq!(first["memories_with_facts"], 1);
+    assert_eq!(first["facts_written"], 2);
+
+    let second = run(&db);
+    assert_eq!(
+        second["facts_written"], first["facts_written"],
+        "re-extraction rewrites the same rows, it does not accumulate"
+    );
+    assert_eq!(second["scanned"], first["scanned"]);
+}
+
+/// After extraction, a `context --query` in marker phrasing surfaces the
+/// decision memory and reports the facts channel in the budget metadata.
+#[test]
+fn context_query_surfaces_the_facts_channel_after_extraction() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "facts-ctx";
+
+    remember(
+        &db,
+        "a",
+        scope,
+        "Decided: adopt the flange protocol for docking.",
+    );
+    remember(&db, "a", scope, "ordinary chatter about the weather");
+
+    // Before extraction the channel exists but is empty.
+    let assert = engram(&db)
+        .args(["context", "--scope", scope, "--query", "flange protocol"])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(envelope["metadata"]["budget"]["channels"]["facts"], 0);
+
+    engram(&db)
+        .args(["consolidate", "--extract", "--scope", scope])
+        .assert()
+        .success();
+
+    let assert = engram(&db)
+        .args(["context", "--scope", scope, "--query", "flange protocol"])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(
+        envelope["metadata"]["budget"]["channels"]["facts"], 1,
+        "the extracted fact's parent is a facts-channel candidate"
+    );
+    let memories = envelope["data"]["memories"]
+        .as_array()
+        .expect("data.memories is an array");
+    assert!(
+        memories
+            .iter()
+            .any(|m| m["content"] == "Decided: adopt the flange protocol for docking."),
+        "the decision memory is in the assembled context: {memories:?}"
+    );
+}

@@ -50,7 +50,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
 schemars = "1.2.1"
-uuid = { version = "1", features = ["v4"] }
+# v4: random memory ids. v5: deterministic (namespaced-SHA1) fact ids —
+# re-extraction regenerates the same id for the same (memory, fact) pair,
+# which is what makes `consolidate --extract` idempotent via INSERT OR REPLACE.
+uuid = { version = "1", features = ["v4", "v5"] }
 anyhow = "1"
 # Optional — gated behind the "vector" feature (see [features] for why the
 # default features are disabled: no hf-hub network fetching, ever).

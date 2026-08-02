@@ -331,8 +331,12 @@ so arbitrary input cannot inject FTS5 syntax.
 @cindex vector search
 @cindex semantic search
 In a build with the @code{vector} feature, @code{--mode hybrid} fuses
-the FTS5 channel with a Model2Vec cosine-similarity channel via
-reciprocal rank fusion (k=60).  With @code{--mode} omitted, hybrid
+the FTS5 channel with a Model2Vec cosine-similarity channel --- and,
+since M4, with the extracted-fact channel (@pxref{Invocation,,engram
+consolidate}) --- via reciprocal rank fusion (k=60).  The facts channel
+boosts memories whose marker-prefixed decision lines match the query;
+because facts are verbatim substrings of content, it can never surface
+a memory plain FTS5 could not.  With @code{--mode} omitted, hybrid
 engages automatically when the feature is compiled in, a local model
 resolves (@code{--model-path}, then @env{ENGRAM_MODEL}, then
 @file{$XDG_DATA_HOME/engram/model}), and the model has indexed vectors
@@ -388,10 +392,15 @@ visible in the budget report.  Memories are then packed into whatever
 budget remains.
 
 Without @code{--query}, memories are selected newest-first.  With
-@code{--query}, the recency channel (newest first) and the full-text
-relevance channel (rank order) are fused with reciprocal rank fusion
+@code{--query}, the recency channel (newest first), the full-text
+relevance channel (rank order), and the extracted-fact channel (the
+parents of matching facts, deduped --- see @command{engram
+consolidate} below) are fused with reciprocal rank fusion
 (@code{k = 60}), so an old-but-relevant memory can displace a
-new-but-irrelevant one.  Selection order and presentation order
+new-but-irrelevant one, and the memory that @emph{states} a decision
+outranks the ones that merely mention its words.  The budget report
+names each channel's candidate count (@code{channels.facts} included).
+Selection order and presentation order
 differ by design: whichever way a memory earned its slot, the
 included memories are presented chronologically, which is how a
 prompt reads best.  Rule rows surfaced by recall or search are
@@ -400,6 +409,55 @@ skipped as candidates --- they already lead the block.
 The data carries @code{rules}, @code{memories}, @code{rules_tokens},
 and the @code{budget} report; the envelope repeats the report as
 @code{metadata.budget}.
+
+@section engram consolidate
+
+@cindex consolidate command
+@cindex facts, extracted
+@cindex fact extraction
+
+@example
+engram consolidate --extract [--scope @var{id}] [--dry-run]
+@end example
+
+Idle-time maintenance over the extracted-fact index.  At M4 the only
+phase is @code{--extract}; running @command{consolidate} without it is
+an error (exit code 2 --- dedup/decay phases arrive at M5).
+
+@code{--extract} runs the deterministic extractor
+(@code{deterministic-v1}) over every @emph{current, non-rule} memory
+--- optionally narrowed to one scope; omitted, it walks @emph{every}
+scope, deliberately unlike the rule commands' cascade, because
+maintenance naturally spans the whole database.  @code{--dry-run}
+reports what would be written without writing.
+
+@cindex markers, fact
+Extraction is pure string processing --- @emph{no LLM ever runs on the
+write path}.  Content is split into lines (plus sentence-splits of
+multi-sentence lines); after trimming bullet markers, a unit is a fact
+iff it starts (case-insensitively) with one of the markers
+@code{Decided:}, @code{Decision:}, @code{TODO}, @code{FIXME},
+@code{NOTE:}, @code{Rule:}, @code{Fix:}, @code{Fixed:}, @code{Chose:},
+@code{Chosen:}, @code{Rejected:}, @code{Constraint:}, @code{Gotcha:},
+@code{Warning:}, @code{Never}, @code{Always}, @code{Must},
+@code{Do not}, or @code{Don't}.  Facts shorter than 12 characters are
+skipped, exact duplicates collapse, and at most @emph{eight} facts per
+memory are kept (the first eight in document order).
+
+Facts are stored @emph{verbatim} --- each is an exact substring of its
+parent memory, with the parent's id as a drill-down pointer
+(@code{GET /v1/memory/:id}, the MCP @code{get} tool) --- and they
+never replace the verbatim record: they are an index over it.  Ids are
+deterministic (UUID v5 over the memory id and the fact text), so
+re-running extraction upserts in place --- the pass is idempotent.  A
+fact's liveness derives from its @emph{parent}: superseding a memory
+retires its facts at query time (the fact channel joins the parent and
+applies the validity filter there); nothing is ever deleted.
+
+The command is deliberately @emph{CLI-only} --- it exists on neither
+the MCP nor the HTTP surface.  Extraction is an operator's batch job;
+agents receive facts automatically through the @command{engram
+context} fusion and hybrid search ranking.
 
 @section engram rule
 

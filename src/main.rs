@@ -7,6 +7,7 @@
 mod cli;
 mod embed;
 mod error;
+mod facts;
 mod http;
 mod mcp;
 mod output;
@@ -249,11 +250,12 @@ fn run(
                                     let (mems, mut report) =
                                         retrieval::budget_search(hybrid.memories, budget);
                                     // budget_search knows one channel; hybrid
-                                    // fed two, so name both with their real
-                                    // candidate counts.
+                                    // fed three, so name them all with their
+                                    // real candidate counts.
                                     report.channels = std::collections::BTreeMap::from([
                                         ("fts", hybrid.fts_candidates),
                                         ("vector", hybrid.vector_candidates),
+                                        ("facts", hybrid.facts_candidates),
                                     ]);
                                     emit_ok(
                                         Response::new("engram memory search", mems)
@@ -338,6 +340,42 @@ fn run(
                 Err(e) => fail(AppError::from(e), mode),
             }
         }
+        Command::Consolidate {
+            extract,
+            scope,
+            dry_run,
+        } => {
+            if !extract {
+                // At M4 extraction is the only consolidation phase, and an
+                // explicit flag keeps the surface honest when M5 adds more.
+                return fail(
+                    AppError::new(
+                        error::ErrorCode::InvalidArgument,
+                        2,
+                        "consolidate needs a phase flag",
+                        "pass --extract (dedup/decay arrive at M5)",
+                    ),
+                    mode,
+                );
+            }
+            let guard = store.lock().expect("store lock poisoned");
+            // No scope cascade here, unlike the rule commands: None means
+            // EVERY scope, because idle-time maintenance naturally spans
+            // the whole database.
+            match guard.facts_extract(scope.as_deref(), dry_run) {
+                Ok(report) => {
+                    let resp = if dry_run {
+                        Response::new("engram consolidate --extract --dry-run", report)
+                            .with_dry_run()
+                    } else {
+                        Response::new("engram consolidate --extract", report)
+                    };
+                    emit_ok(resp, mode);
+                    0
+                }
+                Err(e) => fail(AppError::from(e), mode),
+            }
+        }
         Command::Rule { action } => run_rule(action, &store, mode),
         Command::Index {
             scope,
@@ -383,10 +421,19 @@ fn run(
                 "maintainer": "Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>",
                 "website": "https://Engram.SpacecraftSoftware.org/",
                 "commands": [
-                    "remember", "recall", "search", "context", "index",
+                    "remember", "recall", "search", "context", "index", "consolidate",
                     "rule add", "rule list", "rule retire", "rule sync", "rule purge",
                     "save-chat", "mcp", "serve", "schema", "describe"
                 ],
+                "facts": {
+                    "extractor": facts::EXTRACTOR,
+                    "philosophy": "facts are VERBATIM marker-prefixed lines/sentences (Decided:, \
+                                   TODO, Never..., 19 markers) indexed with drill-down pointers to \
+                                   their parent memories; extraction is deterministic — no LLM ever \
+                                   runs on the write path, and a fact's liveness derives from its \
+                                   parent memory's validity at query time",
+                    "cli_only": true
+                },
                 "vector": {
                     "description": "Semantic (hybrid) retrieval: FTS5 + Model2Vec vector channels \
                                     fused with reciprocal rank fusion. Feature-gated at build time; \

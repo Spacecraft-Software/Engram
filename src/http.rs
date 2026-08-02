@@ -301,6 +301,7 @@ async fn search(State(store): State<SharedStore>, Query(q): Query<SearchParams>)
                         report.channels = std::collections::BTreeMap::from([
                             ("fts", hybrid.fts_candidates),
                             ("vector", hybrid.vector_candidates),
+                            ("facts", hybrid.facts_candidates),
                         ]);
                         ok_resp(Response::new("GET /v1/memory/search", mems).with_budget(report))
                     }

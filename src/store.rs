@@ -177,7 +177,7 @@ pub struct HybridQuery<'a> {
 
 /// Result of a [`Store::search_hybrid`]: the fused memories plus how many
 /// candidates each channel contributed, so callers can report
-/// `channels: {"fts": n, "vector": n}` in a budget envelope.
+/// `channels: {"fts": n, "vector": n, "facts": n}` in a budget envelope.
 #[derive(Debug)]
 pub struct HybridSearch {
     /// Fused results, best rank first (reciprocal-rank-fusion order).
@@ -186,6 +186,23 @@ pub struct HybridSearch {
     pub fts_candidates: usize,
     /// Candidates the vector channel fed into the fusion.
     pub vector_candidates: usize,
+    /// Parent memories the extracted-fact channel fed into the fusion
+    /// (deduped — a parent with several matching facts counts once).
+    pub facts_candidates: usize,
+}
+
+/// Outcome of a [`Store::facts_extract`] pass, serialized as the
+/// `engram consolidate --extract` payload.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ExtractReport {
+    /// Current, non-rule memories walked.
+    pub scanned: u64,
+    /// Fact rows written — or, on a dry run, that would have been written.
+    /// Deterministic ids make re-runs report the same number without
+    /// growing the table.
+    pub facts_written: u64,
+    /// Memories that yielded at least one fact.
+    pub memories_with_facts: u64,
 }
 
 /// Candidates fetched per channel before hybrid fusion. Both the FTS and the
@@ -234,6 +251,15 @@ impl Store {
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        // Required by the facts index (M4): `facts_extract` upserts with
+        // INSERT OR REPLACE, and SQLite fires the conflict-resolution
+        // DELETE's triggers only when recursive triggers are enabled.
+        // Without this, re-extraction would leave ghost rows in the
+        // external-content `facts_fts` index (the parent JOIN would still
+        // filter them, but the index would silently drift out of sync).
+        // No other engram trigger can recurse — they only write into FTS
+        // virtual tables, which have no triggers of their own.
+        conn.pragma_update(None, "recursive_triggers", true)?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS memories (
@@ -642,16 +668,187 @@ impl Store {
         Ok(scored)
     }
 
-    /// Hybrid retrieval: FTS5 top-[`HYBRID_CHANNEL_LIMIT`] fused with the
-    /// vector top-[`HYBRID_CHANNEL_LIMIT`] by reciprocal rank fusion
+    /// Runs the deterministic fact extractor over every CURRENT, non-rule
+    /// memory (optionally narrowed to one scope) and upserts the results
+    /// into the `facts` index.
+    ///
+    /// Extraction is **append-only in v1**: `INSERT OR REPLACE` keyed on the
+    /// deterministic [`crate::facts::fact_id`] is the only write — facts
+    /// whose parent has since been superseded, or which a changed extractor
+    /// would no longer produce, are *not* deleted here. Stale facts are
+    /// filtered at **query time** instead, through the parent JOIN in
+    /// [`Store::fact_candidates`] — the same never-delete posture as the
+    /// rest of the store. Deterministic ids make the pass idempotent:
+    /// re-running rewrites the same rows and the table does not grow.
+    ///
+    /// `scope = None` means **every scope** — deliberately unlike the rule
+    /// commands' cascade, because idle-time maintenance naturally spans the
+    /// whole database. With `dry_run`, nothing is written and the report
+    /// counts what a real run would have written.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if a query or the write
+    /// transaction fails.
+    pub fn facts_extract(
+        &self,
+        scope: Option<&str>,
+        dry_run: bool,
+    ) -> rusqlite::Result<ExtractReport> {
+        let scope_clause = if scope.is_some() {
+            "AND scope = ?1"
+        } else {
+            ""
+        };
+        // Deterministic walk order (it does not change the outcome — ids
+        // are content-derived — but it keeps runs comparable in a trace).
+        let sql = format!(
+            "SELECT id, scope, content FROM memories
+             WHERE valid_to IS NULL AND rule_id IS NULL {scope_clause}
+             ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let memories: Vec<(String, String, String)> = rows.collect::<Result<_, _>>()?;
+
+        // One timestamp for the whole pass; one transaction for all writes.
+        let now = crate::time::now_iso8601();
+        let tx = if dry_run {
+            None
+        } else {
+            Some(self.conn.unchecked_transaction()?)
+        };
+        let mut report = ExtractReport {
+            scanned: 0,
+            facts_written: 0,
+            memories_with_facts: 0,
+        };
+        for (memory_id, memory_scope, content) in &memories {
+            report.scanned += 1;
+            let extracted = crate::facts::extract(content);
+            if extracted.is_empty() {
+                continue;
+            }
+            report.memories_with_facts += 1;
+            for fact in &extracted {
+                if let Some(tx) = tx.as_ref() {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO facts
+                             (id, memory_id, scope, fact, extractor, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            crate::facts::fact_id(memory_id, fact),
+                            memory_id,
+                            memory_scope,
+                            fact,
+                            crate::facts::EXTRACTOR,
+                            now
+                        ],
+                    )?;
+                }
+                report.facts_written += 1;
+            }
+        }
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
+        Ok(report)
+    }
+
+    /// Parent memory ids whose extracted facts match `query`, deduped, in
+    /// FTS rank order — the facts retrieval channel.
+    ///
+    /// The validity clause is applied to the **parent** columns (`m.`):
+    /// the fact rows' own `valid_to`/`superseded_by` are reserved and stay
+    /// NULL, so a fact is live exactly as long as its parent memory is.
+    /// A parent with several matching facts appears once, at its best
+    /// rank. No SQL `LIMIT`: duplicates would eat limit slots before the
+    /// dedupe, so all matches are fetched and truncated after — fine at
+    /// engram's scale, the same no-index reasoning as brute-force cosine.
+    /// The `m.rule_id IS NULL` filter is belt-and-braces; rule rows are
+    /// never extracted from in the first place.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails —
+    /// including the FTS syntax error an empty `query` produces.
+    pub fn fact_candidates(
+        &self,
+        query: &str,
+        scope: Option<&str>,
+        limit: u32,
+        validity: Validity<'_>,
+    ) -> rusqlite::Result<Vec<String>> {
+        let query = &sanitize_fts_query(query);
+        let (clause, as_of) = validity_filter(validity, "m.", if scope.is_some() { 3 } else { 2 });
+        let sql = if scope.is_some() {
+            format!(
+                "SELECT f.memory_id FROM facts_fts ff
+                 JOIN facts f ON f.rowid = ff.rowid
+                 JOIN memories m ON m.id = f.memory_id
+                 WHERE facts_fts MATCH ?1 AND m.scope = ?2 AND m.rule_id IS NULL {clause}
+                 ORDER BY rank"
+            )
+        } else {
+            format!(
+                "SELECT f.memory_id FROM facts_fts ff
+                 JOIN facts f ON f.rowid = ff.rowid
+                 JOIN memories m ON m.id = f.memory_id
+                 WHERE facts_fts MATCH ?1 AND m.rule_id IS NULL {clause}
+                 ORDER BY rank"
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![query];
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        if let Some(t) = as_of.as_ref() {
+            bind.push(t);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut parents: Vec<String> = Vec::new();
+        for row in rows {
+            let id = row?;
+            if seen.insert(id.clone()) {
+                parents.push(id);
+                if parents.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(parents)
+    }
+
+    /// Hybrid retrieval: the FTS5, vector, and extracted-fact channels
+    /// (top-[`HYBRID_CHANNEL_LIMIT`] each) fused by reciprocal rank fusion
     /// (k = [`crate::retrieval::RRF_K`]), truncated to `limit`.
     ///
-    /// Rule rows are dropped from both channels — policy is delivered
-    /// through the rules section, not through search. Both channels read the
-    /// same `validity` slice, so a superseded memory is invisible under
-    /// [`Validity::Current`] on either path. Not feature-gated: it takes a
-    /// precomputed query vector, so hand-built vectors exercise it in every
-    /// build.
+    /// The facts channel ([`Store::fact_candidates`]) can never surface a
+    /// memory FTS cannot — facts are verbatim substrings of content — but
+    /// it *boosts* parents whose marker-prefixed decision/constraint lines
+    /// match the query, so the memory that states a decision outranks the
+    /// ones that merely mention its words. Rule rows are dropped from every
+    /// channel — policy is delivered through the rules section, not through
+    /// search. All channels read the same `validity` slice, so a superseded
+    /// memory is invisible under [`Validity::Current`] on every path. Not
+    /// feature-gated: it takes a precomputed query vector, so hand-built
+    /// vectors exercise it in every build.
     ///
     /// # Errors
     ///
@@ -677,12 +874,14 @@ impl Store {
             .collect();
         let vector_hits =
             self.vector_candidates(query_vec, model, scope, HYBRID_CHANNEL_LIMIT, validity)?;
+        let facts_channel = self.fact_candidates(query, scope, HYBRID_CHANNEL_LIMIT, validity)?;
 
         let fts_channel: Vec<String> = fts.iter().map(|m| m.id.clone()).collect();
         let vector_channel: Vec<String> = vector_hits.into_iter().map(|(id, _)| id).collect();
         let fts_candidates = fts_channel.len();
         let vector_candidates = vector_channel.len();
-        let fused = rrf_fuse(&[fts_channel, vector_channel], RRF_K);
+        let facts_candidates = facts_channel.len();
+        let fused = rrf_fuse(&[fts_channel, vector_channel, facts_channel], RRF_K);
 
         // The FTS channel already carries full rows; vector-only ids are
         // fetched under the same validity slice (their rows passed it once
@@ -707,6 +906,7 @@ impl Store {
             memories,
             fts_candidates,
             vector_candidates,
+            facts_candidates,
         })
     }
 
@@ -719,10 +919,12 @@ impl Store {
     ///
     /// Candidate *selection* order is newest-first recency when there is no
     /// query, or the reciprocal-rank fusion of the recency channel
-    /// (newest-first) with the FTS relevance channel (rank order) when there
-    /// is one. When the caller additionally supplies a [`HybridQuery`] (the
-    /// auto-hybrid gate passed and the query was embedded), a third vector
-    /// channel joins the same fusion — the same auto rule as search.
+    /// (newest-first), the FTS relevance channel (rank order), and the
+    /// extracted-fact channel ([`Store::fact_candidates`]; parents of
+    /// matching marker lines) when there is one. When the caller
+    /// additionally supplies a [`HybridQuery`] (the auto-hybrid gate passed
+    /// and the query was embedded), a vector channel joins the same fusion
+    /// — the same auto rule as search.
     /// *Presentation* is different: the included memories are re-sorted
     /// chronologically, because a prompt reads best oldest-first even though
     /// packing priority favors the newest and most relevant.
@@ -773,6 +975,17 @@ impl Store {
         let recency_count = recency.len();
         let relevance_count = relevance.len();
 
+        // Facts channel (M4): parents whose extracted marker lines match
+        // the query. Always on when a query ran — extraction is idle-time
+        // CLI work (`engram consolidate --extract`), so a never-extracted
+        // database simply contributes zero candidates here. Same validity
+        // slice as the other channels.
+        let fact_ids: Vec<String> = match query {
+            Some(q) => self.fact_candidates(q, Some(scope), limit, Validity::Current)?,
+            None => Vec::new(),
+        };
+        let facts_count = fact_ids.len();
+
         // Vector channel: only when a query ran AND the caller embedded it
         // (the auto-hybrid gate lives at the surfaces; a `Some` here means it
         // passed). Same validity slice as the other channels.
@@ -792,7 +1005,7 @@ impl Store {
         let priority_ids: Vec<String> = if query.is_some() {
             let recency_channel: Vec<String> = recency.iter().rev().map(|m| m.id.clone()).collect();
             let relevance_channel: Vec<String> = relevance.iter().map(|m| m.id.clone()).collect();
-            let mut channels = vec![recency_channel, relevance_channel];
+            let mut channels = vec![recency_channel, relevance_channel, fact_ids.clone()];
             if vector_ran {
                 channels.push(vector_ids.clone());
             }
@@ -810,10 +1023,11 @@ impl Store {
         for m in recency.into_iter().chain(relevance) {
             pool.entry(m.id.clone()).or_insert(m);
         }
-        // Vector-only hits carry no row yet; fetch them under the same
-        // Current view the other channels used (rule rows never qualify —
-        // vector_candidates already excludes them, this is belt-and-braces).
-        for id in &vector_ids {
+        // Facts-only and vector-only hits carry no row yet; fetch them
+        // under the same Current view the other channels used (rule rows
+        // never qualify — both candidate queries already exclude them,
+        // this is belt-and-braces).
+        for id in fact_ids.iter().chain(vector_ids.iter()) {
             if !pool.contains_key(id) {
                 if let Some(m) = self
                     .get(id, Validity::Current)?
@@ -858,6 +1072,7 @@ impl Store {
         channels.insert("recency", recency_count);
         if query.is_some() {
             channels.insert("fts", relevance_count);
+            channels.insert("facts", facts_count);
         }
         if vector_ran {
             channels.insert("vector", vector_count);
@@ -1182,6 +1397,49 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             dim       INTEGER NOT NULL,
             embedding BLOB NOT NULL
         );",
+    )?;
+    // Extracted-fact index (M4, the TencentDB L0↔L1 pattern). Facts are an
+    // INDEX over memories, never a replacement: each row is a verbatim
+    // marker-prefixed line/sentence of its parent's content, with
+    // `memory_id` as the drill-down pointer back to the full record
+    // (`engram get` / the MCP `get` tool). `id` is a deterministic UUID v5
+    // over (memory_id, fact) — see `crate::facts::fact_id` — so
+    // re-extraction upserts in place. `valid_to`/`superseded_by` are
+    // RESERVED and stay NULL for now: a fact's liveness derives from its
+    // PARENT's validity — every fact-channel query joins `memories` and
+    // applies the validity clause to the parent columns, so superseding a
+    // memory retires its facts at query time without touching fact rows.
+    // Rule rows are never extracted from.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS facts (
+            id            TEXT PRIMARY KEY,
+            memory_id     TEXT NOT NULL REFERENCES memories(id),
+            scope         TEXT NOT NULL,
+            fact          TEXT NOT NULL,
+            extractor     TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            valid_to      TEXT,
+            superseded_by TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_facts_scope ON facts(scope);
+        CREATE INDEX IF NOT EXISTS idx_facts_memory ON facts(memory_id);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+            fact,
+            content='facts',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+            INSERT INTO facts_fts(rowid, fact) VALUES (new.rowid, new.fact);
+        END;
+        CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, fact) VALUES('delete', old.rowid, old.fact);
+        END;
+        CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, fact) VALUES('delete', old.rowid, old.fact);
+            INSERT INTO facts_fts(rowid, fact) VALUES (new.rowid, new.fact);
+        END;",
     )?;
     Ok(())
 }
@@ -2368,5 +2626,286 @@ mod tests {
             .search("searchable-marker", Some("demo"), 10, Validity::All)
             .expect("search")
             .is_empty());
+    }
+
+    // ---- M4: extracted-fact index ----------------------------------------
+    //
+    // Extraction is deterministic (`facts::extract`, no LLM), append-only
+    // (INSERT OR REPLACE on deterministic ids), and stale facts are
+    // filtered at query time through the parent JOIN — these tests pin all
+    // three properties.
+
+    #[test]
+    fn facts_extract_is_idempotent_with_deterministic_ids() {
+        let store = Store::open_in_memory().expect("open");
+        let marked = store
+            .remember(
+                "a",
+                "m4",
+                "note",
+                "Decided: the flange torque stays at spec.\njust chatter on a second line",
+            )
+            .expect("remember");
+        store
+            .remember("a", "m4", "note", "plain narrative with no markers at all")
+            .expect("remember");
+        let count = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM facts", [], |r| r.get(0))
+                .expect("count")
+        };
+
+        // Dry run: full report, no rows.
+        let dry = store.facts_extract(Some("m4"), true).expect("dry run");
+        assert_eq!(dry.scanned, 2);
+        assert_eq!(dry.memories_with_facts, 1);
+        assert_eq!(dry.facts_written, 1);
+        assert_eq!(count(&store), 0, "a dry run must write nothing");
+
+        // Real run: one row, with the deterministic v5 id.
+        let first = store.facts_extract(Some("m4"), false).expect("extract");
+        assert_eq!(first.facts_written, 1);
+        assert_eq!(count(&store), 1);
+        let (id, extractor): (String, String) = store
+            .conn
+            .query_row("SELECT id, extractor FROM facts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("fact row");
+        assert_eq!(
+            id,
+            crate::facts::fact_id(&marked.id, "Decided: the flange torque stays at spec."),
+            "the row id is the deterministic UUID v5 over (memory, fact)"
+        );
+        assert_eq!(extractor, crate::facts::EXTRACTOR);
+
+        // Idempotent: same report, no growth.
+        let second = store.facts_extract(Some("m4"), false).expect("re-extract");
+        assert_eq!(second.facts_written, first.facts_written);
+        assert_eq!(count(&store), 1, "re-extraction must not grow the table");
+    }
+
+    #[test]
+    fn facts_extract_skips_rule_rows_and_superseded_memories() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "m4-skip";
+        // A rule whose text would extract if rules were eligible.
+        store
+            .rule_add(
+                "a",
+                scope,
+                "flange-rule",
+                "Never loosen the flange without a spotter.",
+            )
+            .expect("rule");
+        // A superseded memory whose text would extract if history were.
+        let old = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "Decided: torque limit is five newton meters.",
+            )
+            .expect("remember");
+        let new = store
+            .remember_superseding(
+                "a",
+                scope,
+                "note",
+                "Decided: torque limit is six newton meters.",
+                &old.id,
+            )
+            .expect("supersede")
+            .memory
+            .expect("stored");
+
+        let report = store.facts_extract(Some(scope), false).expect("extract");
+        assert_eq!(
+            report.scanned, 1,
+            "only the current, non-rule memory is walked"
+        );
+        assert_eq!(report.facts_written, 1);
+
+        let parents: Vec<String> = store
+            .conn
+            .prepare("SELECT memory_id FROM facts")
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            parents,
+            vec![new.id.clone()],
+            "only the replacement was extracted from"
+        );
+    }
+
+    #[test]
+    fn fact_candidates_dedupes_parents_and_follows_parent_validity() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "m4-cand";
+        // Two matching facts on one parent — must appear once.
+        let multi = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "Decided: use the zeta flange coupling.\n\
+                 Gotcha: the zeta flange coupling seizes when cold.",
+            )
+            .expect("remember");
+        let single = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "TODO inspect the zeta flange coupling next week",
+            )
+            .expect("remember");
+        // Matching content, but no marker — never extracted, never a candidate.
+        store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "the zeta flange coupling came up in chatter",
+            )
+            .expect("remember");
+        store.facts_extract(Some(scope), false).expect("extract");
+
+        let hits = store
+            .fact_candidates("zeta flange coupling", Some(scope), 10, Validity::Current)
+            .expect("candidates");
+        assert_eq!(
+            hits.len(),
+            2,
+            "three matching facts, two distinct parents: {hits:?}"
+        );
+        assert!(hits.contains(&multi.id));
+        assert!(hits.contains(&single.id));
+
+        // Superseding the parent retires its facts at QUERY time: the fact
+        // rows are untouched (append-only v1), but the parent JOIN's
+        // validity clause stops surfacing them under Current.
+        store
+            .remember_superseding("a", scope, "note", "replacement without markers", &multi.id)
+            .expect("supersede");
+        let current = store
+            .fact_candidates("zeta flange coupling", Some(scope), 10, Validity::Current)
+            .expect("candidates");
+        assert_eq!(
+            current,
+            vec![single.id.clone()],
+            "the superseded parent is gone"
+        );
+        let all = store
+            .fact_candidates("zeta flange coupling", Some(scope), 10, Validity::All)
+            .expect("candidates");
+        assert!(
+            all.contains(&multi.id),
+            "the full-history view still reaches the stale facts' parent"
+        );
+    }
+
+    #[test]
+    fn context_facts_channel_boosts_the_marker_parent_and_reports_it() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "ctx-facts";
+        // The decision memory is OLDEST and LONG: last in the recency
+        // channel, and its BM25 rank trails the short chatter (one "flange"
+        // in a long document vs one in three words). Only the facts channel
+        // puts it at rank 0 — without that boost it loses the budget race.
+        let decided = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "Decided: adopt the flange protocol for docking. The rest of this \
+                 memory is deliberately long filler so its rank in the full-text \
+                 channel trails the short mentions that follow it.",
+            )
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for content in [
+            "flange chatter one",
+            "flange chatter two",
+            "flange chatter three",
+        ] {
+            remember_spaced(&store, scope, content);
+        }
+        store.facts_extract(Some(scope), false).expect("extract");
+
+        // A budget of exactly the decision memory's cost: whichever
+        // candidate is selected first consumes it all.
+        let budget = crate::retrieval::estimate_tokens(&decided.content);
+        let ctx = store
+            .context(scope, Some("flange"), 50, budget, None)
+            .expect("context");
+        let ids: Vec<&str> = ctx.memories.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![decided.id.as_str()],
+            "the facts channel ranks the decision memory first: {:?}",
+            ctx.memories
+        );
+        assert_eq!(ctx.budget.channels[&"facts"], 1);
+        assert_eq!(ctx.budget.channels[&"fts"], 4);
+        assert_eq!(ctx.budget.dropped, 3);
+
+        // No query: the facts channel does not run and is not reported.
+        let ctx = store
+            .context(scope, None, 50, budget, None)
+            .expect("context");
+        assert!(!ctx.budget.channels.contains_key("facts"));
+    }
+
+    #[test]
+    fn search_hybrid_fuses_the_facts_channel_and_reports_it() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "hybrid-facts";
+        let marker = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "Decided: the flange protocol is frozen for the mission duration.",
+            )
+            .expect("remember");
+        let plain = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "the flange came up in passing conversation",
+            )
+            .expect("remember");
+        // Only the plain memory carries a vector; only the marker memory
+        // yields a fact — every channel contributes something distinct.
+        store
+            .vector_upsert(&plain.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        store.facts_extract(Some(scope), false).expect("extract");
+
+        let hybrid = store
+            .search_hybrid(
+                "flange",
+                &[1.0, 0.0],
+                "m",
+                Some(scope),
+                10,
+                Validity::Current,
+            )
+            .expect("hybrid");
+        assert_eq!(hybrid.fts_candidates, 2);
+        assert_eq!(hybrid.vector_candidates, 1);
+        assert_eq!(
+            hybrid.facts_candidates, 1,
+            "one parent with a matching fact"
+        );
+        let ids: Vec<&str> = hybrid.memories.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&marker.id.as_str()));
+        assert!(ids.contains(&plain.id.as_str()));
     }
 }

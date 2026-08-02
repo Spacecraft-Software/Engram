@@ -62,6 +62,7 @@ engram remember ... --supersedes <id>                            # close old val
 engram recall --scope S --as-of <ISO8601> | --include-superseded # time travel / full history
 engram index [--scope S] [--dry-run]                             # backfill vectors (vector feature; local model only)
 engram search Q --mode fts|hybrid                                # explicit retrieval mode (auto-hybrid when ready)
+engram consolidate --extract [--scope S] [--dry-run]             # deterministic fact extraction (M4; CLI-only; no scope = ALL scopes)
 engram rule sync [--scope S] [--file PATH]... [--dry-run]
 ```
 
