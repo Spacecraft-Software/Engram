@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [package]
 name = "engram"
-version = "0.5.0"
+version = "0.6.0-dev"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Shared verbatim chat memory for multi-model LLM pipelines. MCP + HTTP, SQLite FTS5-backed."
