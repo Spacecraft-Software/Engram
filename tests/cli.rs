@@ -987,9 +987,9 @@ fn rule_purge_deletes_tombstones_only_and_needs_consent() {
 // --- M4: extracted-fact index --------------------------------------------
 
 /// `consolidate` with no phase flag is a structured refusal, not a no-op:
-/// at M4 only `--extract` exists, and the hint says what is coming.
+/// the hint names every available phase.
 #[test]
-fn consolidate_without_extract_is_invalid_argument() {
+fn consolidate_without_a_phase_flag_is_invalid_argument() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
 
@@ -998,10 +998,9 @@ fn consolidate_without_extract_is_invalid_argument() {
     assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
     assert_eq!(err["error"]["exit_code"], 2);
     let hint = err["error"]["hint"].as_str().expect("hint is a string");
-    assert!(
-        hint.contains("--extract"),
-        "the hint names the missing phase flag: {hint}"
-    );
+    for phase in ["--extract", "--dedup", "--report"] {
+        assert!(hint.contains(phase), "the hint names phase {phase}: {hint}");
+    }
 }
 
 /// `--dry-run` reports the full extraction outcome without persisting it:
@@ -1026,9 +1025,14 @@ fn consolidate_extract_dry_run_counts_without_writing() {
         .success();
     let envelope = parse_single_line_json(&assert.get_output().stdout);
     assert_eq!(envelope["metadata"]["dry_run"], true);
-    assert_eq!(envelope["data"]["scanned"], 2);
-    assert_eq!(envelope["data"]["memories_with_facts"], 1);
-    assert_eq!(envelope["data"]["facts_written"], 1);
+    let extract = &envelope["data"]["extract"];
+    assert_eq!(extract["scanned"], 2);
+    assert_eq!(extract["memories_with_facts"], 1);
+    assert_eq!(extract["facts_written"], 1);
+    assert!(
+        envelope["data"]["dedup"].is_null() && envelope["data"]["report"].is_null(),
+        "phases that did not run are absent from the data"
+    );
 
     // Nothing was persisted: the real run still writes the same count (a
     // fact already on disk would have been an upsert either way, but the
@@ -1042,7 +1046,7 @@ fn consolidate_extract_dry_run_counts_without_writing() {
         envelope["metadata"]["dry_run"].is_null(),
         "no dry_run marker on a real run"
     );
-    assert_eq!(envelope["data"]["facts_written"], 1);
+    assert_eq!(envelope["data"]["extract"]["facts_written"], 1);
 }
 
 /// Deterministic ids make re-extraction an upsert: the same report on every
@@ -1066,7 +1070,7 @@ fn consolidate_extract_is_idempotent() {
             .args(["consolidate", "--extract", "--scope", scope])
             .assert()
             .success();
-        parse_single_line_json(&assert.get_output().stdout)["data"].clone()
+        parse_single_line_json(&assert.get_output().stdout)["data"]["extract"].clone()
     };
     let first = run(&db);
     assert_eq!(first["scanned"], 2);
@@ -1128,4 +1132,218 @@ fn context_query_surfaces_the_facts_channel_after_extraction() {
             .any(|m| m["content"] == "Decided: adopt the flange protocol for docking."),
         "the decision memory is in the assembled context: {memories:?}"
     );
+}
+
+// --- M5: idle consolidation + decay ---------------------------------------
+
+/// `--dedup` without `--yes` names the duplicate group but changes nothing;
+/// `--dedup --yes` supersedes the older copies (never deletes), and a second
+/// run finds nothing — the losers are no longer Current.
+#[test]
+fn consolidate_dedup_reports_then_supersedes_with_yes_idempotently() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "dedup-cli";
+
+    // Two copies distinct only in case/whitespace, plus a bystander.
+    let older = remember(
+        &db,
+        "a",
+        scope,
+        "Decided: torque stays at five newton meters.",
+    );
+    let older_id = older["data"]["id"].as_str().expect("id").to_string();
+    let newer = remember(
+        &db,
+        "a",
+        scope,
+        "  decided:   TORQUE stays at five newton meters.  ",
+    );
+    let newer_id = newer["data"]["id"].as_str().expect("id").to_string();
+    remember(&db, "a", scope, "unrelated bystander memory");
+
+    // Report-only: the group is named; every row stays Current.
+    let assert = engram(&db)
+        .args(["consolidate", "--dedup", "--scope", scope])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    let dedup = &envelope["data"]["dedup"];
+    assert_eq!(dedup["applied"], false);
+    assert_eq!(dedup["superseded"], 0);
+    let groups = dedup["groups"].as_array().expect("groups is an array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0]["winner"],
+        newer_id.as_str(),
+        "the newest row wins"
+    );
+    assert_eq!(groups[0]["losers"][0], older_id.as_str());
+    assert_eq!(
+        recall_data(&db, scope).len(),
+        3,
+        "report-only leaves every row Current"
+    );
+
+    // --yes: the loser is superseded by the winner. Never deleted.
+    let assert = engram(&db)
+        .args(["consolidate", "--dedup", "--scope", scope, "--yes"])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(envelope["data"]["dedup"]["applied"], true);
+    assert_eq!(envelope["data"]["dedup"]["superseded"], 1);
+    let current = recall_data(&db, scope);
+    assert_eq!(current.len(), 2, "the loser left the Current view");
+    assert!(current.iter().all(|m| m["id"] != older_id.as_str()));
+
+    // The full history keeps the loser, chained to the winner.
+    let assert = engram(&db)
+        .args(["recall", "--scope", scope, "--include-superseded"])
+        .assert()
+        .success();
+    let all = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    let loser_row = all
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|m| m["id"] == older_id.as_str())
+        .expect("the superseded row survives")
+        .clone();
+    assert_eq!(loser_row["superseded_by"], newer_id.as_str());
+    assert!(loser_row["valid_to"].is_string());
+
+    // Idempotent: nothing left to find.
+    let assert = engram(&db)
+        .args(["consolidate", "--dedup", "--scope", scope, "--yes"])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(
+        envelope["data"]["dedup"]["groups"].as_array().map(Vec::len),
+        Some(0),
+        "a second run finds nothing"
+    );
+    assert_eq!(envelope["data"]["dedup"]["superseded"], 0);
+}
+
+/// `--report` returns both sections — contradiction pairs and decay
+/// candidates — and is always read-only.
+#[test]
+fn consolidate_report_returns_contradictions_and_decay() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "report-cli";
+
+    remember(
+        &db,
+        "a",
+        scope,
+        "the deploy pipeline uses docker for builds",
+    );
+    let negated = remember(
+        &db,
+        "a",
+        scope,
+        "the deploy pipeline does not use docker for builds",
+    );
+    let negated_id = negated["data"]["id"].as_str().expect("id");
+
+    let assert = engram(&db)
+        .args(["consolidate", "--report", "--scope", scope])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    let report = &envelope["data"]["report"];
+
+    let contradictions = report["contradictions"]
+        .as_array()
+        .expect("contradictions is an array");
+    assert_eq!(contradictions.len(), 1, "{contradictions:?}");
+    assert_eq!(contradictions[0]["negated"], negated_id);
+    assert!(contradictions[0]["jaccard"].as_f64().expect("jaccard") >= 0.5);
+
+    let decay = report["decay"].as_array().expect("decay is an array");
+    assert_eq!(decay.len(), 2, "both memories are scored");
+    for candidate in decay {
+        assert!(candidate["staleness"].is_number());
+        assert!(candidate["access_count"].is_number());
+        assert!(candidate["age_days"].is_number());
+    }
+    // The report itself is read-only: both rows are still Current.
+    assert_eq!(recall_data(&db, scope).len(), 2);
+}
+
+/// `--no-track` keeps reads from bumping access counters; a tracked read
+/// bumps them — observable through the decay report's `access_count`. The
+/// serialized memories never carry the access columns either way.
+#[test]
+fn no_track_recall_leaves_access_counts_untouched() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "no-track-cli";
+
+    remember(&db, "a", scope, "the audited memory");
+
+    // Audited read: no bump.
+    let assert = engram(&db)
+        .args(["--no-track", "recall", "--scope", scope])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    let row = &data.as_array().expect("array")[0];
+    assert!(
+        row.get("access_count").is_none() && row.get("last_accessed_at").is_none(),
+        "access columns are internal and never serialized: {row}"
+    );
+
+    let access_count = |db: &Path| -> i64 {
+        let assert = engram(db)
+            .args(["consolidate", "--report", "--scope", scope])
+            .assert()
+            .success();
+        parse_single_line_json(&assert.get_output().stdout)["data"]["report"]["decay"][0]
+            ["access_count"]
+            .as_i64()
+            .expect("access_count")
+    };
+    assert_eq!(access_count(&db), 0, "--no-track left the counter at 0");
+
+    // Tracked read: bumps once. (consolidate --report itself never tracks —
+    // it is analysis, not retrieval — so the counter is stable across the
+    // probe calls.)
+    engram(&db)
+        .args(["recall", "--scope", scope])
+        .assert()
+        .success();
+    assert_eq!(access_count(&db), 1, "a tracked recall bumps once");
+}
+
+/// The capability manifest advertises the consolidate phases and the
+/// access-tracking posture.
+#[test]
+fn describe_advertises_consolidate_phases_and_access_tracking() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let assert = engram(&db).arg("describe").assert().success();
+    let manifest = parse_json(&assert.get_output().stdout);
+
+    let phases = manifest["consolidate"]["phases"]
+        .as_array()
+        .expect("consolidate.phases is an array");
+    for phase in ["extract", "dedup", "report"] {
+        assert!(
+            phases.iter().any(|p| p == phase),
+            "phases must include {phase}: {phases:?}"
+        );
+    }
+    assert_eq!(manifest["consolidate"]["cli_only"], true);
+
+    let tracking = &manifest["access_tracking"];
+    let columns = tracking["columns"]
+        .as_array()
+        .expect("access_tracking.columns is an array");
+    assert!(columns.iter().any(|c| c == "access_count"));
+    assert!(columns.iter().any(|c| c == "last_accessed_at"));
+    assert_eq!(tracking["opt_out"], "--no-track (CLI)");
 }

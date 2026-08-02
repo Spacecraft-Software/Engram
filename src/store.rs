@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 pub struct Store {
     conn: Connection,
+    /// Whether reads bump the access-tracking columns (`access_count`,
+    /// `last_accessed_at`). Defaults to `true`; the CLI's global
+    /// `--no-track` flag turns it off for read-only auditing. The MCP and
+    /// HTTP surfaces expose no opt-out of their own — agent reads are
+    /// exactly the signal the decay report exists to measure.
+    tracking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -205,9 +211,111 @@ pub struct ExtractReport {
     pub memories_with_facts: u64,
 }
 
+/// One group of near-duplicate memories found by
+/// [`Store::consolidate_dedup`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DedupGroup {
+    pub scope: String,
+    /// The newest row of the group (max `created_at`, id as tie-break) —
+    /// kept as the current truth.
+    pub winner: String,
+    /// The older rows: superseded when the run applies, merely reported
+    /// otherwise.
+    pub losers: Vec<String>,
+    /// Which detector(s) connected the group: `"exact"` (normalized text)
+    /// and/or `"vector"` (stored-embedding cosine).
+    pub detectors: Vec<&'static str>,
+}
+
+/// Outcome of a [`Store::consolidate_dedup`] pass — the
+/// `engram consolidate --dedup` payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct DedupReport {
+    /// Current, non-rule memories walked.
+    pub scanned: u64,
+    /// Duplicate groups found, each naming its winner and losers.
+    pub groups: Vec<DedupGroup>,
+    /// True when the losers were actually superseded (`--yes`); false on a
+    /// report-only run, which writes nothing.
+    pub applied: bool,
+    /// Losers whose validity window was closed (0 on report-only).
+    pub superseded: u64,
+}
+
+/// A suspected contradiction between two current memories — one half of the
+/// `engram consolidate --report` payload.
+///
+/// Flagged by a deliberately crude heuristic (word overlap + a negation
+/// marker on exactly one side); the tool never auto-resolves. A human or
+/// agent inspects the pair and, if the contradiction is real, records the
+/// truth with `engram remember --supersedes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContradictionPair {
+    pub scope: String,
+    /// The older memory of the pair.
+    pub a: String,
+    /// The newer memory of the pair.
+    pub b: String,
+    /// Jaccard overlap of the lowercased word sets (>= 0.5 to be flagged).
+    pub jaccard: f64,
+    /// Id of the side carrying the negation marker.
+    pub negated: String,
+}
+
+/// A stale-memory candidate from the decay scoring of
+/// `engram consolidate --report`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecayCandidate {
+    pub id: String,
+    pub scope: String,
+    /// Days since `created_at`.
+    pub age_days: f64,
+    /// Times a tracked read returned this memory (NULL column reads as 0).
+    pub access_count: u64,
+    /// When a tracked read last returned it; absent if never.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    /// `age_days * 1.0 + 30.0 / (1 + access_count)` — see
+    /// [`Store::consolidate_report`].
+    pub staleness: f64,
+}
+
+/// Outcome of a [`Store::consolidate_report`] pass — always report-only.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsolidateReport {
+    /// Current, non-rule memories walked.
+    pub scanned: u64,
+    /// Suspected contradictions, for a human or agent to resolve.
+    pub contradictions: Vec<ContradictionPair>,
+    /// The top [`DECAY_TOP`] stalest memories.
+    pub decay: Vec<DecayCandidate>,
+}
+
 /// Candidates fetched per channel before hybrid fusion. Both the FTS and the
 /// vector channel feed their top-50 into [`crate::retrieval::rrf_fuse`].
 const HYBRID_CHANNEL_LIMIT: u32 = 50;
+
+/// Cosine threshold above which two stored vectors count as near-duplicates
+/// in [`Store::consolidate_dedup`].
+const DEDUP_COSINE_THRESHOLD: f32 = 0.92;
+
+/// How many decay candidates [`Store::consolidate_report`] returns.
+const DECAY_TOP: usize = 20;
+
+/// Substrings whose presence marks a memory as "negated" for the
+/// contradiction heuristic of [`Store::consolidate_report`]. Checked against
+/// the lowercased content; the trailing spaces keep e.g. `notable` from
+/// matching `not `.
+const NEGATION_MARKERS: [&str; 8] = [
+    "not ",
+    "never ",
+    "no longer ",
+    "don't ",
+    "do not ",
+    "isn't ",
+    "wasn't ",
+    "stopped ",
+];
 
 /// A budget-packed context block assembled by [`Store::context`]: the
 /// scope's active rules first, then the memories that fit the remaining
@@ -292,7 +400,56 @@ impl Store {
             "#,
         )?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            tracking: true,
+        })
+    }
+
+    /// Turns read-path access tracking on or off for this handle.
+    ///
+    /// Off means `recall`/`search`/`search_hybrid`/`context`/`get` leave
+    /// `access_count` and `last_accessed_at` untouched — the CLI's
+    /// `--no-track` (read-only auditing). Tracking defaults to on.
+    pub fn set_tracking(&mut self, on: bool) {
+        self.tracking = on;
+    }
+
+    /// Bumps the access-tracking columns for the given memory ids: one
+    /// batched `UPDATE` per 500-id chunk (SQLite's default host-parameter
+    /// ceiling is 999; 500 leaves comfortable margin), all sharing one
+    /// timestamp. A no-op when tracking is off or `ids` is empty.
+    ///
+    /// Called at the END of each tracked read, inside the same lock, and
+    /// only for the memories actually *returned* — candidates that lost the
+    /// fusion or the budget race are not touched. The columns are internal:
+    /// [`row_to_memory`] never reads them, so `Memory` serialization is
+    /// byte-identical with or without tracking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if an update fails.
+    fn track_access(&self, ids: &[String]) -> rusqlite::Result<()> {
+        if !self.tracking || ids.is_empty() {
+            return Ok(());
+        }
+        let now = crate::time::now_iso8601();
+        for chunk in ids.chunks(500) {
+            let placeholders: Vec<String> =
+                (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+            let sql = format!(
+                "UPDATE memories
+                 SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ?1
+                 WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&now];
+            for id in chunk {
+                bind.push(id);
+            }
+            self.conn.execute(&sql, rusqlite::params_from_iter(bind))?;
+        }
+        Ok(())
     }
 
     pub fn remember(
@@ -429,13 +586,59 @@ impl Store {
         })
     }
 
+    /// Closes `loser_id`'s validity window in favor of an **existing**
+    /// memory `winner_id`, at instant `now`.
+    ///
+    /// This reuses M2's supersession semantics — `valid_to` + `superseded_by`
+    /// set together, the row never deleted, `Validity::Current` reads stop
+    /// seeing it — but unlike [`Store::remember_superseding`] it inserts no
+    /// new row: the winner already exists. It is the dedup primitive
+    /// (`consolidate --dedup --yes`), where the newest copy of a duplicate
+    /// group absorbs the older ones.
+    ///
+    /// The `valid_to IS NULL` guard makes it naturally idempotent and
+    /// conflict-safe: a loser already superseded (by anything) is left
+    /// untouched, and `false` is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the update fails.
+    pub fn mark_superseded_by(
+        &self,
+        loser_id: &str,
+        winner_id: &str,
+        now: &str,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE memories SET valid_to = ?1, superseded_by = ?2
+             WHERE id = ?3 AND valid_to IS NULL",
+            params![now, winner_id, loser_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Most recent memories in a scope, oldest last-N, chronological order.
     ///
     /// Rules are stored in this same table and are returned here alongside
     /// messages — recalling a scope should surface the policy that governs it.
     /// Use [`Store::rules`] when only rules are wanted. `validity` selects
-    /// which slice of the bi-temporal history is visible.
+    /// which slice of the bi-temporal history is visible. The returned rows'
+    /// access counters are bumped (see [`Store::track_access`]).
     pub fn recall(
+        &self,
+        scope: &str,
+        limit: u32,
+        validity: Validity<'_>,
+    ) -> rusqlite::Result<Vec<Memory>> {
+        let out = self.recall_inner(scope, limit, validity)?;
+        self.track_access(&out.iter().map(|m| m.id.clone()).collect::<Vec<_>>())?;
+        Ok(out)
+    }
+
+    /// [`Store::recall`] without access tracking — the shared body, also
+    /// used by composite reads ([`Store::context`]) that must only track
+    /// what they finally return, never every candidate.
+    fn recall_inner(
         &self,
         scope: &str,
         limit: u32,
@@ -459,7 +662,24 @@ impl Store {
 
     /// Full-text search across all scopes, or restricted to one scope.
     /// `validity` selects which slice of the bi-temporal history is visible.
+    /// The returned rows' access counters are bumped
+    /// (see [`Store::track_access`]).
     pub fn search(
+        &self,
+        query: &str,
+        scope: Option<&str>,
+        limit: u32,
+        validity: Validity<'_>,
+    ) -> rusqlite::Result<Vec<Memory>> {
+        let out = self.search_inner(query, scope, limit, validity)?;
+        self.track_access(&out.iter().map(|m| m.id.clone()).collect::<Vec<_>>())?;
+        Ok(out)
+    }
+
+    /// [`Store::search`] without access tracking — the shared body, also
+    /// the candidate feed for [`Store::search_hybrid`] and
+    /// [`Store::context`], which track only their final output.
+    fn search_inner(
         &self,
         query: &str,
         scope: Option<&str>,
@@ -765,6 +985,363 @@ impl Store {
         Ok(report)
     }
 
+    /// Finds near-duplicate groups among the CURRENT, non-rule memories of
+    /// each scope, and — when `apply` — supersedes every loser in favor of
+    /// its group's newest row.
+    ///
+    /// Two detectors run and their edges are **unioned** into groups
+    /// (connected components):
+    ///
+    /// - **exact** — normalized text equality: trimmed, lowercased, internal
+    ///   whitespace collapsed to single spaces. Always on.
+    /// - **vector** — cosine >= [`DEDUP_COSINE_THRESHOLD`] between *stored*
+    ///   embeddings under `vector_model`, same-scope pairs only. Runs only
+    ///   when the caller passes a model (the CLI passes one exactly when the
+    ///   vector feature is built in, a model resolves, and that model has
+    ///   indexed vectors — the same gate as auto-hybrid). Pairwise over each
+    ///   scope: O(n²), the same deliberate no-index posture as brute-force
+    ///   cosine search.
+    ///
+    /// Each group keeps its NEWEST row (max `created_at`, id as tie-break)
+    /// as the winner. With `apply`, every loser goes through
+    /// [`Store::mark_superseded_by`] — M2 supersession semantics, no new row
+    /// inserted, **nothing is ever deleted** — in one transaction sharing
+    /// one timestamp. The pass is idempotent: superseded losers are no
+    /// longer Current, so a second run finds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if a query or the write
+    /// transaction fails.
+    pub fn consolidate_dedup(
+        &self,
+        scope: Option<&str>,
+        vector_model: Option<&str>,
+        apply: bool,
+    ) -> rusqlite::Result<DedupReport> {
+        use std::collections::HashMap;
+
+        let scope_clause = if scope.is_some() {
+            "AND scope = ?1"
+        } else {
+            ""
+        };
+        // Deterministic walk order; the index into `rows` is the node id for
+        // the union-find below.
+        let sql = format!(
+            "SELECT id, scope, content, created_at FROM memories
+             WHERE valid_to IS NULL AND rule_id IS NULL {scope_clause}
+             ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        let fetched = stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let rows: Vec<(String, String, String, String)> = fetched.collect::<Result<_, _>>()?;
+
+        // Union-find over row indices; every duplicate edge unions its ends.
+        let mut parent: Vec<usize> = (0..rows.len()).collect();
+        fn find(parent: &mut [usize], i: usize) -> usize {
+            let mut root = i;
+            while parent[root] != root {
+                root = parent[root];
+            }
+            let mut walk = i;
+            while parent[walk] != root {
+                let next = parent[walk];
+                parent[walk] = root;
+                walk = next;
+            }
+            root
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[rb] = ra;
+            }
+        }
+
+        // Detector 1 (always on): normalized-exact text within a scope.
+        let mut exact_edges: Vec<(usize, usize)> = Vec::new();
+        let mut by_norm: HashMap<(String, String), usize> = HashMap::new();
+        for (index, (_, row_scope, content, _)) in rows.iter().enumerate() {
+            let key = (row_scope.clone(), normalize_for_dedup(content));
+            match by_norm.get(&key) {
+                Some(&first) => {
+                    exact_edges.push((first, index));
+                    union(&mut parent, first, index);
+                }
+                None => {
+                    by_norm.insert(key, index);
+                }
+            }
+        }
+
+        // Detector 2 (gated by the caller): stored-vector cosine, pairwise
+        // within each scope.
+        let mut vector_edges: Vec<(usize, usize)> = Vec::new();
+        if let Some(model) = vector_model {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT memory_id, embedding FROM memory_vectors WHERE model = ?1")?;
+            let fetched = stmt.query_map(params![model], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+            for row in fetched {
+                let (id, blob) = row?;
+                vectors.insert(
+                    id,
+                    blob.chunks_exact(4)
+                        .map(|b| {
+                            f32::from_le_bytes(b.try_into().expect("chunks_exact yields 4 bytes"))
+                        })
+                        .collect(),
+                );
+            }
+            for i in 0..rows.len() {
+                let Some(vec_i) = vectors.get(&rows[i].0) else {
+                    continue;
+                };
+                for j in (i + 1)..rows.len() {
+                    if rows[i].1 != rows[j].1 {
+                        continue; // pairs are same-scope only
+                    }
+                    let Some(vec_j) = vectors.get(&rows[j].0) else {
+                        continue;
+                    };
+                    if crate::embed::cosine(vec_i, vec_j) >= DEDUP_COSINE_THRESHOLD {
+                        vector_edges.push((i, j));
+                        union(&mut parent, i, j);
+                    }
+                }
+            }
+        }
+
+        // Connected components of size >= 2 are the duplicate groups.
+        let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+        for index in 0..rows.len() {
+            let root = find(&mut parent, index);
+            components.entry(root).or_default().push(index);
+        }
+        let mut exact_roots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (a, _) in &exact_edges {
+            exact_roots.insert(find(&mut parent, *a));
+        }
+        let mut vector_roots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (a, _) in &vector_edges {
+            vector_roots.insert(find(&mut parent, *a));
+        }
+
+        let mut groups: Vec<DedupGroup> = Vec::new();
+        for (root, mut members) in components {
+            if members.len() < 2 {
+                continue;
+            }
+            // Winner: newest by created_at, id as tie-break — the last
+            // element once sorted ascending.
+            members.sort_by(|&a, &b| {
+                rows[a]
+                    .3
+                    .cmp(&rows[b].3)
+                    .then_with(|| rows[a].0.cmp(&rows[b].0))
+            });
+            let winner = members.pop().expect("component has >= 2 members");
+            let mut detectors: Vec<&'static str> = Vec::new();
+            if exact_roots.contains(&root) {
+                detectors.push("exact");
+            }
+            if vector_roots.contains(&root) {
+                detectors.push("vector");
+            }
+            groups.push(DedupGroup {
+                scope: rows[winner].1.clone(),
+                winner: rows[winner].0.clone(),
+                losers: members.iter().map(|&i| rows[i].0.clone()).collect(),
+                detectors,
+            });
+        }
+        // Deterministic report order regardless of HashMap iteration.
+        groups.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.winner.cmp(&b.winner)));
+
+        let mut superseded: u64 = 0;
+        if apply && !groups.is_empty() {
+            // One transaction, one timestamp, for the whole apply pass.
+            let now = crate::time::now_iso8601();
+            let tx = self.conn.unchecked_transaction()?;
+            for group in &groups {
+                for loser in &group.losers {
+                    if self.mark_superseded_by(loser, &group.winner, &now)? {
+                        superseded += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+
+        Ok(DedupReport {
+            scanned: rows.len() as u64,
+            groups,
+            applied: apply,
+            superseded,
+        })
+    }
+
+    /// Report-only maintenance analysis over the CURRENT, non-rule memories
+    /// (optionally one scope): suspected contradictions plus decay scoring.
+    ///
+    /// **Contradictions** are pairs of same-scope memories where the Jaccard
+    /// overlap of the lowercased word sets is >= 0.5 AND exactly one side
+    /// contains a [`NEGATION_MARKERS`] substring. This is a deliberately
+    /// crude heuristic — it will both miss real contradictions and flag
+    /// rephrasings — and the tool therefore **never auto-resolves**: a human
+    /// or agent inspects each pair and records the truth with
+    /// `remember --supersedes`. Pairwise per scope, O(n²) — the usual
+    /// engram-scale posture.
+    ///
+    /// **Decay** scores every memory
+    /// `staleness = age_days * 1.0 + 30.0 / (1 + access_count)` — crude but
+    /// monotone in both age and un-accessedness — and returns the top
+    /// [`DECAY_TOP`]. Age is computed from `created_at` against
+    /// [`crate::time::now_iso8601`] via `jiff`; a `created_at` that fails to
+    /// parse (only possible for rows engram did not write) scores age 0
+    /// rather than failing the report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails.
+    pub fn consolidate_report(&self, scope: Option<&str>) -> rusqlite::Result<ConsolidateReport> {
+        let scope_clause = if scope.is_some() {
+            "AND scope = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, scope, content, created_at, access_count, last_accessed_at
+             FROM memories
+             WHERE valid_to IS NULL AND rule_id IS NULL {scope_clause}
+             ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        struct Row {
+            id: String,
+            scope: String,
+            content: String,
+            created_at: String,
+            access_count: u64,
+            last_accessed_at: Option<String>,
+        }
+        let fetched = stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get(3)?,
+                access_count: row.get::<_, Option<i64>>(4)?.map_or(0, |n| n.max(0) as u64),
+                last_accessed_at: row.get(5)?,
+            })
+        })?;
+        let rows: Vec<Row> = fetched.collect::<Result<_, _>>()?;
+
+        // Contradiction heuristic: word sets and negation flags, once per row.
+        let word_sets: Vec<std::collections::HashSet<String>> = rows
+            .iter()
+            .map(|r| {
+                r.content
+                    .to_lowercase()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect();
+        let negated: Vec<bool> = rows
+            .iter()
+            .map(|r| {
+                let lower = r.content.to_lowercase();
+                NEGATION_MARKERS.iter().any(|m| lower.contains(m))
+            })
+            .collect();
+        let mut contradictions: Vec<ContradictionPair> = Vec::new();
+        for i in 0..rows.len() {
+            for j in (i + 1)..rows.len() {
+                if rows[i].scope != rows[j].scope || negated[i] == negated[j] {
+                    continue;
+                }
+                let intersection = word_sets[i].intersection(&word_sets[j]).count();
+                let union = word_sets[i].union(&word_sets[j]).count();
+                if union == 0 {
+                    continue;
+                }
+                // Set sizes are tiny (bounded by content length); the
+                // usize→f64 casts are lossless in practice.
+                let jaccard = intersection as f64 / union as f64;
+                if jaccard >= 0.5 {
+                    contradictions.push(ContradictionPair {
+                        scope: rows[i].scope.clone(),
+                        a: rows[i].id.clone(),
+                        b: rows[j].id.clone(),
+                        jaccard,
+                        negated: if negated[i] {
+                            rows[i].id.clone()
+                        } else {
+                            rows[j].id.clone()
+                        },
+                    });
+                }
+            }
+        }
+
+        // Decay scoring.
+        let now = crate::time::now_iso8601();
+        let now_ts: jiff::Timestamp = now.parse().expect("now_iso8601 emits a valid timestamp");
+        let mut decay: Vec<DecayCandidate> = rows
+            .iter()
+            .map(|r| {
+                let age_days = r
+                    .created_at
+                    .parse::<jiff::Timestamp>()
+                    .map(|ts| ((now_ts.as_second() - ts.as_second()).max(0)) as f64 / 86_400.0)
+                    .unwrap_or(0.0);
+                DecayCandidate {
+                    id: r.id.clone(),
+                    scope: r.scope.clone(),
+                    age_days,
+                    access_count: r.access_count,
+                    last_accessed_at: r.last_accessed_at.clone(),
+                    // staleness = age_days * 1.0 + 30.0 / (1 + access_count):
+                    // the age weight is 1.0 per day (written implicitly).
+                    staleness: age_days + 30.0 / (1.0 + r.access_count as f64),
+                }
+            })
+            .collect();
+        decay.sort_by(|a, b| {
+            b.staleness
+                .total_cmp(&a.staleness)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        decay.truncate(DECAY_TOP);
+
+        Ok(ConsolidateReport {
+            scanned: rows.len() as u64,
+            contradictions,
+            decay,
+        })
+    }
+
     /// Parent memory ids whose extracted facts match `query`, deduped, in
     /// FTS rank order — the facts retrieval channel.
     ///
@@ -868,7 +1445,7 @@ impl Store {
         use std::collections::HashMap;
 
         let fts: Vec<Memory> = self
-            .search(query, scope, HYBRID_CHANNEL_LIMIT, validity)?
+            .search_inner(query, scope, HYBRID_CHANNEL_LIMIT, validity)?
             .into_iter()
             .filter(|m| m.rule_id.is_none())
             .collect();
@@ -896,12 +1473,17 @@ impl Store {
             }
             let mem = match pool.remove(&id) {
                 Some(m) => Some(m),
-                None => self.get(&id, validity)?.filter(|m| m.rule_id.is_none()),
+                None => self
+                    .get_inner(&id, validity)?
+                    .filter(|m| m.rule_id.is_none()),
             };
             if let Some(m) = mem {
                 memories.push(m);
             }
         }
+        // Track only the fused, truncated output — not the (up to 150)
+        // per-channel candidates that fed the fusion.
+        self.track_access(&memories.iter().map(|m| m.id.clone()).collect::<Vec<_>>())?;
         Ok(HybridSearch {
             memories,
             fts_candidates,
@@ -960,13 +1542,13 @@ impl Store {
         // session-start context block asserts what is true now, and a
         // superseded memory is by definition no longer that.
         let recency: Vec<Memory> = self
-            .recall(scope, limit, Validity::Current)?
+            .recall_inner(scope, limit, Validity::Current)?
             .into_iter()
             .filter(|m| m.rule_id.is_none())
             .collect();
         let relevance: Vec<Memory> = match query {
             Some(q) => self
-                .search(q, Some(scope), limit, Validity::Current)?
+                .search_inner(q, Some(scope), limit, Validity::Current)?
                 .into_iter()
                 .filter(|m| m.rule_id.is_none())
                 .collect(),
@@ -1030,7 +1612,7 @@ impl Store {
         for id in fact_ids.iter().chain(vector_ids.iter()) {
             if !pool.contains_key(id) {
                 if let Some(m) = self
-                    .get(id, Validity::Current)?
+                    .get_inner(id, Validity::Current)?
                     .filter(|m| m.rule_id.is_none())
                 {
                     pool.insert(m.id.clone(), m);
@@ -1087,6 +1669,10 @@ impl Store {
             dropped_ids: pack.dropped_ids,
             channels,
         };
+        // Track only the memories that made it into the assembled block —
+        // never the dropped candidates, and never the rules section (rules
+        // are policy, not retrieval; `Store::rules` stays untracked).
+        self.track_access(&memories.iter().map(|m| m.id.clone()).collect::<Vec<_>>())?;
         Ok(ContextResult {
             rules,
             memories,
@@ -1095,7 +1681,23 @@ impl Store {
         })
     }
 
+    /// One memory by id, under a validity slice. Bumps the returned row's
+    /// access counters (see [`Store::track_access`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails.
     pub fn get(&self, id: &str, validity: Validity<'_>) -> rusqlite::Result<Option<Memory>> {
+        let out = self.get_inner(id, validity)?;
+        if let Some(mem) = out.as_ref() {
+            self.track_access(std::slice::from_ref(&mem.id))?;
+        }
+        Ok(out)
+    }
+
+    /// [`Store::get`] without access tracking — the shared body, also the
+    /// row fetch for composite reads that track only their final output.
+    fn get_inner(&self, id: &str, validity: Validity<'_>) -> rusqlite::Result<Option<Memory>> {
         let (clause, as_of) = validity_filter(validity, "", 2);
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1 {clause}");
         let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&id];
@@ -1378,6 +1980,33 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "superseded_by") {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
     }
+    // Access tracking (M5). Both nullable: a NULL access_count reads as 0,
+    // and every pre-existing row has simply never been read. The columns are
+    // internal — `row_to_memory` does not read them, so `Memory` output is
+    // unchanged — and they feed only the `consolidate --report` decay
+    // scoring.
+    if !columns.iter().any(|c| c == "last_accessed_at") {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;")?;
+    }
+    if !columns.iter().any(|c| c == "access_count") {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN access_count INTEGER;")?;
+    }
+    // Narrow the FTS update trigger to content changes (M5). The original
+    // trigger fired on EVERY update, so each access-tracking bump — i.e.
+    // every read — and each supersession (`valid_to`/`superseded_by`) would
+    // churn the FTS index with a pointless delete+reinsert of unchanged
+    // content. `AFTER UPDATE OF content` fires only when a statement assigns
+    // the content column (rule revisions), which is the only case the index
+    // must follow. SQLite has no CREATE OR REPLACE TRIGGER, so the narrowing
+    // is an unconditional drop+create on every open — idempotent, and it
+    // also converts the broad trigger in any pre-M5 database in place.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memories_au;
+         CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+             INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+             INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;",
+    )?;
     // Partial index: enforces one rule per (scope, rule_id) without constraining
     // ordinary messages, which all have a NULL rule_id.
     conn.execute_batch(
@@ -1473,6 +2102,17 @@ fn sanitize_fts_query(raw: &str) -> String {
         .join(" OR ")
 }
 
+/// Normalization for the exact-text dedup detector: trim, lowercase, and
+/// collapse every internal whitespace run to a single space. Two memories
+/// whose normalized forms are equal restate the same text; formatting-only
+/// variance (case, indentation, line wrapping) is not a distinct memory.
+fn normalize_for_dedup(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The full `memories` column list every read shares, in [`row_to_memory`]
 /// order. One definition so a future column lands everywhere at once.
 const MEMORY_COLUMNS: &str =
@@ -1526,7 +2166,10 @@ mod tests {
         // In-memory database: exercises the real schema and migration path
         // without touching the filesystem.
         let conn = Connection::open_in_memory().expect("open in-memory database");
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            tracking: true,
+        };
         store
             .conn
             .execute_batch(
@@ -2907,5 +3550,544 @@ mod tests {
         let ids: Vec<&str> = hybrid.memories.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&marker.id.as_str()));
         assert!(ids.contains(&plain.id.as_str()));
+    }
+
+    // ---- M5: access tracking + consolidation -----------------------------
+    //
+    // Access columns are internal (never serialized), reads bump only what
+    // they return, dedup supersedes but never deletes, and the report phase
+    // is pure analysis. The narrowed FTS trigger keeps all of it from
+    // churning the full-text index.
+
+    /// Reads the raw access columns for one memory id.
+    fn access(store: &Store, id: &str) -> (Option<i64>, Option<String>) {
+        store
+            .conn
+            .query_row(
+                "SELECT access_count, last_accessed_at FROM memories WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("access columns")
+    }
+
+    #[test]
+    fn migration_adds_access_columns_and_narrows_the_fts_update_trigger() {
+        // The legacy-schema fixture: migrate() must add both columns and
+        // install the content-narrowed trigger even over a pre-M5 database
+        // whose memories_au fired on every update.
+        let store = store();
+        let columns = table_columns(&store.conn, "memories").expect("columns");
+        assert!(columns.iter().any(|c| c == "last_accessed_at"));
+        assert!(columns.iter().any(|c| c == "access_count"));
+
+        let trigger_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_au'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("memories_au exists");
+        assert!(
+            trigger_sql.contains("UPDATE OF content"),
+            "the update trigger must fire on content changes only: {trigger_sql}"
+        );
+    }
+
+    #[test]
+    fn tracked_reads_and_supersession_leave_the_fts_index_consistent() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "fts-consistency";
+        let a = store
+            .remember("a", scope, "note", "unique-marker-alpha content")
+            .expect("remember");
+        store
+            .remember("a", scope, "note", "unique-marker-beta content")
+            .expect("remember");
+
+        // Tracked reads (recall bumps access columns via UPDATE): with the
+        // old full-row trigger every one of these churned the FTS index.
+        for _ in 0..3 {
+            store.recall(scope, 10, Validity::Current).expect("recall");
+        }
+        let hits = store
+            .search("unique-marker-alpha", Some(scope), 10, Validity::All)
+            .expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "after tracked reads the row is indexed exactly once: {hits:?}"
+        );
+
+        // Supersession (valid_to/superseded_by UPDATE) no longer touches
+        // FTS either: the old row stays findable exactly once under All.
+        store
+            .remember_superseding("a", scope, "note", "replacement text", &a.id)
+            .expect("supersede");
+        let hits = store
+            .search("unique-marker-alpha", Some(scope), 10, Validity::All)
+            .expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the superseded row's FTS entry survives, once: {hits:?}"
+        );
+
+        // Content updates still reindex: a rule revision must be findable
+        // under its new wording, not its old one.
+        store
+            .rule_add("a", scope, "some-rule", "original-wording here")
+            .expect("rule");
+        store
+            .rule_add("a", scope, "some-rule", "revised-wording here")
+            .expect("revise");
+        assert_eq!(
+            store
+                .search("revised-wording", Some(scope), 10, Validity::All)
+                .expect("search")
+                .len(),
+            1,
+            "content updates must still reach the index"
+        );
+        assert!(
+            store
+                .search("original-wording", Some(scope), 10, Validity::All)
+                .expect("search")
+                .is_empty(),
+            "the old wording must have left the index"
+        );
+    }
+
+    #[test]
+    fn recall_bumps_access_count_once_per_returned_row() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "track-recall";
+        let first = store.remember("a", scope, "note", "one").expect("remember");
+        let second = store.remember("a", scope, "note", "two").expect("remember");
+
+        assert_eq!(
+            access(&store, &first.id),
+            (None, None),
+            "unread rows stay NULL"
+        );
+
+        store.recall(scope, 10, Validity::Current).expect("recall");
+        let (count, at) = access(&store, &first.id);
+        assert_eq!(count, Some(1), "NULL reads as 0 and bumps to 1");
+        assert!(at.expect("last_accessed_at set").ends_with('Z'));
+        assert_eq!(access(&store, &second.id).0, Some(1));
+
+        store.recall(scope, 10, Validity::Current).expect("recall");
+        assert_eq!(access(&store, &first.id).0, Some(2), "1 bumps to 2");
+        assert_eq!(access(&store, &second.id).0, Some(2));
+    }
+
+    #[test]
+    fn only_returned_rows_bump_and_rule_reads_stay_untracked() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "track-limit";
+        let old = store
+            .remember("a", scope, "note", "the oldest")
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newest = store
+            .remember("a", scope, "note", "the newest")
+            .expect("remember");
+        store
+            .rule_add("a", scope, "some-policy", "Policy text.")
+            .expect("rule");
+
+        // limit 1 returns only the scope's most recent row — the rule row,
+        // added last. Every row outside the limit must stay NULL.
+        store.recall(scope, 1, Validity::Current).expect("recall");
+        assert_eq!(
+            access(&store, &old.id),
+            (None, None),
+            "a row outside the limit was not returned, so it must not bump"
+        );
+        assert_eq!(access(&store, &newest.id), (None, None));
+        let rule_row_id: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE rule_id = 'some-policy'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rule row id");
+        assert_eq!(
+            access(&store, &rule_row_id).0,
+            Some(1),
+            "the one returned row (the rule row, via recall) bumps"
+        );
+
+        // Rules are policy, not retrieval: rules() never tracks.
+        store.rules(scope).expect("rules");
+        store.rules(scope).expect("rules again");
+        assert_eq!(
+            access(&store, &rule_row_id).0,
+            Some(1),
+            "rule listing must never bump access counters"
+        );
+
+        // get() tracks exactly its returned row.
+        store.get(&newest.id, Validity::Current).expect("get");
+        assert_eq!(access(&store, &newest.id).0, Some(1), "get bumps once");
+        assert_eq!(access(&store, &old.id), (None, None));
+    }
+
+    #[test]
+    fn set_tracking_off_leaves_the_columns_null() {
+        let mut store = Store::open_in_memory().expect("open");
+        let scope = "track-off";
+        let mem = store
+            .remember("a", scope, "note", "auditable content")
+            .expect("remember");
+
+        store.set_tracking(false);
+        store.recall(scope, 10, Validity::Current).expect("recall");
+        store
+            .search("auditable", Some(scope), 10, Validity::Current)
+            .expect("search");
+        store.get(&mem.id, Validity::Current).expect("get");
+        store
+            .context(scope, Some("auditable"), 50, 1000, None)
+            .expect("context");
+        assert_eq!(
+            access(&store, &mem.id),
+            (None, None),
+            "no read path may bump while tracking is off"
+        );
+
+        store.set_tracking(true);
+        store.recall(scope, 10, Validity::Current).expect("recall");
+        assert_eq!(access(&store, &mem.id).0, Some(1), "tracking resumes");
+    }
+
+    #[test]
+    fn memory_output_never_carries_the_access_columns() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "track-shape";
+        store
+            .remember("a", scope, "note", "shape check")
+            .expect("remember");
+        // Read it back TRACKED, so the columns are populated in SQLite —
+        // and still absent from the serialized Memory.
+        let recalled = store.recall(scope, 10, Validity::Current).expect("recall");
+        let json = serde_json::to_string(&recalled[0]).expect("serialize");
+        assert!(
+            !json.contains("access_count") && !json.contains("last_accessed_at"),
+            "access columns are internal; row_to_memory must not read them: {json}"
+        );
+        // The plain-memory JSON key set is exactly the pre-M5 shape.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["agent", "content", "created_at", "id", "role", "scope"],
+            "plain JSON unchanged"
+        );
+    }
+
+    #[test]
+    fn mark_superseded_by_reuses_m2_semantics_without_a_new_row() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "mark-superseded";
+        let loser = store
+            .remember("a", scope, "note", "the old duplicate")
+            .expect("remember");
+        let winner = store
+            .remember("a", scope, "note", "the newer copy")
+            .expect("remember");
+        let count = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .expect("count")
+        };
+        let before = count(&store);
+
+        let now = crate::time::now_iso8601();
+        assert!(store
+            .mark_superseded_by(&loser.id, &winner.id, &now)
+            .expect("mark"));
+        assert_eq!(count(&store), before, "no new row is inserted");
+
+        // The chain is visible exactly as after remember --supersedes.
+        let all = store.recall(scope, 10, Validity::All).expect("recall all");
+        assert_eq!(all.len(), 2);
+        let closed = all.iter().find(|m| m.id == loser.id).expect("loser row");
+        assert_eq!(closed.valid_to.as_deref(), Some(now.as_str()));
+        assert_eq!(closed.superseded_by.as_deref(), Some(winner.id.as_str()));
+        let current = store
+            .recall(scope, 10, Validity::Current)
+            .expect("recall current");
+        assert_eq!(
+            current.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![winner.id.as_str()]
+        );
+
+        // Idempotent: an already-closed window is left untouched.
+        assert!(!store
+            .mark_superseded_by(&loser.id, &winner.id, &now)
+            .expect("re-mark"));
+    }
+
+    #[test]
+    fn dedup_groups_normalized_exact_text_newest_wins_and_reruns_find_nothing() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "dedup-exact";
+        // Three copies distinct only in case/whitespace, plus one bystander.
+        let oldest = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "Decided: keep the flange torque at spec.",
+            )
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let middle = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "  decided:   keep the FLANGE torque at spec.  ",
+            )
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newest = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "DECIDED: KEEP THE FLANGE TORQUE AT SPEC.",
+            )
+            .expect("remember");
+        let bystander = store
+            .remember("a", scope, "note", "unrelated chatter entirely")
+            .expect("remember");
+
+        // Report-only: the group is named, nothing changes.
+        let report = store
+            .consolidate_dedup(Some(scope), None, false)
+            .expect("dedup");
+        assert_eq!(report.scanned, 4);
+        assert!(!report.applied);
+        assert_eq!(report.superseded, 0);
+        assert_eq!(report.groups.len(), 1);
+        let group = &report.groups[0];
+        assert_eq!(group.winner, newest.id, "max created_at wins");
+        assert_eq!(group.losers.len(), 2);
+        assert!(group.losers.contains(&oldest.id));
+        assert!(group.losers.contains(&middle.id));
+        assert_eq!(group.detectors, vec!["exact"]);
+        assert_eq!(
+            store
+                .recall(scope, 10, Validity::Current)
+                .expect("recall")
+                .len(),
+            4,
+            "report-only leaves every row Current"
+        );
+
+        // Apply: the two losers are superseded by the winner; the bystander
+        // and the winner stay Current. Nothing is deleted.
+        let applied = store
+            .consolidate_dedup(Some(scope), None, true)
+            .expect("dedup --yes");
+        assert!(applied.applied);
+        assert_eq!(applied.superseded, 2);
+        let current = store.recall(scope, 10, Validity::Current).expect("recall");
+        let ids: Vec<&str> = current.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&newest.id.as_str()));
+        assert!(ids.contains(&bystander.id.as_str()));
+        assert_eq!(ids.len(), 2);
+        let closed = store
+            .get(&oldest.id, Validity::All)
+            .expect("get")
+            .expect("row survives");
+        assert_eq!(closed.superseded_by.as_deref(), Some(newest.id.as_str()));
+
+        // Idempotent: the losers are no longer Current, so a second run
+        // finds nothing at all.
+        let rerun = store
+            .consolidate_dedup(Some(scope), None, true)
+            .expect("re-dedup");
+        assert!(rerun.groups.is_empty(), "{:?}", rerun.groups);
+        assert_eq!(rerun.superseded, 0);
+    }
+
+    #[test]
+    fn dedup_vector_detector_pairs_near_identical_vectors_within_a_scope() {
+        // Hand-built vectors, no model anywhere — the detector compares
+        // stored embeddings, so it is exercised in every feature set (the
+        // same posture as the search_hybrid tests).
+        let store = Store::open_in_memory().expect("open");
+        let scope = "dedup-vector";
+        let stale = store
+            .remember("a", scope, "note", "telemetry cadence is five seconds")
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let fresh = store
+            .remember("a", scope, "note", "cadence of telemetry: five seconds")
+            .expect("remember");
+        let other = store
+            .remember("a", scope, "note", "reactor coolant flow is nominal")
+            .expect("remember");
+        // A same-vector twin in ANOTHER scope: must never pair.
+        let elsewhere = store
+            .remember(
+                "a",
+                "other-scope",
+                "note",
+                "telemetry cadence is five seconds!!",
+            )
+            .expect("remember");
+        store
+            .vector_upsert(&stale.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        store
+            .vector_upsert(&fresh.id, "m", &[0.999, 0.01])
+            .expect("upsert");
+        store
+            .vector_upsert(&other.id, "m", &[0.0, 1.0])
+            .expect("upsert");
+        store
+            .vector_upsert(&elsewhere.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+
+        // Without the model, the texts normalize differently: no group.
+        let text_only = store
+            .consolidate_dedup(Some(scope), None, false)
+            .expect("dedup");
+        assert!(text_only.groups.is_empty());
+
+        // With the model, the near-identical vectors pair — and only they.
+        let report = store
+            .consolidate_dedup(Some(scope), Some("m"), false)
+            .expect("dedup vector");
+        assert_eq!(report.groups.len(), 1);
+        let group = &report.groups[0];
+        assert_eq!(group.winner, fresh.id, "the newer of the pair wins");
+        assert_eq!(group.losers, vec![stale.id.clone()]);
+        assert_eq!(group.detectors, vec!["vector"]);
+
+        // Across ALL scopes the same-vector twin still pairs with nothing:
+        // vector pairs are same-scope only.
+        let all_scopes = store
+            .consolidate_dedup(None, Some("m"), false)
+            .expect("dedup");
+        assert!(
+            all_scopes
+                .groups
+                .iter()
+                .all(|g| !g.losers.contains(&elsewhere.id) && g.winner != elsewhere.id),
+            "cross-scope vectors must never form a group: {:?}",
+            all_scopes.groups
+        );
+    }
+
+    #[test]
+    fn contradiction_heuristic_needs_overlap_and_exactly_one_negation() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "contra";
+        let plain = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "the deploy pipeline uses docker for builds",
+            )
+            .expect("remember");
+        let negated = store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "the deploy pipeline does not use docker for builds",
+            )
+            .expect("remember");
+        // High overlap with the negated row but itself negated too: a
+        // both-negated pair is never flagged, whatever the overlap. (Its
+        // overlap with the plain row is diluted below the 0.5 line.)
+        store
+            .remember(
+                "a",
+                scope,
+                "note",
+                "remember we never said the deploy pipeline does not use docker \
+                 for builds anymore honestly speaking friends",
+            )
+            .expect("remember");
+        // One negated but almost no overlap: not flagged.
+        store
+            .remember("a", scope, "note", "the reactor is not overheating today")
+            .expect("remember");
+
+        let report = store.consolidate_report(Some(scope)).expect("report");
+        assert_eq!(report.scanned, 4);
+        assert_eq!(
+            report.contradictions.len(),
+            1,
+            "exactly the high-overlap, single-negation pair: {:?}",
+            report.contradictions
+        );
+        let pair = &report.contradictions[0];
+        assert_eq!(pair.a, plain.id);
+        assert_eq!(pair.b, negated.id);
+        assert_eq!(pair.negated, negated.id, "the negated side is named");
+        assert!(pair.jaccard >= 0.5, "jaccard: {}", pair.jaccard);
+    }
+
+    #[test]
+    fn decay_ranks_the_old_unaccessed_above_the_new_hot() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "decay";
+        // An old, never-read row (hand-inserted so its age is real).
+        store
+            .conn
+            .execute(
+                "INSERT INTO memories (id, agent, scope, role, content, created_at)
+                 VALUES ('old-cold', 'a', ?1, 'note', 'forgotten lore', '2026-01-01T00:00:00Z')",
+                params![scope],
+            )
+            .expect("insert old row");
+        // A brand-new, heavily-read row.
+        let hot = store
+            .remember("a", scope, "note", "everyone reads this")
+            .expect("remember");
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET access_count = 50, last_accessed_at = ?1 WHERE id = ?2",
+                params![crate::time::now_iso8601(), hot.id],
+            )
+            .expect("mark hot");
+
+        let report = store.consolidate_report(Some(scope)).expect("report");
+        assert_eq!(report.decay.len(), 2);
+        let top = &report.decay[0];
+        assert_eq!(
+            top.id, "old-cold",
+            "age + un-accessedness outranks recency + heat: {:?}",
+            report.decay
+        );
+        assert_eq!(top.access_count, 0, "NULL access_count reads as 0");
+        assert!(top.last_accessed_at.is_none());
+        assert!(top.age_days > 100.0, "age_days: {}", top.age_days);
+        let runner_up = &report.decay[1];
+        assert_eq!(runner_up.access_count, 50);
+        assert!(runner_up.last_accessed_at.is_some());
+        assert!(
+            top.staleness > runner_up.staleness,
+            "staleness is monotone in age and un-accessedness"
+        );
     }
 }

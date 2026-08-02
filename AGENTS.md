@@ -29,6 +29,7 @@ cargo doc -p rmcp --open                 # verify rmcp 0.16 macro shape if build
 - Mode cascade: explicit `--format`/`--json` > `AI_AGENT`/`AGENT` set non-empty or `CI` truthy > non-TTY stdout → machine output (single-line JSON to stdout, structured error to stderr).
 - `--format <json|jsonl|csv>` (global; `--json` is an alias for `--format json`). `jsonl`: first line `{"metadata":...,"data":null}`, then one line per record. `csv`: RFC 4180 rows on stdout, metadata as one JSON line on stderr. `yaml`/`explore` deferred.
 - `--accessible` (global): plain linear output per Standard §18. Also via `SPACECRAFT_A11Y=1`; the flag wins over `SPACECRAFT_A11Y=0`.
+- `--no-track` (global): read-only auditing — do not update access counts on reads. CLI-only; MCP/HTTP reads always track (`access_count`/`last_accessed_at` are internal columns feeding `consolidate --report` decay; never serialized on `Memory`).
 - `save-chat --scope S [--file PATH] [--model NAME]`: export a scope's history to Texinfo. Default `chat/<timestamp>.texi`; appends to an existing file; auto-gitignores `chat/`. `--model` falls back to `MODEL`/`LLM_MODEL`/`AI_AGENT`/`AGENT`.
 - `ENGRAM_DB` env var for db path (default: `engram.db`).
 - `--no-color` respects `NO_COLOR` convention.
@@ -37,7 +38,7 @@ cargo doc -p rmcp --open                 # verify rmcp 0.16 macro shape if build
 
 ## Storage
 
-SQLite + FTS5, WAL journal mode, 5s busy timeout. The `memories_fts` virtual table is kept in sync via `AFTER INSERT/DELETE/UPDATE` triggers on `memories`. FTS5 query sanitization in `sanitize_fts_query` wraps every token as escaped quoted phrase — free-text queries must not hit raw FTS5 syntax.
+SQLite + FTS5, WAL journal mode, 5s busy timeout. The `memories_fts` virtual table is kept in sync via `AFTER INSERT`/`AFTER DELETE` triggers plus a **content-narrowed** `AFTER UPDATE OF content` trigger (M5 — access-tracking bumps and supersession updates must not churn the FTS index; `migrate()` drop+recreates it on every open since SQLite has no `CREATE OR REPLACE TRIGGER`). FTS5 query sanitization in `sanitize_fts_query` wraps every token as escaped quoted phrase — free-text queries must not hit raw FTS5 syntax.
 
 ## Conventions (Spacecraft Software Standard)
 
@@ -63,6 +64,8 @@ engram recall --scope S --as-of <ISO8601> | --include-superseded # time travel /
 engram index [--scope S] [--dry-run]                             # backfill vectors (vector feature; local model only)
 engram search Q --mode fts|hybrid                                # explicit retrieval mode (auto-hybrid when ready)
 engram consolidate --extract [--scope S] [--dry-run]             # deterministic fact extraction (M4; CLI-only; no scope = ALL scopes)
+engram consolidate --dedup [--yes]                               # near-duplicate groups (exact-normalized ∪ vector cosine>=0.92); --yes supersedes losers to the newest — never deletes (M5)
+engram consolidate --report                                      # report-only: contradiction pairs (heuristic; resolve via --supersedes) + top-20 decay by age/un-accessedness (M5)
 engram rule sync [--scope S] [--file PATH]... [--dry-run]
 ```
 

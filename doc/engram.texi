@@ -162,6 +162,17 @@ Accessible output (Standard @U{00A7}18): plain linear text, no color,
 status tags.  Also enabled by @env{SPACECRAFT_A11Y}=1;
 @env{SPACECRAFT_A11Y}=0 disables auto-detection, but this flag still
 wins.
+
+@item --no-track
+@cindex access tracking
+@cindex no-track flag
+Read-only auditing: do not update access counts on reads.  Without
+this flag, @command{recall}, @command{search}, @command{context}, and
+@command{get} bump each @emph{returned} memory's internal
+@code{access_count} and @code{last_accessed_at} columns --- the decay
+signal for @command{engram consolidate --report}.  The columns never
+appear in any output, and the MCP/HTTP surfaces have no opt-out of
+their own: agent reads are exactly what the tracking measures.
 @end table
 
 @section Output modes
@@ -415,21 +426,30 @@ and the @code{budget} report; the envelope repeats the report as
 @cindex consolidate command
 @cindex facts, extracted
 @cindex fact extraction
+@cindex deduplication
+@cindex decay report
+@cindex contradictions
 
 @example
-engram consolidate --extract [--scope @var{id}] [--dry-run]
+engram consolidate [--extract] [--dedup [--yes]] [--report]
+                   [--scope @var{id}] [--dry-run]
 @end example
 
-Idle-time maintenance over the extracted-fact index.  At M4 the only
-phase is @code{--extract}; running @command{consolidate} without it is
-an error (exit code 2 --- dedup/decay phases arrive at M5).
+Idle-time maintenance, in three combinable phases; at least one phase
+flag is required (running @command{consolidate} bare is an error, exit
+code 2).  The data payload carries one optional section per phase that
+ran: @code{extract}, @code{dedup}, @code{report}.  All phases are
+optionally narrowed to one scope; @code{--scope} omitted walks
+@emph{every} scope, deliberately unlike the rule commands' cascade,
+because maintenance naturally spans the whole database.
+
+@subsection consolidate --extract
 
 @code{--extract} runs the deterministic extractor
-(@code{deterministic-v1}) over every @emph{current, non-rule} memory
---- optionally narrowed to one scope; omitted, it walks @emph{every}
-scope, deliberately unlike the rule commands' cascade, because
-maintenance naturally spans the whole database.  @code{--dry-run}
-reports what would be written without writing.
+(@code{deterministic-v1}) over every @emph{current, non-rule} memory.
+@code{--dry-run} reports what would be written without writing (it is
+meaningful only for this phase; the others are already read-only
+without @code{--yes}).
 
 @cindex markers, fact
 Extraction is pure string processing --- @emph{no LLM ever runs on the
@@ -454,10 +474,76 @@ fact's liveness derives from its @emph{parent}: superseding a memory
 retires its facts at query time (the fact channel joins the parent and
 applies the validity filter there); nothing is ever deleted.
 
+@subsection consolidate --dedup
+
+@cindex near-duplicates
+@cindex winner, dedup
+
+@code{--dedup} finds groups of near-duplicate @emph{current, non-rule}
+memories within each scope.  Two detectors run and their pair edges
+are @emph{unioned} into groups (connected components):
+
+@itemize @bullet
+@item
+@emph{exact} --- normalized text equality: trimmed, lowercased,
+internal whitespace collapsed to single spaces.  Always on.
+
+@item
+@emph{vector} --- cosine similarity of at least 0.92 between
+@emph{stored} embeddings, same-scope pairs only.  Runs exactly when
+the auto-hybrid gate would pass (vector feature built in, a local
+model resolves, and that model has indexed vectors); otherwise the
+exact detector runs alone.
+@end itemize
+
+Each group keeps its @emph{newest} row (latest @code{created_at}, id
+as tie-break) as the winner.  Without @code{--yes} the phase is
+report-only: the payload names each group's winner and the ids that
+would be superseded.  With @code{--yes}, every loser's validity window
+is closed in favor of the winner --- exactly the bi-temporal
+supersession semantics of @code{remember --supersedes}
+(@code{valid_to} plus @code{superseded_by}), except that no new row is
+inserted, because the winner already exists.  Dedup @emph{never}
+deletes: the losers stay reachable through
+@code{--include-superseded} and @code{--as-of}.  The pass is
+idempotent --- superseded losers are no longer current, so a second
+run finds nothing.
+
+@subsection consolidate --report
+
+@cindex staleness
+@cindex negation markers
+
+@code{--report} is always report-only and produces two sections over
+the current, non-rule memories.
+
+@emph{Contradictions}: pairs of same-scope memories whose lowercased
+word sets overlap with a Jaccard index of at least 0.5 @emph{and}
+where exactly one of the pair contains a negation marker
+(@code{not}, @code{never}, @code{no longer}, @code{don't},
+@code{do not}, @code{isn't}, @code{wasn't}, @code{stopped} --- each
+matched with its trailing space, so @samp{notable} never matches
+@code{not}).  This is a deliberately
+crude heuristic --- it will both miss real contradictions and flag
+harmless rephrasings --- so the tool @emph{never} auto-resolves: a
+human or agent inspects each pair and, where the contradiction is
+real, records the truth with @code{engram remember --supersedes}.
+
+@emph{Decay}: every memory is scored
+@code{staleness = age_days * 1.0 + 30.0 / (1 + access_count)} ---
+crude, but monotone in both age and un-accessedness --- and the top 20
+are returned with their age, access count, and last access time.  The
+access counters are maintained by the tracked read paths
+(@pxref{Invocation, , the @code{--no-track} global option}).
+
+@subsection Surface posture
+
 The command is deliberately @emph{CLI-only} --- it exists on neither
-the MCP nor the HTTP surface.  Extraction is an operator's batch job;
-agents receive facts automatically through the @command{engram
-context} fusion and hybrid search ranking.
+the MCP nor the HTTP surface.  Extraction, dedup, and reporting are an
+operator's batch jobs; agents receive facts automatically through the
+@command{engram context} fusion and hybrid search ranking, and act on
+dedup/contradiction findings only through the ordinary memory
+commands.
 
 @section engram rule
 

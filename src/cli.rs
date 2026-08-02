@@ -56,6 +56,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub accessible: bool,
 
+    /// Read-only auditing: do not update access counts on reads. Without
+    /// this flag, recall/search/context/get bump each returned memory's
+    /// access_count and last_accessed_at (the decay signal for
+    /// `consolidate --report`). CLI-only: the MCP and HTTP surfaces have no
+    /// opt-out — agent reads are exactly what the tracking measures.
+    #[arg(long, global = true)]
+    pub no_track: bool,
+
     /// Local Model2Vec model directory for semantic (vector) search. First
     /// step of the model cascade: --model-path, then ENGRAM_MODEL, then
     /// $XDG_DATA_HOME/engram/model (default ~/.local/share/engram/model).
@@ -150,15 +158,22 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
-    /// Idle-time maintenance over the extracted-fact index.
+    /// Idle-time maintenance: fact extraction, dedup, and decay reporting.
     ///
-    /// At M4 the only phase is --extract: run the deterministic fact
-    /// extractor (deterministic-v1 — marker-prefixed lines/sentences,
-    /// never an LLM) over the current, non-rule memories and upsert the
-    /// results into the facts index that boosts `context` and hybrid
-    /// search. Deliberately CLI-only: this command exists on neither the
-    /// MCP nor the HTTP surface — extraction is an operator's batch job,
-    /// and agents receive facts through context/hybrid ranking instead.
+    /// Three combinable phases (at least one required): --extract runs the
+    /// deterministic fact extractor (deterministic-v1 — marker-prefixed
+    /// lines/sentences, never an LLM) over the current, non-rule memories
+    /// and upserts into the facts index that boosts `context` and hybrid
+    /// search; --dedup finds near-duplicate groups (normalized-exact text,
+    /// plus stored-vector cosine when the hybrid gate passes) and, only
+    /// with --yes, supersedes each group's older copies in favor of the
+    /// newest (M2 semantics — nothing is ever deleted); --report is always
+    /// report-only: suspected contradictions (a documented heuristic; a
+    /// human or agent resolves via `remember --supersedes`, never this
+    /// tool) plus the top 20 stalest memories by age and un-accessedness.
+    /// Deliberately CLI-only: this command exists on neither the MCP nor
+    /// the HTTP surface — maintenance is an operator's batch job, and
+    /// agents receive its benefits through context/hybrid ranking instead.
     #[command(after_help = "\
 EXAMPLES:
   # Extract facts from EVERY scope (deterministic, idempotent).
@@ -167,20 +182,40 @@ EXAMPLES:
   # Preview one scope first, then run it.
   engram consolidate --extract --scope my-task --dry-run
   engram consolidate --extract --scope my-task
+
+  # See duplicate groups first; supersede the older copies only with --yes.
+  engram consolidate --dedup
+  engram consolidate --dedup --yes
+
+  # Contradiction + decay report (always read-only), all phases at once.
+  engram consolidate --report
+  engram consolidate --extract --dedup --report
 ")]
     Consolidate {
-        /// Run the fact-extraction phase. Required at M4 (dedup/decay
-        /// phases arrive at M5).
+        /// Run the fact-extraction phase (honors --dry-run).
         #[arg(long)]
         extract: bool,
-        /// Only extract from this scope. Omitted: EVERY scope — unlike the
+        /// Run the near-duplicate detection phase. Report-only unless
+        /// --yes is also passed.
+        #[arg(long)]
+        dedup: bool,
+        /// Run the contradiction + decay report phase (always report-only).
+        #[arg(long)]
+        report: bool,
+        /// Only consolidate this scope. Omitted: EVERY scope — unlike the
         /// rule commands there is no scope cascade here, because idle-time
         /// maintenance naturally spans the whole database.
         #[arg(long)]
         scope: Option<String>,
-        /// Report what would be written without writing.
+        /// Report what --extract would write without writing. Meaningful
+        /// only for --extract; --dedup without --yes and --report are
+        /// already read-only.
         #[arg(long)]
         dry_run: bool,
+        /// Actually supersede the losers --dedup found. Consent must be a
+        /// flag: this process may not have a TTY to ask on.
+        #[arg(long)]
+        yes: bool,
     },
     /// Durable project rules — policy that outlives a session.
     ///

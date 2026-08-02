@@ -29,7 +29,15 @@ fn main() {
     let mode = resolve_mode(cli.format, cli.json, cli.no_color, cli.accessible);
 
     let store = match Store::open(&cli.db) {
-        Ok(s) => Arc::new(Mutex::new(s)),
+        Ok(mut s) => {
+            // Global --no-track: read-only auditing, wired before the store
+            // is shared. CLI-only — the MCP/HTTP surfaces expose no opt-out
+            // of their own (agent reads are what the tracking measures).
+            if cli.no_track {
+                s.set_tracking(false);
+            }
+            Arc::new(Mutex::new(s))
+        }
         Err(e) => {
             AppError::from(e).emit_to_stderr();
             std::process::exit(1);
@@ -342,18 +350,23 @@ fn run(
         }
         Command::Consolidate {
             extract,
+            dedup,
+            report,
             scope,
             dry_run,
+            yes,
         } => {
-            if !extract {
-                // At M4 extraction is the only consolidation phase, and an
-                // explicit flag keeps the surface honest when M5 adds more.
+            if !extract && !dedup && !report {
+                // An explicit phase flag keeps the surface honest: silently
+                // running every phase would make --yes far too easy to aim.
                 return fail(
                     AppError::new(
                         error::ErrorCode::InvalidArgument,
                         2,
-                        "consolidate needs a phase flag",
-                        "pass --extract (dedup/decay arrive at M5)",
+                        "consolidate needs at least one phase flag",
+                        "pass --extract (fact extraction), --dedup (near-duplicate detection; \
+                         add --yes to supersede), and/or --report (contradictions + decay, \
+                         report-only)",
                     ),
                     mode,
                 );
@@ -362,19 +375,52 @@ fn run(
             // No scope cascade here, unlike the rule commands: None means
             // EVERY scope, because idle-time maintenance naturally spans
             // the whole database.
-            match guard.facts_extract(scope.as_deref(), dry_run) {
-                Ok(report) => {
-                    let resp = if dry_run {
-                        Response::new("engram consolidate --extract --dry-run", report)
-                            .with_dry_run()
-                    } else {
-                        Response::new("engram consolidate --extract", report)
-                    };
-                    emit_ok(resp, mode);
-                    0
+            let mut sections = ConsolidateOutput {
+                extract: None,
+                dedup: None,
+                report: None,
+            };
+            let mut command = String::from("engram consolidate");
+            if extract {
+                command.push_str(" --extract");
+                match guard.facts_extract(scope.as_deref(), dry_run) {
+                    Ok(r) => sections.extract = Some(r),
+                    Err(e) => return fail(AppError::from(e), mode),
                 }
-                Err(e) => fail(AppError::from(e), mode),
             }
+            if dedup {
+                command.push_str(" --dedup");
+                if yes {
+                    command.push_str(" --yes");
+                }
+                // The cosine detector joins exactly when the auto-hybrid
+                // gate would pass: vector feature + resolvable model +
+                // indexed vectors. Otherwise the exact-text detector runs
+                // alone.
+                let vector_model = dedup_vector_model(&guard, model_path.as_deref());
+                match guard.consolidate_dedup(scope.as_deref(), vector_model.as_deref(), yes) {
+                    Ok(r) => sections.dedup = Some(r),
+                    Err(e) => return fail(AppError::from(e), mode),
+                }
+            }
+            if report {
+                command.push_str(" --report");
+                match guard.consolidate_report(scope.as_deref()) {
+                    Ok(r) => sections.report = Some(r),
+                    Err(e) => return fail(AppError::from(e), mode),
+                }
+            }
+            // --dry-run is meaningful only for --extract (the other phases
+            // are read-only without --yes anyway); the envelope marker
+            // follows the same rule.
+            let resp = if dry_run && extract {
+                command.push_str(" --dry-run");
+                Response::new(command, sections).with_dry_run()
+            } else {
+                Response::new(command, sections)
+            };
+            emit_ok(resp, mode);
+            0
         }
         Command::Rule { action } => run_rule(action, &store, mode),
         Command::Index {
@@ -425,6 +471,27 @@ fn run(
                     "rule add", "rule list", "rule retire", "rule sync", "rule purge",
                     "save-chat", "mcp", "serve", "schema", "describe"
                 ],
+                "consolidate": {
+                    "phases": ["extract", "dedup", "report"],
+                    "extract": "deterministic fact extraction into the facts index (honors --dry-run)",
+                    "dedup": "near-duplicate groups per scope — normalized-exact text always, \
+                              stored-vector cosine >= 0.92 when the hybrid gate passes; the \
+                              newest row wins and --yes supersedes the losers (M2 semantics, \
+                              never a delete); report-only without --yes",
+                    "report": "always report-only: contradiction pairs (>= 0.5 word-set Jaccard \
+                               with a negation marker on exactly one side — a heuristic; resolve \
+                               via remember --supersedes, never auto-resolved) and the top 20 \
+                               stalest memories by age_days + 30/(1+access_count)",
+                    "cli_only": true
+                },
+                "access_tracking": {
+                    "columns": ["access_count", "last_accessed_at"],
+                    "opt_out": "--no-track (CLI)",
+                    "semantics": "recall/search/context/get bump the counters for the memories \
+                                  actually returned (not candidates); the columns are internal — \
+                                  Memory output never carries them — and feed the decay report; \
+                                  MCP/HTTP reads always track"
+                },
                 "facts": {
                     "extractor": facts::EXTRACTOR,
                     "philosophy": "facts are VERBATIM marker-prefixed lines/sentences (Decided:, \
@@ -529,6 +596,40 @@ fn run(
             }
         }
     }
+}
+
+/// `engram consolidate` payload: one optional section per phase that ran,
+/// absent sections omitted entirely — the data shape mirrors the flags.
+#[derive(serde::Serialize)]
+struct ConsolidateOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extract: Option<store::ExtractReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dedup: Option<store::DedupReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<store::ConsolidateReport>,
+}
+
+/// The model whose stored vectors the dedup cosine detector may compare —
+/// `Some` exactly when the auto-hybrid gate would pass (vector feature
+/// compiled in, a local model resolves and loads, and that model has
+/// indexed vectors). Any miss means the exact-text detector runs alone; a
+/// dedup never errors over a missing model.
+#[cfg(feature = "vector")]
+fn dedup_vector_model(store: &Store, model_path: Option<&std::path::Path>) -> Option<String> {
+    let embedder = embed::try_embedder(model_path)?;
+    let model = embedder.model_name().to_string();
+    match store.vector_count(&model) {
+        Ok(count) if count > 0 => Some(model),
+        _ => None,
+    }
+}
+
+/// Without the vector feature there are no stored vectors to compare; the
+/// exact-text detector always runs alone.
+#[cfg(not(feature = "vector"))]
+fn dedup_vector_model(_store: &Store, _model_path: Option<&std::path::Path>) -> Option<String> {
+    None
 }
 
 #[derive(serde::Serialize)]
