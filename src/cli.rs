@@ -2,6 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// Retrieval mode for `engram search` — explicit override of the auto rule.
+///
+/// Present in every build so the CLI schema is stable: without the `vector`
+/// feature, `--mode hybrid` parses and then fails with a structured exit-2
+/// error naming the missing feature.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum SearchMode {
+    /// FTS5 full-text only — always available.
+    Fts,
+    /// FTS5 + vector channels fused with reciprocal rank fusion. Requires
+    /// the vector feature, a resolvable local model, and an indexed scope.
+    Hybrid,
+}
+
 /// Machine output formats — spacecraft-cli-standard §3 `--format`.
 /// `yaml` is deferred (serde_yaml is archived); `explore` has no TUI yet.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -41,6 +55,15 @@ pub struct Cli {
     /// auto-detection but this flag still wins.
     #[arg(long, global = true)]
     pub accessible: bool,
+
+    /// Local Model2Vec model directory for semantic (vector) search. First
+    /// step of the model cascade: --model-path, then ENGRAM_MODEL, then
+    /// $XDG_DATA_HOME/engram/model (default ~/.local/share/engram/model).
+    /// Engram never downloads a model — install one manually. Only present
+    /// in builds with the vector feature.
+    #[cfg(feature = "vector")]
+    #[arg(long, global = true)]
+    pub model_path: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -102,6 +125,12 @@ pub enum Command {
         /// Include superseded memories — the full verbatim history.
         #[arg(long, conflicts_with = "as_of")]
         include_superseded: bool,
+        /// Retrieval mode. Omitted: hybrid is used automatically when the
+        /// vector feature is built in, a local model resolves, and the
+        /// model's vectors are indexed — otherwise fts. An explicit
+        /// `--mode hybrid` errors (exit 2) when a prerequisite is missing.
+        #[arg(long, value_enum)]
+        mode: Option<SearchMode>,
     },
     /// Assemble a budget-packed context block for session start: active
     /// rules first (always included), then recency+relevance fused memories.
@@ -129,6 +158,38 @@ pub enum Command {
     Rule {
         #[command(subcommand)]
         action: RuleAction,
+    },
+    /// Embed stored memories into the vector index (vector feature).
+    ///
+    /// Backfills embeddings for every memory that has none yet under the
+    /// resolved model — including memories written by surfaces that never
+    /// embed live (MCP, HTTP) and history from before the model existed.
+    /// Rule rows are skipped: policy is delivered through the rules section,
+    /// not retrieval. Requires a local Model2Vec model; engram never
+    /// downloads one.
+    #[command(after_help = "\
+EXAMPLES:
+  # Index everything the resolved model has not embedded yet.
+  engram index
+
+  # Restrict to one scope, and preview first.
+  engram index --scope my-task --dry-run
+  engram index --scope my-task
+
+  # Point at a model explicitly (cascade: --model-path, ENGRAM_MODEL,
+  # $XDG_DATA_HOME/engram/model).
+  engram --model-path ~/models/potion-base-8M index
+")]
+    Index {
+        /// Only index memories in this scope. Omitted: every scope.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Memories fetched and embedded per batch.
+        #[arg(long, default_value_t = 500)]
+        batch: u32,
+        /// Report how many memories would be embedded, without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run as an MCP server over stdio.
     Mcp,

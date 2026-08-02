@@ -110,6 +110,12 @@ engram rule sync
 # Withdraw one when it stops applying, then re-sync.
 engram rule retire --id skill-description-1000 && engram rule sync
 
+# Semantic (hybrid) search — opt-in build, local model only, never downloads:
+#   cargo build --release --features vector
+#   engram --model-path ~/models/potion-base-8M index
+#   engram search "why did the binary lose its symbols" --mode hybrid
+# Gate result (bench/RESULTS.md): hybrid 0.918 vs fts 0.856 recall@5.
+
 # Contradiction? Supersede instead of overwrite: the old row keeps its
 # history (valid_to + superseded_by), reads default to what is true now.
 engram remember --agent kimi --scope my-task --supersedes <old-id> "Correction: X is async."

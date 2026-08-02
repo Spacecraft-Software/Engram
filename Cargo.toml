@@ -14,6 +14,28 @@ repository = "https://github.com/Spacecraft-Software/engram"
 name = "engram"
 path = "src/main.rs"
 
+[features]
+# Default build stays FTS5-only: zero ML dependencies, identical behavior to
+# 0.2.x. Vector/hybrid retrieval is strictly opt-in.
+default = []
+# Semantic (vector) search via Model2Vec static embeddings, loaded from a
+# LOCAL model directory only (--model-path / ENGRAM_MODEL /
+# $XDG_DATA_HOME/engram/model). model2vec-rs is pulled with
+# default-features = false because its default feature set includes
+# "hf-hub" (HuggingFace Hub fetching over the network via hf-hub + ureq),
+# which would violate the Standard §9 privacy-first posture — engram never
+# auto-downloads anything. "local-only" hard-disables remote loading inside
+# model2vec-rs's from_pretrained; "fancy-regex" selects the pure-Rust
+# tokenizer regex backend instead of the default "onig" (oniguruma C build).
+vector = ["dep:model2vec-rs"]
+# Reserved: a release build that vendors a model blob into the binary so
+# `--features vector-bundled` needs no external model directory. No model
+# blob is committed to this repository yet, so src/embed.rs carries a
+# compile_error! stub for this feature — it exists in the manifest so the
+# feature name is stable, but it cannot be built half-done. Build with
+# `--features vector` and a local model path instead.
+vector-bundled = ["vector"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +52,12 @@ rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
 schemars = "1.2.1"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
+# Optional — gated behind the "vector" feature (see [features] for why the
+# default features are disabled: no hf-hub network fetching, ever).
+model2vec-rs = { version = "0.2", optional = true, default-features = false, features = [
+    "local-only",
+    "fancy-regex",
+] }
 
 [dev-dependencies]
 assert_cmd = "2"

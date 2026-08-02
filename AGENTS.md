@@ -60,6 +60,8 @@ engram rule retire --id <kebab-id> [--scope S]                   # tombstone, no
 engram rule purge --id <kebab-id> --yes [--dry-run]              # delete a RETIRED rule (CLI-only)
 engram remember ... --supersedes <id>                            # close old validity window, record replacement
 engram recall --scope S --as-of <ISO8601> | --include-superseded # time travel / full history
+engram index [--scope S] [--dry-run]                             # backfill vectors (vector feature; local model only)
+engram search Q --mode fts|hybrid                                # explicit retrieval mode (auto-hybrid when ready)
 engram rule sync [--scope S] [--file PATH]... [--dry-run]
 ```
 

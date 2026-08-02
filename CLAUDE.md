@@ -53,6 +53,7 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 - `main.rs` — entry point; parses CLI, instantiates `Store`, dispatches to surface handlers
 - `store.rs` — `Store` struct; SQLite schema, migration, CRUD (remember/recall/search, rule_add/rules, context)
 - `retrieval.rs` — token budgeting + retrieval assembly, pure functions (no DB handle): `estimate_tokens` (ceil(chars/4), estimator `"chars-div-4"`), `rrf_fuse` (reciprocal rank fusion, `RRF_K = 60.0`), `budget_recall`/`budget_search` (greedy drop-and-continue packing), `BudgetReport`
+- `embed.rs` — local Model2Vec embeddings (cfg-gated `vector`): model-path cascade, process-wide embedder cache, cosine
 - `rules.rs` — durable project rules: scope resolution, markdown rendering, sentinel-block sync
 - `cli.rs` — clap command/argument definitions (`Command` enum, `Cli` struct)
 - `mcp.rs` — MCP server (`#[tool_router]` registration, `#[tool_handler]` impls)
@@ -72,7 +73,7 @@ curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
 - Migration: `migrate()` in `store.rs` probes `pragma_table_info` before each `ALTER TABLE` (SQLite has no `ADD COLUMN IF NOT EXISTS`), so opening a pre-rules database upgrades it in place. Both new columns are nullable — every pre-existing row is a message, which has neither.
 - Pragmas: `journal_mode=WAL`, `busy_timeout=5000ms` (allows concurrent readers while one writer is active)
 
-**Query safety:** FTS5 queries are sanitized in `sanitize_fts_query` — every token is wrapped as an escaped quoted phrase to prevent syntax injection.
+**Query safety:** FTS5 queries are sanitized in `sanitize_fts_query` — every token is wrapped as an escaped quoted phrase to prevent syntax injection, and tokens are joined with `OR` (not FTS5's implicit `AND`): natural-language queries almost always contain a filler word the stored text lacks, and one missing token zeroes an AND match. Measured on the M3 bench: AND-joined recall@5 0.108 → OR-joined 0.856 (`bench/RESULTS.md`); BM25 still ranks multi-token matches first.
 
 ## Conventions (Spacecraft Software Standard §3, §4, §14)
 
@@ -159,15 +160,24 @@ In Claude Code or other multi-model pipelines:
 
 All three surfaces (CLI, MCP, HTTP) hit the same `Store`, so memories are shared across deployment modes. Rules are on all three surfaces too.
 
+## Semantic search (the `vector` feature, M3)
+
+Opt-in at build time: `cargo build --release --features vector`. The default build stays FTS5-only with zero ML dependencies. Facts:
+
+- **Engine:** Model2Vec static embeddings via `model2vec-rs` compiled with `default-features = false` + `local-only` — the hf-hub network fetch path is compiled OUT; engram never downloads a model (§9 PFA). Install one by hand (e.g. `minishlab/potion-base-8M`: `model.safetensors` + `tokenizer.json` + `config.json`).
+- **Model cascade:** `--model-path` → `ENGRAM_MODEL` → `$XDG_DATA_HOME/engram/model` (default `~/.local/share/engram/model`). The directory basename is the model name in `memory_vectors.model`; vectors from different models are never compared.
+- **Storage:** `memory_vectors` side table (memory_id PK/FK, model, dim, embedding BLOB f32-LE) — deliberately NOT sqlite-vec (alpha C extension vs §5.5 packaging) and NOT columns on `memories` (FTS triggers untouched). Similarity is brute-force cosine: sub-millisecond under 100k rows.
+- **Indexing:** `engram remember` embeds live on the CLI when a model resolves; `engram index [--scope] [--batch] [--dry-run]` backfills everything else (MCP/HTTP writes, pre-model history). Rule rows are never embedded.
+- **Retrieval:** `search --mode fts|hybrid`; omitted, hybrid engages automatically when (feature ∧ model resolves ∧ vectors indexed), else fts. Explicit `--mode hybrid` with a missing prerequisite is a structured exit-2/HTTP-400 error, never a silent fallback. Hybrid = FTS top-50 + cosine top-50 → `rrf_fuse(k=60)`; `context` gains the vector as a third channel the same way.
+- **The gate:** measured 2026-08-02 on the held-out `bench/queries.jsonl` (frozen before implementation): hybrid 0.918 vs fts 0.856 recall@5 = +6.2 points ≥ +5 → PASS; the margin is entirely conceptual/synonym queries. See `bench/RESULTS.md` — including why the first (+77.9) measurement was rejected as a baseline defect.
+
 ## What's not yet implemented
 
 Landed in 0.2.0 (no longer gaps): `--format jsonl|csv`, `remember --dry-run`, real status codes on **all** HTTP routes (a breaking change — see the HTTP notes above), packaging manifests (`packaging/`), the Texinfo manual skeleton (`doc/engram.texi`), `CREDITS.md`, CI, and tests over the memory surfaces.
 
 Still missing:
 
-- An MCP `context` tool (lands at M3). Budgeting on MCP `recall`/`search` already exists via the optional `budget_tokens` argument — when set, the tool returns `{"memories": [...], "budget": {...}}` instead of the plain array.
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore` (no TUI yet).
-- Semantic (embedding) search — upgrade path is `sqlite-vec` as a loadable extension.
 - Authentication on the HTTP surface (currently `127.0.0.1`-only, no bearer check).
 
 ## See also

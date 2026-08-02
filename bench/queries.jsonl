@@ -1,0 +1,65 @@
+{"query": "KEEP boot_magic section gc-sections link.x", "scope": null, "relevant_keys": ["zamak-linker-strip-symbols"], "kind": "exact-term"}
+{"query": "axum 0.7 :rule_id path param route syntax", "scope": null, "relevant_keys": ["engram-axum-route-syntax"], "kind": "exact-term"}
+{"query": "busy_timeout WAL synchronous NORMAL pragmas", "scope": "engram", "relevant_keys": ["engram-wal-mode"], "kind": "exact-term"}
+{"query": "postcard vs bincode wire format size", "scope": null, "relevant_keys": ["ironway-serde-bincode-vs-postcard"], "kind": "exact-term"}
+{"query": "flip-link stack placement below .bss", "scope": null, "relevant_keys": ["zamak-flip-link"], "kind": "exact-term"}
+{"query": "cargoHash fakeHash vendor-staging mismatch", "scope": null, "relevant_keys": ["bravais-cargohash-bump"], "kind": "exact-term"}
+{"query": "ServerAliveInterval ServerAliveCountMax defaults", "scope": null, "relevant_keys": ["anvil-keepalive-serveralive"], "kind": "exact-term"}
+{"query": "sanitize_fts_query quoted phrase escaping", "scope": "engram", "relevant_keys": ["engram-fts-sanitize"], "kind": "exact-term"}
+{"query": "SO_REUSEPORT per-worker listener accept", "scope": null, "relevant_keys": ["ironway-epoll-thundering"], "kind": "exact-term"}
+{"query": "perf_event_open mmap ring pages PERF_RECORD_LOST", "scope": null, "relevant_keys": ["caliper-mmap-ring-perf"], "kind": "exact-term"}
+{"query": "sops-nix age keys ssh-to-age rotation", "scope": null, "relevant_keys": ["bravais-sops-nix"], "kind": "exact-term"}
+{"query": "sntrup761x25519 curve25519-sha256 kex order", "scope": null, "relevant_keys": ["anvil-handshake-kex"], "kind": "exact-term"}
+{"query": "TLB shootdown IPI batching crossover", "scope": null, "relevant_keys": ["craton-tlb-shootdown"], "kind": "exact-term"}
+{"query": "RRF k=60 reciprocal rank fusion constant", "scope": "engram", "relevant_keys": ["engram-rrf-constant"], "kind": "exact-term"}
+{"query": "zstd dictionary snapshot compression ratio", "scope": null, "relevant_keys": ["ironway-compression-zstd"], "kind": "exact-term"}
+{"query": "probe-rs vs openocd flashing speed defmt", "scope": null, "relevant_keys": ["zamak-probe-rs-flash"], "kind": "exact-term"}
+{"query": "why doesn't recall show a memory I just stored from another process", "scope": "engram", "relevant_keys": ["engram-wal-checkpoint-stale"], "kind": "paraphrase"}
+{"query": "tiny control messages were arriving late until we changed a socket option", "scope": "ironway-netcode", "relevant_keys": ["ironway-tcp-nodelay"], "kind": "paraphrase"}
+{"query": "flamegraph shows only hex addresses, no function names", "scope": null, "relevant_keys": ["caliper-stripped-symbols"], "kind": "paraphrase"}
+{"query": "logging in takes several seconds before the password prompt appears", "scope": null, "relevant_keys": ["anvil-banner-timing"], "kind": "paraphrase"}
+{"query": "idle connections behind home routers just go silent and die", "scope": "ironway-netcode", "relevant_keys": ["ironway-keepalive-interval"], "kind": "paraphrase"}
+{"query": "the board keeps resetting even though we're refreshing the watchdog", "scope": null, "relevant_keys": ["zamak-watchdog-feed"], "kind": "paraphrase"}
+{"query": "the profiler completely froze the process it was attached to", "scope": null, "relevant_keys": ["caliper-signal-safety"], "kind": "paraphrase"}
+{"query": "nix complains the downloaded source doesn't match what it expected", "scope": null, "relevant_keys": ["bravais-narhash-mismatch"], "kind": "paraphrase"}
+{"query": "my terminal was left unusable with invisible typing after a crash", "scope": null, "relevant_keys": ["anvil-terminal-raw-mode"], "kind": "paraphrase"}
+{"query": "traces started showing spans attached to the wrong parents after a while", "scope": null, "relevant_keys": ["caliper-span-id-collision"], "kind": "paraphrase"}
+{"query": "we stop seeing spans as soon as work moves onto a new task", "scope": null, "relevant_keys": ["caliper-async-context-loss"], "kind": "paraphrase"}
+{"query": "firmware update reports success but the data reads back wrong on the second try", "scope": null, "relevant_keys": ["zamak-erase-before-write"], "kind": "paraphrase"}
+{"query": "the same order got applied twice after a network blip", "scope": null, "relevant_keys": ["ironway-retry-idempotency"], "kind": "paraphrase"}
+{"query": "machine locks up when a handler grabs a lock the CPU already holds", "scope": null, "relevant_keys": ["craton-spinlock-irq"], "kind": "paraphrase"}
+{"query": "what stops someone writing a rule that breaks the managed region in the file", "scope": "engram", "relevant_keys": ["engram-sentinel-reject"], "kind": "paraphrase"}
+{"query": "what made our incremental builds so much faster", "scope": "ironway-netcode", "relevant_keys": ["ironway-linker-mold"], "kind": "paraphrase"}
+{"query": "interrupted file transfers continue where they left off instead of restarting", "scope": null, "relevant_keys": ["anvil-sftp-resume"], "kind": "paraphrase"}
+{"query": "opening an old database just works without any manual upgrade step", "scope": "engram", "relevant_keys": ["engram-migration-probe"], "kind": "paraphrase"}
+{"query": "the chip fetches garbage instructions when startup configures things in the wrong order", "scope": null, "relevant_keys": ["zamak-clock-init-order"], "kind": "paraphrase"}
+{"query": "the release job on the build farm gets killed after two hours", "scope": null, "relevant_keys": ["bravais-hydra-timeout"], "kind": "paraphrase"}
+{"query": "spawning a big process used to be slow because everything got copied up front", "scope": null, "relevant_keys": ["craton-page-fault-cow"], "kind": "paraphrase"}
+{"query": "multiplexed connections fail for people with long home directory paths", "scope": null, "relevant_keys": ["anvil-mux-controlmaster"], "kind": "paraphrase"}
+{"query": "we removed a policy but still want evidence it once existed", "scope": "engram", "relevant_keys": ["engram-retire-tombstone"], "kind": "paraphrase"}
+{"query": "bootloader OOM while parsing the manifest", "scope": "zamak-bootloader", "relevant_keys": ["zamak-oom-allocator"], "kind": "synonym"}
+{"query": "relay process ran out of memory overnight and the kernel killed it", "scope": "ironway-netcode", "relevant_keys": ["ironway-oom-kill"], "kind": "synonym"}
+{"query": "SIGSEGV when an IPv6 peer connects", "scope": "ironway-netcode", "relevant_keys": ["ironway-sockaddr-storage-bug"], "kind": "synonym"}
+{"query": "MITM protection on relay-to-relay links", "scope": null, "relevant_keys": ["ironway-cert-pinning"], "kind": "synonym"}
+{"query": "UB from panics crossing the FFI boundary", "scope": "craton-kernel", "relevant_keys": ["craton-rust-abi-ffi"], "kind": "synonym"}
+{"query": "nix build OOM during the LTO link step", "scope": null, "relevant_keys": ["bravais-nix-max-jobs"], "kind": "synonym"}
+{"query": "what's our RTT p99", "scope": "ironway-netcode", "relevant_keys": ["ironway-metrics-histogram"], "kind": "synonym"}
+{"query": "does 2FA work over ssh", "scope": null, "relevant_keys": ["anvil-keyboard-interactive"], "kind": "synonym"}
+{"query": "thundering herd when everyone reconnects at once", "scope": "ironway-netcode", "relevant_keys": ["ironway-reconnect-storm"], "kind": "synonym"}
+{"query": "TOCTOU race in the key permission check", "scope": null, "relevant_keys": ["anvil-strict-modes"], "kind": "synonym"}
+{"query": "how do decisions actually reach a model's context instead of rotting in the database", "scope": "engram", "relevant_keys": ["engram-sync-delivery"], "kind": "conceptual"}
+{"query": "what's our story for proving firmware wasn't tampered with", "scope": "zamak-bootloader", "relevant_keys": ["zamak-signing-key-rotation"], "kind": "conceptual"}
+{"query": "where do we knowingly trade a little durability for write speed", "scope": "engram", "relevant_keys": ["engram-wal-mode"], "kind": "conceptual"}
+{"query": "why don't we trust wall-clock time to order events across machines", "scope": null, "relevant_keys": ["caliper-clock-sync-multi"], "kind": "conceptual"}
+{"query": "what keeps a hostile local process from writing files outside the project over HTTP", "scope": "engram", "relevant_keys": ["engram-http-sync-cwd"], "kind": "conceptual"}
+{"query": "how do we make sure a build isn't secretly depending on the machine it ran on", "scope": null, "relevant_keys": ["bravais-impure-env"], "kind": "conceptual"}
+{"query": "how does the scheduler avoid cores slowing each other down through shared memory", "scope": "craton-kernel", "relevant_keys": ["craton-cache-false-sharing"], "kind": "conceptual"}
+{"query": "how do we stop fast producers from drowning slow consumers", "scope": "ironway-netcode", "relevant_keys": ["ironway-backpressure-bounded"], "kind": "conceptual"}
+{"query": "how would semantic search work here without calling an LLM", "scope": "engram", "relevant_keys": ["engram-vec-plan"], "kind": "conceptual"}
+{"query": "which of our projects actually promises release discipline to its users", "scope": null, "relevant_keys": ["anvil-semver-changelog"], "kind": "conceptual"}
+{"query": "everything we decided about replay protection and client clock skew", "scope": "ironway-netcode", "relevant_keys": ["ironway-handshake-hmac", "ironway-clock-skew"], "kind": "multi-fact"}
+{"query": "where did we standardize on rustls instead of openssl", "scope": null, "relevant_keys": ["ironway-tls-rustls", "bravais-openssl-vendored-rejected"], "kind": "multi-fact"}
+{"query": "all the linker-script and memory-map boot pitfalls we've hit", "scope": null, "relevant_keys": ["zamak-linker-strip-symbols", "craton-linker-script-sections", "zamak-memory-x-mismatch"], "kind": "multi-fact"}
+{"query": "what have we measured for tracing overhead and ingest throughput", "scope": "caliper-tracing", "relevant_keys": ["caliper-overhead-bench", "caliper-benchmark-ingest"], "kind": "multi-fact"}
+{"query": "why is rule sync safe to run repeatedly from hooks", "scope": "engram", "relevant_keys": ["engram-sync-idempotent", "engram-rule-upsert"], "kind": "multi-fact"}
+{"query": "keepalive and dead-connection detection settings across our projects", "scope": null, "relevant_keys": ["ironway-keepalive-interval", "anvil-keepalive-serveralive"], "kind": "multi-fact"}

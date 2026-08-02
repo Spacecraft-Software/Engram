@@ -245,6 +245,11 @@ struct SearchParams {
     /// Include superseded memories — the full verbatim history.
     #[serde(default)]
     include_superseded: bool,
+    /// Retrieval mode: "fts" or "hybrid". Omitted: hybrid automatically
+    /// when the vector feature is built in, a model resolves, and vectors
+    /// are indexed — else fts. Explicit "hybrid" answers 400 when a
+    /// prerequisite is missing.
+    mode: Option<String>,
 }
 fn default_search_limit() -> u32 {
     20
@@ -256,19 +261,72 @@ async fn search(State(store): State<SharedStore>, Query(q): Query<SearchParams>)
         Err(resp) => return resp,
     };
     let guard = store.lock().expect("store lock poisoned");
-    match guard.search(&q.query, q.scope.as_deref(), q.limit, validity) {
-        Ok(mems) => match q.budget_tokens {
-            Some(budget) => {
-                let (mems, report) = crate::retrieval::budget_search(mems, budget);
-                ok_resp(Response::new("GET /v1/memory/search", mems).with_budget(report))
+    // Same mode semantics as the CLI's --mode: explicit fts/hybrid wins,
+    // omitted means the auto-hybrid rule.
+    let ready = match q.mode.as_deref() {
+        Some("fts") => None,
+        Some("hybrid") => match crate::embed::try_hybrid(&guard, None, &q.query) {
+            Ok(ready) => Some(ready),
+            Err(unavailable) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    unavailable.message(),
+                    &unavailable.hint(),
+                )
             }
-            None => ok("GET /v1/memory/search", mems),
         },
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            e,
-            "check that the database is readable",
-        ),
+        Some(other) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown mode '{other}'"),
+                "mode must be 'fts' or 'hybrid'",
+            )
+        }
+        None => crate::embed::try_hybrid(&guard, None, &q.query).ok(),
+    };
+    match ready {
+        Some(ready) => {
+            match guard.search_hybrid(
+                &q.query,
+                &ready.query_vec,
+                &ready.model,
+                q.scope.as_deref(),
+                q.limit,
+                validity,
+            ) {
+                Ok(hybrid) => match q.budget_tokens {
+                    Some(budget) => {
+                        let (mems, mut report) =
+                            crate::retrieval::budget_search(hybrid.memories, budget);
+                        report.channels = std::collections::BTreeMap::from([
+                            ("fts", hybrid.fts_candidates),
+                            ("vector", hybrid.vector_candidates),
+                        ]);
+                        ok_resp(Response::new("GET /v1/memory/search", mems).with_budget(report))
+                    }
+                    None => ok("GET /v1/memory/search", hybrid.memories),
+                },
+                Err(e) => err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e,
+                    "check that the database is readable",
+                ),
+            }
+        }
+        None => match guard.search(&q.query, q.scope.as_deref(), q.limit, validity) {
+            Ok(mems) => match q.budget_tokens {
+                Some(budget) => {
+                    let (mems, report) = crate::retrieval::budget_search(mems, budget);
+                    ok_resp(Response::new("GET /v1/memory/search", mems).with_budget(report))
+                }
+                None => ok("GET /v1/memory/search", mems),
+            },
+            Err(e) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e,
+                "check that the database is readable",
+            ),
+        },
     }
 }
 
@@ -302,7 +360,25 @@ async fn context(State(store): State<SharedStore>, Query(q): Query<ContextParams
         }
     };
     let guard = store.lock().expect("store lock poisoned");
-    match guard.context(&resolved.name, q.query.as_deref(), q.limit, q.budget_tokens) {
+    // Same auto rule as search: the vector channel joins the fusion only
+    // when the hybrid gate passes; a miss keeps the two-channel path.
+    let ready = q
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| crate::embed::try_hybrid(&guard, None, s).ok());
+    let vector = ready.as_ref().map(|r| crate::store::HybridQuery {
+        model: &r.model,
+        query_vec: &r.query_vec,
+    });
+    match guard.context(
+        &resolved.name,
+        q.query.as_deref(),
+        q.limit,
+        q.budget_tokens,
+        vector,
+    ) {
         Ok(ctx) => {
             let report = ctx.budget.clone();
             let data = serde_json::json!({
@@ -1026,6 +1102,59 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // --- M3: hybrid search mode parameter --------------------------------
+
+    #[tokio::test]
+    async fn search_mode_fts_works_and_bad_modes_are_400() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+        let body = serde_json::json!({
+            "agent": "a", "scope": "mode-scope", "content": "the gyroscope drifts",
+        });
+        let (status, text) = send(&app, post_json("/v1/memory", &body)).await;
+        assert_eq!(status, StatusCode::OK, "insert failed: {text}");
+
+        // Explicit fts always works.
+        let (status, text) = send(
+            &app,
+            get("/v1/memory/search?query=gyroscope&scope=mode-scope&mode=fts"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+        assert_eq!(parse(&text)["data"].as_array().map(Vec::len), Some(1));
+
+        // An unknown mode is a client error, named as such.
+        let (status, text) = send(
+            &app,
+            get("/v1/memory/search?query=gyroscope&mode=telepathy"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
+        assert!(
+            text.contains("telepathy"),
+            "the error names the mode: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_mode_hybrid_without_prerequisites_is_400() {
+        let (_dir, store) = test_store();
+        let app = router(store);
+        // Whatever is missing — the feature (default build), the model, or
+        // any indexed vectors (a fresh test database never has them) — an
+        // explicit hybrid request must answer 400 with a hint, not fall back
+        // silently and not 500.
+        let (status, text) = send(&app, get("/v1/memory/search?query=anything&mode=hybrid")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
+        let json = parse(&text);
+        assert!(
+            json["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| !h.is_empty()),
+            "the 400 carries a hint: {json}"
+        );
     }
 
     // --- M3: drill-down --------------------------------------------------

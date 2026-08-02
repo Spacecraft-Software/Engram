@@ -8,8 +8,8 @@
 @settitle Engram Manual
 @c %**end of header
 
-@set VERSION 0.2.0
-@set UPDATED 2026-08-01
+@set VERSION 0.3.0-dev
+@set UPDATED 2026-08-02
 
 @copying
 This manual is for Engram (version @value{VERSION}, updated
@@ -317,13 +317,47 @@ the output is byte-identical to earlier releases.
 @cindex search command
 
 @example
-engram search @var{query} [--scope @var{id}] [--limit @var{n}] [--budget-tokens @var{n}]
+engram search @var{query} [--scope @var{id}] [--limit @var{n}] [--budget-tokens @var{n}] [--mode fts|hybrid]
 @end example
 
 Full-text (FTS5) search across stored memories, optionally restricted
 to one scope.  @code{--limit} defaults to 20.  Query tokens are
-sanitized --- each is matched as a quoted phrase --- so arbitrary input
-cannot inject FTS5 syntax.
+sanitized --- each is matched as a quoted phrase, and tokens are joined
+with @code{OR} so a natural-language query with one non-matching filler
+word still finds its document (BM25 ranks multi-token matches first) ---
+so arbitrary input cannot inject FTS5 syntax.
+
+@cindex hybrid search
+@cindex vector search
+@cindex semantic search
+In a build with the @code{vector} feature, @code{--mode hybrid} fuses
+the FTS5 channel with a Model2Vec cosine-similarity channel via
+reciprocal rank fusion (k=60).  With @code{--mode} omitted, hybrid
+engages automatically when the feature is compiled in, a local model
+resolves (@code{--model-path}, then @env{ENGRAM_MODEL}, then
+@file{$XDG_DATA_HOME/engram/model}), and the model has indexed vectors
+(run @command{engram index} first); otherwise the search is plain FTS5.  An
+explicit @code{--mode hybrid} with a missing prerequisite is a
+structured error (exit code 2), never a silent fallback.  Engram never
+downloads a model.  The measured gate for shipping this feature is
+recorded in @file{bench/RESULTS.md}.
+
+@section engram index
+
+@cindex index command
+@cindex embeddings, backfilling
+
+@example
+engram index [--scope @var{id}] [--batch @var{n}] [--dry-run]
+@end example
+
+Backfills vector embeddings (under the resolved local model) for every
+memory that has none yet --- including memories written by surfaces
+that never embed live (MCP, HTTP) and history predating the model.
+Rule rows are never embedded: policy is delivered through the rules
+section of @command{engram context}, not through retrieval.  Requires
+a build with the @code{vector} feature and a local Model2Vec model
+directory.
 
 With @code{--budget-tokens}, the ranked results are packed to a token
 budget in rank order --- relevance ordering is the point of a search

@@ -5,6 +5,7 @@
 //! https://Engram.SpacecraftSoftware.org/
 
 mod cli;
+mod embed;
 mod error;
 mod http;
 mod mcp;
@@ -34,11 +35,23 @@ fn main() {
         }
     };
 
-    let exit_code = run(cli.command, store, mode);
+    // `--model-path` only exists in vector builds; the default build passes
+    // None so `run` keeps one signature across feature sets.
+    #[cfg(feature = "vector")]
+    let model_path = cli.model_path.clone();
+    #[cfg(not(feature = "vector"))]
+    let model_path: Option<std::path::PathBuf> = None;
+
+    let exit_code = run(cli.command, store, mode, model_path);
     std::process::exit(exit_code);
 }
 
-fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
+fn run(
+    command: Command,
+    store: Arc<Mutex<Store>>,
+    mode: OutputMode,
+    model_path: Option<std::path::PathBuf>,
+) -> i32 {
     match command {
         Command::Remember {
             agent,
@@ -96,6 +109,10 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                     match guard.remember_superseding(&agent, &scope, &role, &content, &target) {
                         Ok(result) => match result.outcome {
                             store::SupersedeOutcome::Superseded => {
+                                #[cfg(feature = "vector")]
+                                if let Some(mem) = result.memory.as_ref() {
+                                    try_embed_after_write(&guard, model_path.as_deref(), mem);
+                                }
                                 emit_ok(Response::new("engram memory remember", result), mode);
                                 0
                             }
@@ -135,6 +152,8 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 }
                 None => match guard.remember(&agent, &scope, &role, &content) {
                     Ok(mem) => {
+                        #[cfg(feature = "vector")]
+                        try_embed_after_write(&guard, model_path.as_deref(), &mem);
                         emit_ok(Response::new("engram memory remember", mem), mode);
                         0
                     }
@@ -184,31 +203,94 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             budget_tokens,
             as_of,
             include_superseded,
+            mode: search_mode,
         } => {
             let validity = match resolve_validity(as_of.as_deref(), include_superseded) {
                 Ok(v) => v,
                 Err(e) => return fail(e, mode),
             };
             let guard = store.lock().expect("store lock poisoned");
-            match guard.search(&query, scope.as_deref(), limit, validity) {
-                Ok(mems) => {
-                    match budget_tokens {
-                        Some(budget) => {
-                            let (mems, report) = retrieval::budget_search(mems, budget);
-                            emit_ok(
-                                Response::new("engram memory search", mems).with_budget(report),
+            // Effective retrieval mode: an explicit --mode wins; otherwise
+            // hybrid runs exactly when the gate passes (vector feature +
+            // resolvable model + indexed vectors), else fts.
+            let hybrid: Option<embed::HybridReady> = match search_mode {
+                Some(cli::SearchMode::Fts) => None,
+                Some(cli::SearchMode::Hybrid) => {
+                    match embed::try_hybrid(&guard, model_path.as_deref(), &query) {
+                        Ok(ready) => Some(ready),
+                        Err(unavailable) => {
+                            return fail(
+                                AppError::new(
+                                    error::ErrorCode::InvalidArgument,
+                                    2,
+                                    unavailable.message(),
+                                    unavailable.hint(),
+                                ),
                                 mode,
-                            );
+                            )
                         }
-                        None => emit_ok(Response::new("engram memory search", mems), mode),
                     }
-                    0
                 }
-                Err(e) => {
-                    let err = AppError::from(e);
-                    emit_error(&err, mode);
-                    err.exit_code
+                None => embed::try_hybrid(&guard, model_path.as_deref(), &query).ok(),
+            };
+            match hybrid {
+                Some(ready) => {
+                    match guard.search_hybrid(
+                        &query,
+                        &ready.query_vec,
+                        &ready.model,
+                        scope.as_deref(),
+                        limit,
+                        validity,
+                    ) {
+                        Ok(hybrid) => {
+                            match budget_tokens {
+                                Some(budget) => {
+                                    let (mems, mut report) =
+                                        retrieval::budget_search(hybrid.memories, budget);
+                                    // budget_search knows one channel; hybrid
+                                    // fed two, so name both with their real
+                                    // candidate counts.
+                                    report.channels = std::collections::BTreeMap::from([
+                                        ("fts", hybrid.fts_candidates),
+                                        ("vector", hybrid.vector_candidates),
+                                    ]);
+                                    emit_ok(
+                                        Response::new("engram memory search", mems)
+                                            .with_budget(report),
+                                        mode,
+                                    );
+                                }
+                                None => emit_ok(
+                                    Response::new("engram memory search", hybrid.memories),
+                                    mode,
+                                ),
+                            }
+                            0
+                        }
+                        Err(e) => fail(AppError::from(e), mode),
+                    }
                 }
+                None => match guard.search(&query, scope.as_deref(), limit, validity) {
+                    Ok(mems) => {
+                        match budget_tokens {
+                            Some(budget) => {
+                                let (mems, report) = retrieval::budget_search(mems, budget);
+                                emit_ok(
+                                    Response::new("engram memory search", mems).with_budget(report),
+                                    mode,
+                                );
+                            }
+                            None => emit_ok(Response::new("engram memory search", mems), mode),
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        let err = AppError::from(e);
+                        emit_error(&err, mode);
+                        err.exit_code
+                    }
+                },
             }
         }
         Command::Context {
@@ -222,7 +304,24 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 Err(e) => return fail(scope_error(e), mode),
             };
             let guard = store.lock().expect("store lock poisoned");
-            match guard.context(&resolved.name, query.as_deref(), limit, budget_tokens) {
+            // Same auto rule as search: the vector channel joins only when
+            // the gate passes; any miss silently keeps the two-channel path.
+            let ready: Option<embed::HybridReady> = query
+                .as_deref()
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .and_then(|q| embed::try_hybrid(&guard, model_path.as_deref(), q).ok());
+            let vector = ready.as_ref().map(|r| store::HybridQuery {
+                model: &r.model,
+                query_vec: &r.query_vec,
+            });
+            match guard.context(
+                &resolved.name,
+                query.as_deref(),
+                limit,
+                budget_tokens,
+                vector,
+            ) {
                 Ok(ctx) => {
                     let report = ctx.budget.clone();
                     let result = ContextCommandResult {
@@ -240,7 +339,16 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             }
         }
         Command::Rule { action } => run_rule(action, &store, mode),
+        Command::Index {
+            scope,
+            batch,
+            dry_run,
+        } => run_index(scope, batch, dry_run, model_path, &store, mode),
         Command::Mcp => {
+            // Bind the CLI --model-path into the process-wide embedder cache
+            // before any request arrives; auto-hybrid then works server-side.
+            #[cfg(feature = "vector")]
+            embed::warm(model_path.as_deref());
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             if let Err(e) = rt.block_on(mcp::run_stdio(store)) {
                 eprintln!("{{\"error\":{{\"message\":\"{e}\"}}}}");
@@ -249,6 +357,8 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
             0
         }
         Command::Serve { addr } => {
+            #[cfg(feature = "vector")]
+            embed::warm(model_path.as_deref());
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
                 let app = http::router(store);
@@ -273,10 +383,26 @@ fn run(command: Command, store: Arc<Mutex<Store>>, mode: OutputMode) -> i32 {
                 "maintainer": "Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>",
                 "website": "https://Engram.SpacecraftSoftware.org/",
                 "commands": [
-                    "remember", "recall", "search", "context",
+                    "remember", "recall", "search", "context", "index",
                     "rule add", "rule list", "rule retire", "rule sync", "rule purge",
                     "save-chat", "mcp", "serve", "schema", "describe"
                 ],
+                "vector": {
+                    "description": "Semantic (hybrid) retrieval: FTS5 + Model2Vec vector channels \
+                                    fused with reciprocal rank fusion. Feature-gated at build time; \
+                                    `engram index` backfills embeddings; models are loaded from a \
+                                    local directory only — engram never downloads one.",
+                    "feature_enabled": cfg!(feature = "vector"),
+                    "model_cascade": ["--model-path", "ENGRAM_MODEL", "$XDG_DATA_HOME/engram/model (default ~/.local/share/engram/model)"],
+                    "search_modes": ["fts", "hybrid"],
+                    "auto_hybrid": "search/context use hybrid automatically when the feature is \
+                                    built in AND a model resolves AND vector_count(model) > 0; \
+                                    otherwise fts. Explicit --mode hybrid errors (exit 2) when a \
+                                    prerequisite is missing.",
+                    "index": "engram index [--scope S] [--batch N=500] [--dry-run] — embeds every \
+                              memory the resolved model has not indexed yet (rules skipped); \
+                              MCP/HTTP writes are picked up here, they never embed live"
+                },
                 "supersession": {
                     "description": "remember --supersedes closes the target's validity window \
                                     (valid_to + superseded_by) instead of deleting; reads default \
@@ -678,6 +804,143 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
             }
         }
     }
+}
+
+/// `engram index` — backfill embeddings for memories the resolved model has
+/// not indexed yet. Vector-feature builds only; see the sibling stub below
+/// for the structured refusal in a default build.
+#[cfg(feature = "vector")]
+fn run_index(
+    scope: Option<String>,
+    batch: u32,
+    dry_run: bool,
+    model_path: Option<std::path::PathBuf>,
+    store: &Arc<Mutex<Store>>,
+    mode: OutputMode,
+) -> i32 {
+    let Some(path) = embed::resolve_model_path(model_path.as_deref()) else {
+        return fail(
+            AppError::new(
+                error::ErrorCode::InvalidArgument,
+                2,
+                "no embedding model found",
+                "the model path cascade is: --model-path, then ENGRAM_MODEL, then \
+                 $XDG_DATA_HOME/engram/model (default ~/.local/share/engram/model); none exists — \
+                 place a Model2Vec model there yourself (engram never downloads anything)",
+            ),
+            mode,
+        );
+    };
+    let embedder = match embed::Embedder::load(&path) {
+        Ok(e) => e,
+        Err(e) => {
+            return fail(
+                AppError::new(
+                    error::ErrorCode::InvalidArgument,
+                    2,
+                    format!(
+                        "failed to load the embedding model at {}: {e}",
+                        path.display()
+                    ),
+                    "a Model2Vec model directory contains model.safetensors, tokenizer.json, \
+                     and config.json",
+                ),
+                mode,
+            )
+        }
+    };
+    let model = embedder.model_name().to_string();
+    let guard = store.lock().expect("store lock poisoned");
+
+    if dry_run {
+        // Count-only pass. Materializing the rows to count them is fine at
+        // engram's scale (the same no-index reasoning as brute-force cosine).
+        let pending = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
+            Ok(p) => p,
+            Err(e) => return fail(AppError::from(e), mode),
+        };
+        let data = serde_json::json!({
+            "model": model,
+            "dim": embedder.dim(),
+            "indexed": 0,
+            "remaining": pending.len(),
+        });
+        emit_ok(
+            Response::new("engram index --dry-run", data).with_dry_run(),
+            mode,
+        );
+        return 0;
+    }
+
+    let mut indexed: u64 = 0;
+    loop {
+        // Each embedded batch leaves the work queue, so the loop always
+        // fetches fresh work and terminates when the queue drains.
+        let batch_mems = match guard.unindexed_memories(&model, scope.as_deref(), batch.max(1)) {
+            Ok(b) => b,
+            Err(e) => return fail(AppError::from(e), mode),
+        };
+        if batch_mems.is_empty() {
+            break;
+        }
+        for mem in &batch_mems {
+            let vec = embedder.embed(&mem.content);
+            if let Err(e) = guard.vector_upsert(&mem.id, &model, &vec) {
+                return fail(AppError::from(e), mode);
+            }
+            indexed += 1;
+        }
+    }
+    let remaining = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
+        Ok(p) => p.len(),
+        Err(e) => return fail(AppError::from(e), mode),
+    };
+    let data = serde_json::json!({
+        "model": model,
+        "dim": embedder.dim(),
+        "indexed": indexed,
+        "remaining": remaining,
+    });
+    emit_ok(Response::new("engram index", data), mode);
+    0
+}
+
+/// `engram index` in a build without the vector feature: the command parses
+/// (schema stability across builds), then refuses with a structured error.
+#[cfg(not(feature = "vector"))]
+fn run_index(
+    _scope: Option<String>,
+    _batch: u32,
+    _dry_run: bool,
+    _model_path: Option<std::path::PathBuf>,
+    _store: &Arc<Mutex<Store>>,
+    mode: OutputMode,
+) -> i32 {
+    fail(
+        AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            "engram was built without the vector feature",
+            "rebuild with `cargo build --release --features vector`",
+        ),
+        mode,
+    )
+}
+
+/// Best-effort live embedding after a successful CLI `remember`.
+///
+/// Strictly fire-and-forget: a missing model, a load failure, or a write
+/// error must never fail (or even annotate) the remember — the memory is
+/// stored either way and `engram index` backfills whatever this skipped.
+/// CLI-only by design this milestone: MCP/HTTP keep their lock holds short
+/// and rely on the index command instead.
+#[cfg(feature = "vector")]
+fn try_embed_after_write(store: &Store, model_path: Option<&std::path::Path>, mem: &store::Memory) {
+    let Some(embedder) = embed::try_embedder(model_path) else {
+        return;
+    };
+    let vec = embedder.embed(&mem.content);
+    let _ = store.vector_upsert(&mem.id, embedder.model_name(), &vec);
 }
 
 /// Reads all of stdin, returning `None` when it is empty or unreadable.

@@ -160,6 +160,38 @@ pub struct RuleUpsert {
     pub created: bool,
 }
 
+/// A precomputed query embedding for the optional vector channel of
+/// [`Store::context`] and the hybrid search path.
+///
+/// Callers build one only after the auto-hybrid gate passes (vector feature
+/// compiled in, model resolved and loaded, at least one vector indexed) —
+/// the store itself never touches an embedding model, it only compares
+/// vectors it is handed.
+#[derive(Debug, Clone, Copy)]
+pub struct HybridQuery<'a> {
+    /// Model name, matched against `memory_vectors.model`.
+    pub model: &'a str,
+    /// The embedded query.
+    pub query_vec: &'a [f32],
+}
+
+/// Result of a [`Store::search_hybrid`]: the fused memories plus how many
+/// candidates each channel contributed, so callers can report
+/// `channels: {"fts": n, "vector": n}` in a budget envelope.
+#[derive(Debug)]
+pub struct HybridSearch {
+    /// Fused results, best rank first (reciprocal-rank-fusion order).
+    pub memories: Vec<Memory>,
+    /// Candidates the FTS channel fed into the fusion.
+    pub fts_candidates: usize,
+    /// Candidates the vector channel fed into the fusion.
+    pub vector_candidates: usize,
+}
+
+/// Candidates fetched per channel before hybrid fusion. Both the FTS and the
+/// vector channel feed their top-50 into [`crate::retrieval::rrf_fuse`].
+const HYBRID_CHANNEL_LIMIT: u32 = 50;
+
 /// A budget-packed context block assembled by [`Store::context`]: the
 /// scope's active rules first, then the memories that fit the remaining
 /// budget.
@@ -438,6 +470,246 @@ impl Store {
         rows.collect()
     }
 
+    /// Stores (or replaces) the embedding for a memory.
+    ///
+    /// `INSERT OR REPLACE` keyed on `memory_id`: re-indexing after a model
+    /// change overwrites in place, so a memory never carries two vectors.
+    /// The blob is the raw little-endian f32 array. Not feature-gated —
+    /// pure SQL, testable in every build with hand-built vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the write fails.
+    #[cfg_attr(
+        all(not(feature = "vector"), not(test)),
+        expect(
+            dead_code,
+            reason = "written to only by the vector-feature write paths (engram index, post-remember embedding) and by tests; the method stays compiled so the schema logic is one implementation"
+        )
+    )]
+    pub fn vector_upsert(
+        &self,
+        memory_id: &str,
+        model: &str,
+        embedding: &[f32],
+    ) -> rusqlite::Result<()> {
+        let mut blob = Vec::with_capacity(embedding.len() * 4);
+        for value in embedding {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO memory_vectors (memory_id, model, dim, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![memory_id, model, embedding.len() as i64, blob],
+        )?;
+        Ok(())
+    }
+
+    /// How many memories carry an embedding from `model`.
+    ///
+    /// This is the auto-hybrid gate's probe: zero means hybrid retrieval has
+    /// nothing to add and search stays FTS5-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails.
+    #[cfg_attr(
+        all(not(feature = "vector"), not(test)),
+        expect(
+            dead_code,
+            reason = "probed only by the vector-feature auto-hybrid gate and by tests; compiled everywhere so the query logic is one implementation"
+        )
+    )]
+    pub fn vector_count(&self, model: &str) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_vectors WHERE model = ?1",
+            params![model],
+            |row| row.get::<_, i64>(0).map(|n| n.max(0) as u64),
+        )
+    }
+
+    /// Memories that have no embedding from `model` yet — the `engram index`
+    /// work queue, oldest first so a resumed backfill stays deterministic.
+    ///
+    /// Rule rows are skipped: rules are policy, delivered through the rules
+    /// section of every context block, not retrieval candidates. Superseded
+    /// rows ARE included — hybrid search can read `--as-of`/`--include-superseded`
+    /// slices, so history needs vectors too.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails.
+    #[cfg_attr(
+        all(not(feature = "vector"), not(test)),
+        expect(
+            dead_code,
+            reason = "read only by the vector-feature `engram index` command and by tests; compiled everywhere so the query logic is one implementation"
+        )
+    )]
+    pub fn unindexed_memories(
+        &self,
+        model: &str,
+        scope: Option<&str>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Memory>> {
+        let scope_clause = if scope.is_some() {
+            "AND m.scope = ?3"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS_M} FROM memories m
+             WHERE m.rule_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_vectors v
+                   WHERE v.memory_id = m.id AND v.model = ?1
+               )
+               {scope_clause}
+             ORDER BY m.created_at ASC, m.id ASC LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&model, &limit];
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), row_to_memory)?;
+        rows.collect()
+    }
+
+    /// Nearest stored memories to a precomputed query vector, best first.
+    ///
+    /// Loads every candidate row for `model` (optionally narrowed to one
+    /// scope and a validity slice via the shared [`validity_filter`]),
+    /// brute-force cosines in Rust, sorts descending, and truncates to
+    /// `limit`. Brute force is the deliberate no-index choice — see
+    /// [`crate::embed::cosine`]. Rule rows never qualify, mirroring
+    /// [`Store::unindexed_memories`]. Not feature-gated: it takes a
+    /// precomputed vector, so it is testable without any model.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails.
+    pub fn vector_candidates(
+        &self,
+        query_vec: &[f32],
+        model: &str,
+        scope: Option<&str>,
+        limit: u32,
+        validity: Validity<'_>,
+    ) -> rusqlite::Result<Vec<(String, f32)>> {
+        let (clause, as_of) = validity_filter(validity, "m.", if scope.is_some() { 3 } else { 2 });
+        let sql = if scope.is_some() {
+            format!(
+                "SELECT v.memory_id, v.embedding
+                 FROM memory_vectors v JOIN memories m ON m.id = v.memory_id
+                 WHERE v.model = ?1 AND m.scope = ?2 AND m.rule_id IS NULL {clause}"
+            )
+        } else {
+            format!(
+                "SELECT v.memory_id, v.embedding
+                 FROM memory_vectors v JOIN memories m ON m.id = v.memory_id
+                 WHERE v.model = ?1 AND m.rule_id IS NULL {clause}"
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&model];
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        if let Some(t) = as_of.as_ref() {
+            bind.push(t);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((id, blob))
+        })?;
+
+        let mut scored: Vec<(String, f32)> = Vec::new();
+        for row in rows {
+            let (id, blob) = row?;
+            let vec: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact yields 4 bytes")))
+                .collect();
+            // A dimension mismatch (different-width model under the same
+            // name) cosines to 0.0 rather than erroring — see `cosine`.
+            scored.push((id, crate::embed::cosine(query_vec, &vec)));
+        }
+        // Deterministic total order: score descending, id ascending.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(scored)
+    }
+
+    /// Hybrid retrieval: FTS5 top-[`HYBRID_CHANNEL_LIMIT`] fused with the
+    /// vector top-[`HYBRID_CHANNEL_LIMIT`] by reciprocal rank fusion
+    /// (k = [`crate::retrieval::RRF_K`]), truncated to `limit`.
+    ///
+    /// Rule rows are dropped from both channels — policy is delivered
+    /// through the rules section, not through search. Both channels read the
+    /// same `validity` slice, so a superseded memory is invisible under
+    /// [`Validity::Current`] on either path. Not feature-gated: it takes a
+    /// precomputed query vector, so hand-built vectors exercise it in every
+    /// build.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if any query fails —
+    /// including the FTS syntax error an empty `query` produces, exactly as
+    /// [`Store::search`] does.
+    pub fn search_hybrid(
+        &self,
+        query: &str,
+        query_vec: &[f32],
+        model: &str,
+        scope: Option<&str>,
+        limit: u32,
+        validity: Validity<'_>,
+    ) -> rusqlite::Result<HybridSearch> {
+        use crate::retrieval::{rrf_fuse, RRF_K};
+        use std::collections::HashMap;
+
+        let fts: Vec<Memory> = self
+            .search(query, scope, HYBRID_CHANNEL_LIMIT, validity)?
+            .into_iter()
+            .filter(|m| m.rule_id.is_none())
+            .collect();
+        let vector_hits =
+            self.vector_candidates(query_vec, model, scope, HYBRID_CHANNEL_LIMIT, validity)?;
+
+        let fts_channel: Vec<String> = fts.iter().map(|m| m.id.clone()).collect();
+        let vector_channel: Vec<String> = vector_hits.into_iter().map(|(id, _)| id).collect();
+        let fts_candidates = fts_channel.len();
+        let vector_candidates = vector_channel.len();
+        let fused = rrf_fuse(&[fts_channel, vector_channel], RRF_K);
+
+        // The FTS channel already carries full rows; vector-only ids are
+        // fetched under the same validity slice (their rows passed it once
+        // already inside vector_candidates, so the get is a plain lookup).
+        let mut pool: HashMap<String, Memory> =
+            fts.into_iter().map(|m| (m.id.clone(), m)).collect();
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut memories: Vec<Memory> = Vec::new();
+        for (id, _score) in fused {
+            if memories.len() >= limit {
+                break;
+            }
+            let mem = match pool.remove(&id) {
+                Some(m) => Some(m),
+                None => self.get(&id, validity)?.filter(|m| m.rule_id.is_none()),
+            };
+            if let Some(m) = mem {
+                memories.push(m);
+            }
+        }
+        Ok(HybridSearch {
+            memories,
+            fts_candidates,
+            vector_candidates,
+        })
+    }
+
     /// Assembles a budget-packed context block for session start.
     ///
     /// Rules come first and are **always all included**, even when they alone
@@ -448,12 +720,16 @@ impl Store {
     /// Candidate *selection* order is newest-first recency when there is no
     /// query, or the reciprocal-rank fusion of the recency channel
     /// (newest-first) with the FTS relevance channel (rank order) when there
-    /// is one. *Presentation* is different: the included memories are
-    /// re-sorted chronologically, because a prompt reads best oldest-first
-    /// even though packing priority favors the newest and most relevant.
+    /// is one. When the caller additionally supplies a [`HybridQuery`] (the
+    /// auto-hybrid gate passed and the query was embedded), a third vector
+    /// channel joins the same fusion — the same auto rule as search.
+    /// *Presentation* is different: the included memories are re-sorted
+    /// chronologically, because a prompt reads best oldest-first even though
+    /// packing priority favors the newest and most relevant.
     ///
     /// A whitespace-only `query` is treated as no query at all — `search`
-    /// would reject the degenerate FTS expression with an error. Rule rows
+    /// would reject the degenerate FTS expression with an error — and the
+    /// vector channel is skipped with it (nothing was embedded). Rule rows
     /// that `recall`/`search` surface are skipped as candidates: they are
     /// already in the rules section and must not be double-counted.
     ///
@@ -466,6 +742,7 @@ impl Store {
         query: Option<&str>,
         limit: u32,
         budget_tokens: u32,
+        vector: Option<HybridQuery<'_>>,
     ) -> rusqlite::Result<ContextResult> {
         use crate::retrieval::{estimate_tokens, greedy_pack, BudgetReport, ESTIMATOR, RRF_K};
         use std::collections::{BTreeMap, HashMap, HashSet};
@@ -496,12 +773,30 @@ impl Store {
         let recency_count = recency.len();
         let relevance_count = relevance.len();
 
+        // Vector channel: only when a query ran AND the caller embedded it
+        // (the auto-hybrid gate lives at the surfaces; a `Some` here means it
+        // passed). Same validity slice as the other channels.
+        let vector_ids: Vec<String> = match (query, vector) {
+            (Some(_), Some(v)) => self
+                .vector_candidates(v.query_vec, v.model, Some(scope), limit, Validity::Current)?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let vector_count = vector_ids.len();
+        let vector_ran = query.is_some() && vector.is_some();
+
         // Selection priority: fused when a query ran, plain newest-first
         // otherwise. `rrf_fuse` dedupes ids across channels by construction.
         let priority_ids: Vec<String> = if query.is_some() {
             let recency_channel: Vec<String> = recency.iter().rev().map(|m| m.id.clone()).collect();
             let relevance_channel: Vec<String> = relevance.iter().map(|m| m.id.clone()).collect();
-            crate::retrieval::rrf_fuse(&[recency_channel, relevance_channel], RRF_K)
+            let mut channels = vec![recency_channel, relevance_channel];
+            if vector_ran {
+                channels.push(vector_ids.clone());
+            }
+            crate::retrieval::rrf_fuse(&channels, RRF_K)
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect()
@@ -509,11 +804,24 @@ impl Store {
             recency.iter().rev().map(|m| m.id.clone()).collect()
         };
 
-        // Union of both channels, keyed by id so an id appearing in both is
+        // Union of the channels, keyed by id so an id appearing in several is
         // included once.
         let mut pool: HashMap<String, Memory> = HashMap::new();
         for m in recency.into_iter().chain(relevance) {
             pool.entry(m.id.clone()).or_insert(m);
+        }
+        // Vector-only hits carry no row yet; fetch them under the same
+        // Current view the other channels used (rule rows never qualify —
+        // vector_candidates already excludes them, this is belt-and-braces).
+        for id in &vector_ids {
+            if !pool.contains_key(id) {
+                if let Some(m) = self
+                    .get(id, Validity::Current)?
+                    .filter(|m| m.rule_id.is_none())
+                {
+                    pool.insert(m.id.clone(), m);
+                }
+            }
         }
 
         let remaining = budget_tokens.saturating_sub(rules_tokens);
@@ -550,6 +858,9 @@ impl Store {
         channels.insert("recency", recency_count);
         if query.is_some() {
             channels.insert("fts", relevance_count);
+        }
+        if vector_ran {
+            channels.insert("vector", vector_count);
         }
 
         let budget = BudgetReport {
@@ -858,6 +1169,20 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_rule
          ON memories(scope, rule_id) WHERE rule_id IS NOT NULL;",
     )?;
+    // Vector sidecar (M3). Deliberately NOT feature-gated: the table simply
+    // stays empty in a build without the `vector` feature, and a database
+    // touched by a vector-enabled binary keeps working everywhere else.
+    // `embedding` is a little-endian f32 array, `dim` entries long; `model`
+    // names the embedding model so vectors from different models are never
+    // compared against each other.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_vectors (
+            memory_id TEXT PRIMARY KEY REFERENCES memories(id),
+            model     TEXT NOT NULL,
+            dim       INTEGER NOT NULL,
+            embedding BLOB NOT NULL
+        );",
+    )?;
     Ok(())
 }
 
@@ -870,16 +1195,24 @@ fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>
 /// FTS5 treats AND/OR/NOT/NEAR, quotes, parens, `*`, `:`, `-` as query
 /// syntax. A user's or agent's free-text query ("what did we decide about
 /// GraphQL - and why not REST?") is not a query language expression; it's
-/// data. Wrap each token as an escaped quoted phrase so implicit AND still
-/// works across tokens but no character inside a token can be interpreted
-/// as an operator. This is the exact class of bug the TencentDB Agent
-/// Memory project had to patch (fts5-query-sanitization) — worth avoiding
-/// from the start.
+/// data. Wrap each token as an escaped quoted phrase so no character inside
+/// a token can be interpreted as an operator. This is the exact class of
+/// bug the TencentDB Agent Memory project had to patch
+/// (fts5-query-sanitization) — worth avoiding from the start.
+///
+/// Tokens are joined with `OR`, not FTS5's implicit `AND`: memory queries
+/// are natural language ("why did the binary lose its symbols"), and
+/// requiring *every* token to appear zeroes out any query with a filler
+/// word the stored text lacks. The M3 benchmark measured the difference on
+/// engineer-typed queries: AND-joined recall@5 was 0.108, OR-joined 0.856
+/// (bench/RESULTS.md). BM25 ranking still rewards documents matching more
+/// of the tokens, so precision survives the looser match — and `--limit`
+/// caps the tail.
 fn sanitize_fts_query(raw: &str) -> String {
     raw.split_whitespace()
         .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
 }
 
 /// The full `memories` column list every read shares, in [`row_to_memory`]
@@ -1371,7 +1704,7 @@ mod tests {
         remember_spaced(&store, "ctx", "a message");
         remember_spaced(&store, "ctx", "another message");
 
-        let ctx = store.context("ctx", None, 50, 10).expect("context");
+        let ctx = store.context("ctx", None, 50, 10, None).expect("context");
         assert_eq!(ctx.rules.len(), 1, "policy is never silently dropped");
         assert!(
             ctx.rules_tokens > 10,
@@ -1401,7 +1734,9 @@ mod tests {
             remember_spaced(&store, "ctx-recency", content);
         }
 
-        let ctx = store.context("ctx-recency", None, 50, 12).expect("context");
+        let ctx = store
+            .context("ctx-recency", None, 50, 12, None)
+            .expect("context");
         let contents: Vec<&str> = ctx.memories.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             contents,
@@ -1432,7 +1767,7 @@ mod tests {
             remember_spaced(&store, scope, content);
         }
 
-        let without_query = store.context(scope, None, 50, 12).expect("context");
+        let without_query = store.context(scope, None, 50, 12, None).expect("context");
         assert!(
             !without_query
                 .memories
@@ -1442,7 +1777,7 @@ mod tests {
         );
 
         let with_query = store
-            .context(scope, Some("launch"), 50, 12)
+            .context(scope, Some("launch"), 50, 12, None)
             .expect("context with query");
         assert!(
             with_query
@@ -1460,7 +1795,9 @@ mod tests {
         assert_eq!(with_query.budget.channels[&"recency"], 5);
 
         // A whitespace-only query is treated as no query, not a search error.
-        let blank = store.context(scope, Some("   "), 50, 12).expect("context");
+        let blank = store
+            .context(scope, Some("   "), 50, 12, None)
+            .expect("context");
         assert!(!blank.budget.channels.contains_key("fts"));
     }
 
@@ -1481,7 +1818,7 @@ mod tests {
         // Generous budget; the query matches the rule text, so search
         // surfaces the rule row — it must still be filtered from memories.
         let ctx = store
-            .context(scope, Some("expose port"), 50, 1000)
+            .context(scope, Some("expose port"), 50, 1000, None)
             .expect("context");
         assert_eq!(ctx.rules.len(), 1);
         assert!(
@@ -1630,6 +1967,367 @@ mod tests {
         // Failure outcomes inserted nothing.
         assert_eq!(count(&store), after_valid);
         assert_eq!(after_valid, before + 1); // only B was ever added
+    }
+
+    // ---- M3: vector storage + hybrid fusion ------------------------------
+    //
+    // All hand-built vectors — no embedding model anywhere. These run in
+    // every feature set: the storage and fusion layer is deliberately not
+    // feature-gated, only the model-loading glue is.
+
+    #[test]
+    fn vector_upsert_round_trips_and_replaces_in_place() {
+        let store = Store::open_in_memory().expect("open");
+        let mem = store
+            .remember("a", "vec", "note", "the fact")
+            .expect("remember");
+
+        store
+            .vector_upsert(&mem.id, "test-model", &[1.0, 2.5, -3.0])
+            .expect("upsert");
+        assert_eq!(store.vector_count("test-model").expect("count"), 1);
+        assert_eq!(
+            store.vector_count("other-model").expect("count"),
+            0,
+            "counts are per model"
+        );
+
+        // Byte-exact round trip through the little-endian blob: an identical
+        // query vector must cosine to exactly 1.0.
+        let hits = store
+            .vector_candidates(&[1.0, 2.5, -3.0], "test-model", None, 10, Validity::Current)
+            .expect("candidates");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, mem.id);
+        assert!((hits[0].1 - 1.0).abs() < 1e-6, "score: {}", hits[0].1);
+
+        // Upsert replaces: same memory, new vector, still one row.
+        store
+            .vector_upsert(&mem.id, "test-model", &[0.0, 1.0, 0.0])
+            .expect("re-upsert");
+        assert_eq!(store.vector_count("test-model").expect("count"), 1);
+        let hits = store
+            .vector_candidates(&[0.0, 1.0, 0.0], "test-model", None, 10, Validity::Current)
+            .expect("candidates");
+        assert!((hits[0].1 - 1.0).abs() < 1e-6, "the new vector is in force");
+    }
+
+    #[test]
+    fn vector_candidates_orders_by_cosine_and_respects_scope_and_validity() {
+        let store = Store::open_in_memory().expect("open");
+        let near = store.remember("a", "s1", "note", "near").expect("remember");
+        let far = store.remember("a", "s1", "note", "far").expect("remember");
+        let other = store
+            .remember("a", "s2", "note", "other scope")
+            .expect("remember");
+        store
+            .vector_upsert(&near.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        store
+            .vector_upsert(&far.id, "m", &[0.0, 1.0])
+            .expect("upsert");
+        store
+            .vector_upsert(&other.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+
+        // Cosine ordering, across scopes.
+        let hits = store
+            .vector_candidates(&[1.0, 0.1], "m", None, 10, Validity::Current)
+            .expect("candidates");
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[2], far.id, "the orthogonal vector ranks last");
+        assert!(hits[0].1 > hits[2].1, "scores are descending");
+
+        // Scope filter.
+        let hits = store
+            .vector_candidates(&[1.0, 0.0], "m", Some("s2"), 10, Validity::Current)
+            .expect("candidates");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, other.id);
+
+        // Limit truncates after sorting.
+        let hits = store
+            .vector_candidates(&[1.0, 0.1], "m", Some("s1"), 1, Validity::Current)
+            .expect("candidates");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, near.id, "truncation keeps the best-scoring hit");
+
+        // Validity: superseding `near` hides it from Current but not All.
+        let replacement = store
+            .remember_superseding("a", "s1", "note", "corrected", &near.id)
+            .expect("supersede")
+            .memory
+            .expect("stored");
+        store
+            .vector_upsert(&replacement.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        let current = store
+            .vector_candidates(&[1.0, 0.0], "m", Some("s1"), 10, Validity::Current)
+            .expect("candidates");
+        assert!(
+            current.iter().all(|(id, _)| *id != near.id),
+            "superseded rows are invisible under Current"
+        );
+        let all = store
+            .vector_candidates(&[1.0, 0.0], "m", Some("s1"), 10, Validity::All)
+            .expect("candidates");
+        assert!(
+            all.iter().any(|(id, _)| *id == near.id),
+            "the full history still reaches them"
+        );
+    }
+
+    #[test]
+    fn vector_candidates_scores_zero_on_dimension_mismatch() {
+        let store = Store::open_in_memory().expect("open");
+        let mem = store
+            .remember("a", "s", "note", "3d row")
+            .expect("remember");
+        store
+            .vector_upsert(&mem.id, "m", &[1.0, 2.0, 3.0])
+            .expect("upsert");
+        let hits = store
+            .vector_candidates(&[1.0, 2.0], "m", None, 10, Validity::Current)
+            .expect("candidates");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 0.0, "a width mismatch scores 0.0, never errors");
+    }
+
+    #[test]
+    fn unindexed_memories_skips_rules_and_already_indexed_rows() {
+        let store = Store::open_in_memory().expect("open");
+        let first = store.remember("a", "s", "note", "one").expect("remember");
+        let second = store.remember("a", "s", "note", "two").expect("remember");
+        store
+            .rule_add("a", "s", "some-policy", "Policy.")
+            .expect("rule");
+
+        let pending = store.unindexed_memories("m", None, 100).expect("unindexed");
+        let ids: Vec<&str> = pending.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "the rule row is not a retrieval candidate");
+        assert!(ids.contains(&first.id.as_str()));
+        assert!(ids.contains(&second.id.as_str()));
+
+        store.vector_upsert(&first.id, "m", &[1.0]).expect("upsert");
+        let pending = store.unindexed_memories("m", None, 100).expect("unindexed");
+        assert_eq!(pending.len(), 1, "an indexed row leaves the work queue");
+        assert_eq!(pending[0].id, second.id);
+
+        // Per-model: the other model still sees both.
+        assert_eq!(
+            store
+                .unindexed_memories("other", None, 100)
+                .expect("unindexed")
+                .len(),
+            2
+        );
+
+        // Scope filter narrows the queue.
+        store
+            .remember("a", "elsewhere", "note", "three")
+            .expect("remember");
+        assert_eq!(
+            store
+                .unindexed_memories("m", Some("s"), 100)
+                .expect("unindexed")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_hybrid_pulls_a_vector_only_hit_into_the_results() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "hybrid";
+        let textual = store
+            .remember("a", scope, "note", "the launch window opens at dawn")
+            .expect("remember");
+        // No shared vocabulary with the query — FTS5 alone can never find it.
+        let semantic = store
+            .remember("a", scope, "note", "liftoff begins when the sun rises")
+            .expect("remember");
+        store
+            .vector_upsert(&textual.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        store
+            .vector_upsert(&semantic.id, "m", &[0.9, 0.1])
+            .expect("upsert");
+
+        // FTS finds only `textual`; the query vector is near both.
+        let fts_only = store
+            .search("launch window", Some(scope), 10, Validity::Current)
+            .expect("search");
+        assert_eq!(
+            fts_only.len(),
+            1,
+            "precondition: FTS alone misses the paraphrase"
+        );
+
+        let hybrid = store
+            .search_hybrid(
+                "launch window",
+                &[1.0, 0.05],
+                "m",
+                Some(scope),
+                10,
+                Validity::Current,
+            )
+            .expect("hybrid");
+        let ids: Vec<&str> = hybrid.memories.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&textual.id.as_str()));
+        assert!(
+            ids.contains(&semantic.id.as_str()),
+            "the vector channel rescues the paraphrase: {ids:?}"
+        );
+        assert_eq!(
+            ids[0], textual.id,
+            "the id in both channels outranks the vector-only one"
+        );
+        assert_eq!(hybrid.fts_candidates, 1);
+        assert_eq!(hybrid.vector_candidates, 2);
+
+        // Limit still applies to the fused list.
+        let one = store
+            .search_hybrid(
+                "launch window",
+                &[1.0, 0.05],
+                "m",
+                Some(scope),
+                1,
+                Validity::Current,
+            )
+            .expect("hybrid");
+        assert_eq!(one.memories.len(), 1);
+    }
+
+    #[test]
+    fn search_hybrid_excludes_superseded_rows_under_current_and_skips_rules() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "hybrid-validity";
+        let stale = store
+            .remember("a", scope, "note", "telemetry cadence is five seconds")
+            .expect("remember");
+        store
+            .vector_upsert(&stale.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        let fresh = store
+            .remember_superseding(
+                "a",
+                scope,
+                "note",
+                "telemetry cadence is one second",
+                &stale.id,
+            )
+            .expect("supersede")
+            .memory
+            .expect("stored");
+        store
+            .vector_upsert(&fresh.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+        // A rule row that matches the query textually AND carries a vector
+        // (hand-inserted; the index command would never do this).
+        store
+            .rule_add(
+                "a",
+                scope,
+                "telemetry-policy",
+                "telemetry cadence is policy",
+            )
+            .expect("rule");
+        let rule_row_id: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE rule_id = 'telemetry-policy'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rule row id");
+        store
+            .vector_upsert(&rule_row_id, "m", &[1.0, 0.0])
+            .expect("upsert");
+
+        let current = store
+            .search_hybrid(
+                "telemetry cadence",
+                &[1.0, 0.0],
+                "m",
+                Some(scope),
+                10,
+                Validity::Current,
+            )
+            .expect("hybrid");
+        let ids: Vec<&str> = current.memories.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![fresh.id.as_str()],
+            "only the current truth: {ids:?}"
+        );
+
+        let all = store
+            .search_hybrid(
+                "telemetry cadence",
+                &[1.0, 0.0],
+                "m",
+                Some(scope),
+                10,
+                Validity::All,
+            )
+            .expect("hybrid");
+        assert_eq!(
+            all.memories.len(),
+            2,
+            "the full history keeps both versions but never the rule row"
+        );
+    }
+
+    #[test]
+    fn context_vector_channel_rescues_a_semantic_match_and_reports_it() {
+        let store = Store::open_in_memory().expect("open");
+        let scope = "ctx-vector";
+        // The paraphrase is oldest and shares no vocabulary with the query;
+        // then enough chatter that recency alone (at this budget) drops it.
+        let semantic = store
+            .remember("a", scope, "note", "liftoff begins when the sun rises")
+            .expect("remember");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for content in [
+            "irrelevant chatter one",
+            "irrelevant chatter two",
+            "irrelevant chatter three",
+            "irrelevant chatter four",
+        ] {
+            remember_spaced(&store, scope, content);
+        }
+        store
+            .vector_upsert(&semantic.id, "m", &[1.0, 0.0])
+            .expect("upsert");
+
+        let vector = HybridQuery {
+            model: "m",
+            query_vec: &[1.0, 0.05],
+        };
+        let ctx = store
+            .context(scope, Some("launch"), 50, 12, Some(vector))
+            .expect("context");
+        assert!(
+            ctx.memories.iter().any(|m| m.id == semantic.id),
+            "the vector channel pulls the paraphrase in: {:?}",
+            ctx.memories
+        );
+        assert_eq!(ctx.budget.channels[&"vector"], 1);
+
+        // Without the vector, the same call must not report the channel.
+        let ctx = store
+            .context(scope, Some("launch"), 50, 12, None)
+            .expect("context");
+        assert!(!ctx.budget.channels.contains_key("vector"));
+
+        // No query means no vector channel even when a vector is supplied.
+        let ctx = store
+            .context(scope, None, 50, 12, Some(vector))
+            .expect("context");
+        assert!(!ctx.budget.channels.contains_key("vector"));
     }
 
     #[test]

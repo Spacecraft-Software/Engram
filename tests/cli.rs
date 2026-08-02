@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 /// Env vars that would leak the host's agent/CI context into the mode
 /// cascade, scope resolution, agent defaults, or `metadata.tool_agent`.
-const HERMETIC_VARS: [&str; 11] = [
+const HERMETIC_VARS: [&str; 12] = [
     "AI_AGENT",
     "AGENT",
     "CI",
@@ -25,6 +25,7 @@ const HERMETIC_VARS: [&str; 11] = [
     "ENGRAM_DB",
     "ENGRAM_SCOPE",
     "ENGRAM_AGENT",
+    "ENGRAM_MODEL",
     "CLAUDECODE",
     "CURSOR_AGENT",
     "GEMINI_CLI",
@@ -36,6 +37,14 @@ fn engram(db: &Path) -> Command {
     for var in HERMETIC_VARS {
         cmd.env_remove(var);
     }
+    // Point the model cascade's XDG fallback at a directory that has no
+    // engram/model in it, so a Model2Vec model installed on the developer's
+    // machine (~/.local/share/engram/model) can never leak into a
+    // vector-feature test run and silently flip search to hybrid.
+    cmd.env(
+        "XDG_DATA_HOME",
+        db.parent().expect("db lives in a tempdir").join("xdg-data"),
+    );
     // `--db` is a top-level (non-global) flag, so it must precede the
     // subcommand; the helper adds it first, callers append the rest.
     cmd.arg("--db").arg(db);
@@ -751,6 +760,145 @@ fn as_of_validates_and_conflicts_with_include_superseded() {
         .assert()
         .failure()
         .code(2);
+}
+
+// --- M3: vector feature gates -------------------------------------------
+
+/// `engram index` always parses, and always refuses with a structured exit-2
+/// error when it cannot run: in a default build because the vector feature
+/// is compiled out, in a vector build because this hermetic environment
+/// resolves no model. Either way the refusal is INVALID_ARGUMENT with a
+/// non-empty hint — never a panic, never a silent success.
+#[test]
+fn index_without_a_usable_model_is_invalid_argument() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+
+    let assert = engram(&db).arg("index").assert().failure().code(2);
+    let err = parse_single_line_json(&assert.get_output().stderr);
+    assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
+    let hint = err["error"]["hint"].as_str().expect("hint is a string");
+    assert!(!hint.is_empty(), "the refusal explains the next step");
+    if cfg!(feature = "vector") {
+        assert!(
+            hint.contains("--model-path") && hint.contains("ENGRAM_MODEL"),
+            "the vector build explains the model cascade: {hint}"
+        );
+    } else {
+        assert!(
+            hint.contains("--features vector"),
+            "the default build names the missing feature: {hint}"
+        );
+    }
+}
+
+/// `--mode fts` always works; `--mode hybrid` without its prerequisites is a
+/// structured exit-2 error in every build (missing feature, missing model,
+/// or nothing indexed — this hermetic environment guarantees at least one).
+#[test]
+fn search_mode_flag_gates_hybrid_and_keeps_fts_available() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    remember(&db, "a", "mode-scope", "the antenna is aligned");
+
+    let assert = engram(&db)
+        .args([
+            "search",
+            "antenna",
+            "--scope",
+            "mode-scope",
+            "--mode",
+            "fts",
+        ])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(envelope["data"].as_array().map(Vec::len), Some(1));
+
+    let assert = engram(&db)
+        .args(["search", "antenna", "--mode", "hybrid"])
+        .assert()
+        .failure()
+        .code(2);
+    let err = parse_single_line_json(&assert.get_output().stderr);
+    assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
+    assert!(
+        !err["error"]["hint"].as_str().expect("hint").is_empty(),
+        "the refusal explains what is missing"
+    );
+}
+
+/// The capability manifest advertises the index command and the vector
+/// posture, including whether this binary was built with the feature.
+#[test]
+fn describe_advertises_index_and_the_vector_posture() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let assert = engram(&db).arg("describe").assert().success();
+    let manifest = parse_json(&assert.get_output().stdout);
+    let commands = manifest["commands"]
+        .as_array()
+        .expect("describe .commands is an array");
+    assert!(
+        commands.iter().any(|c| c == "index"),
+        "describe must advertise index, got {commands:?}"
+    );
+    assert_eq!(
+        manifest["vector"]["feature_enabled"],
+        cfg!(feature = "vector"),
+        "feature_enabled reflects the build"
+    );
+    assert!(
+        manifest["vector"]["model_cascade"].is_array(),
+        "the model cascade is machine-readable"
+    );
+}
+
+/// Full local end-to-end: index a scope with a real Model2Vec model, then
+/// search it in hybrid mode. Needs a model on disk, which CI runners and
+/// most dev machines do not have — run explicitly with
+/// `ENGRAM_TEST_MODEL=/path/to/model cargo test --features vector -- --ignored`.
+#[cfg(feature = "vector")]
+#[test]
+#[ignore = "needs a local model2vec model (set ENGRAM_TEST_MODEL to its directory)"]
+fn index_then_hybrid_search_with_a_real_model() {
+    let model = std::env::var("ENGRAM_TEST_MODEL")
+        .expect("set ENGRAM_TEST_MODEL to a Model2Vec model directory");
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "e2e-hybrid";
+
+    remember(&db, "a", scope, "the launch window opens at dawn");
+    remember(&db, "a", scope, "liftoff begins when the sun rises");
+
+    let assert = engram(&db)
+        .args(["--model-path", &model, "index", "--scope", scope])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(envelope["data"]["indexed"], 2);
+    assert_eq!(envelope["data"]["remaining"], 0);
+    assert!(envelope["data"]["dim"].as_u64().is_some_and(|d| d > 0));
+
+    let assert = engram(&db)
+        .args([
+            "--model-path",
+            &model,
+            "search",
+            "launch",
+            "--scope",
+            scope,
+            "--mode",
+            "hybrid",
+        ])
+        .assert()
+        .success();
+    let envelope = parse_single_line_json(&assert.get_output().stdout);
+    let hits = envelope["data"].as_array().expect("data is an array");
+    assert!(
+        !hits.is_empty(),
+        "hybrid search returns results: {envelope}"
+    );
 }
 
 #[test]

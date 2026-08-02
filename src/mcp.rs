@@ -255,7 +255,10 @@ impl EngramMcp {
     }
 
     #[tool(
-        description = "Full-text search across stored memories, optionally restricted to one scope."
+        description = "Full-text search across stored memories, optionally restricted to one scope. \
+                       When the server was built with the vector feature, a local model resolves, \
+                       and `engram index` has run, results are hybrid (FTS5 + vector, rank-fused) \
+                       automatically — there is no mode parameter; the schema is identical either way."
     )]
     async fn search(
         &self,
@@ -263,15 +266,46 @@ impl EngramMcp {
     ) -> Result<CallToolResult, McpError> {
         let validity = mcp_validity(args.as_of.as_deref(), args.include_superseded)?;
         let store = self.store.lock().map_err(lock_err)?;
-        let mems = store
-            .search(&args.query, args.scope.as_deref(), args.limit, validity)
-            .map_err(store_err)?;
-        let text = match args.budget_tokens {
-            Some(budget) => {
-                let (mems, report) = crate::retrieval::budget_search(mems, budget);
-                serde_json::json!({ "memories": mems, "budget": report }).to_string()
+        // Auto rule only (no MCP mode parameter — the tool schema stays
+        // stable): hybrid when the gate passes, FTS5-only otherwise.
+        let ready = crate::embed::try_hybrid(&store, None, &args.query).ok();
+        let text = match ready {
+            Some(ready) => {
+                let hybrid = store
+                    .search_hybrid(
+                        &args.query,
+                        &ready.query_vec,
+                        &ready.model,
+                        args.scope.as_deref(),
+                        args.limit,
+                        validity,
+                    )
+                    .map_err(store_err)?;
+                match args.budget_tokens {
+                    Some(budget) => {
+                        let (mems, mut report) =
+                            crate::retrieval::budget_search(hybrid.memories, budget);
+                        report.channels = std::collections::BTreeMap::from([
+                            ("fts", hybrid.fts_candidates),
+                            ("vector", hybrid.vector_candidates),
+                        ]);
+                        serde_json::json!({ "memories": mems, "budget": report }).to_string()
+                    }
+                    None => serde_json::to_string(&hybrid.memories).unwrap_or_default(),
+                }
             }
-            None => serde_json::to_string(&mems).unwrap_or_default(),
+            None => {
+                let mems = store
+                    .search(&args.query, args.scope.as_deref(), args.limit, validity)
+                    .map_err(store_err)?;
+                match args.budget_tokens {
+                    Some(budget) => {
+                        let (mems, report) = crate::retrieval::budget_search(mems, budget);
+                        serde_json::json!({ "memories": mems, "budget": report }).to_string()
+                    }
+                    None => serde_json::to_string(&mems).unwrap_or_default(),
+                }
+            }
         };
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
@@ -448,12 +482,25 @@ impl EngramMcp {
     ) -> Result<CallToolResult, McpError> {
         let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
         let store = self.store.lock().map_err(lock_err)?;
+        // Same auto rule as the search tool: a vector channel joins the
+        // fusion only when the hybrid gate passes.
+        let ready = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .and_then(|q| crate::embed::try_hybrid(&store, None, q).ok());
+        let vector = ready.as_ref().map(|r| crate::store::HybridQuery {
+            model: &r.model,
+            query_vec: &r.query_vec,
+        });
         let ctx = store
             .context(
                 &resolved.name,
                 args.query.as_deref(),
                 args.limit,
                 args.budget_tokens,
+                vector,
             )
             .map_err(store_err)?;
         let payload = serde_json::json!({

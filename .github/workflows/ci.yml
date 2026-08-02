@@ -38,8 +38,9 @@ jobs:
       fail-fast: false
       matrix:
         features: ["", "vector"]
-    # vector feature lands at M3; leg is advisory until then
-    continue-on-error: ${{ matrix.features == 'vector' }}
+    # Both legs are required: the vector feature landed at M3. Its clippy
+    # coverage rides here via cargo test's build; the dedicated clippy job
+    # covers the default set.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
