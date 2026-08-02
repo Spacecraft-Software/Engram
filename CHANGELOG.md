@@ -39,7 +39,7 @@ the 0.3/0.4 development cycle in one release.
 ### Security
 - `cargo audit` assessed: RUSTSEC-2026-0189 (rmcp 0.16 Streamable-HTTP DNS
   rebinding) does not apply — engram compiles only rmcp's stdio transport;
-  suppressed with reasoning in `audit.toml`, to be dropped with the tracked
+  suppressed with reasoning in `.cargo/audit.toml`, to be dropped with the tracked
   rmcp ≥ 1.4 upgrade. Two unmaintained-crate warnings (`paste`,
   `number_prefix`) are transitive and advisory-only.
 
