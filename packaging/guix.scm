@@ -19,7 +19,7 @@
 (define-public engram
   (package
     (name "engram")
-    (version "0.2.0")
+    (version "0.5.0")
     ;; Release stanza — swap in at the first tagged release:
     ;;
     ;; (source

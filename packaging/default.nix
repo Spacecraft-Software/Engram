@@ -13,7 +13,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "engram";
-  version = "0.2.0";
+  version = "0.5.0";
 
   # Local source: 0.2.0-dev is unreleased, so build the repository checkout
   # this file lives in.  The filter keeps build artifacts, the local

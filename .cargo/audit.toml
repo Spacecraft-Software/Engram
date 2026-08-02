@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad & Spacecraft Software
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# cargo-audit policy (Standard §3.3). Every ignore carries its reasoning;
+# re-evaluate each entry whenever the named dependency is upgraded.
+
+[advisories]
+ignore = [
+    # rmcp 0.16: DNS rebinding in the *Streamable HTTP server* transport.
+    # Engram compiles rmcp with only the stdio transport (features: server,
+    # transport-io, macros) — the vulnerable transport is not enabled and
+    # not in the binary; engram's own HTTP surface is axum, bound to
+    # 127.0.0.1. The 0.16 pin is deliberate (documented macro fragility);
+    # upgrading to rmcp >= 1.4 is tracked as post-0.5.0 work and this entry
+    # MUST be dropped with that upgrade.
+    "RUSTSEC-2026-0189",
+]

@@ -8,7 +8,7 @@
 @settitle Engram Manual
 @c %**end of header
 
-@set VERSION 0.3.0-dev
+@set VERSION 0.5.0
 @set UPDATED 2026-08-02
 
 @copying
@@ -373,13 +373,6 @@ Rule rows are never embedded: policy is delivered through the rules
 section of @command{engram context}, not through retrieval.  Requires
 a build with the @code{vector} feature and a local Model2Vec model
 directory.
-
-With @code{--budget-tokens}, the ranked results are packed to a token
-budget in rank order --- relevance ordering is the point of a search
-result, so it is both the packing priority and the output order.  An
-over-budget hit is dropped and later, smaller hits are still tried.
-The envelope reports the same @code{metadata.budget} object as
-@command{engram recall}.
 
 @section engram context
 

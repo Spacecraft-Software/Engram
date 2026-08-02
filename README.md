@@ -10,7 +10,7 @@ raw text out, full-text searchable.
 
 ## Status
 
-**0.2.0-dev.** Builds and runs against the pinned `rmcp` 0.16. The MCP stdio
+**0.5.0.** Builds and runs against the pinned `rmcp` 0.16. The MCP stdio
 handshake tolerates a leading non-`initialize` probe (some hosts, e.g.
 Antigravity, send a proprietary discovery request first) — see `src/mcp.rs`.
 
