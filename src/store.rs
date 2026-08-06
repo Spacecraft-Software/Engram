@@ -53,6 +53,26 @@ pub struct Memory {
     pub superseded_by: Option<String>,
 }
 
+/// One transcript turn on its way into the store, with a caller-supplied
+/// deterministic id (see [`Store::ingest_turns`]).
+#[derive(Debug, Clone)]
+pub struct IngestTurn {
+    pub id: String,
+    pub agent: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// What one [`Store::ingest_turns`] call did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct IngestReport {
+    pub inserted: usize,
+    /// Turns already present from an earlier ingest of the same session —
+    /// the number that proves the operation is idempotent.
+    pub skipped_existing: usize,
+}
+
 /// Which slice of the bi-temporal history a read should see.
 ///
 /// `status` (the rules lifecycle column) is a separate axis entirely:
@@ -658,6 +678,91 @@ impl Store {
         let mut out: Vec<Memory> = rows.collect::<Result<_, _>>()?;
         out.reverse(); // chronological for reading back into a prompt
         Ok(out)
+    }
+
+    /// One transcript turn on its way into the store.
+    ///
+    /// Unlike [`Store::remember`], the id is supplied by the caller: it is a
+    /// deterministic function of the source record (see
+    /// [`crate::transcript::turn_id`]), which is what makes re-ingesting a
+    /// session a no-op.
+    ///
+    /// Bulk-inserts transcript turns, skipping any already present.
+    ///
+    /// `INSERT OR IGNORE` inside one transaction. Two consequences worth
+    /// stating: re-ingesting a session inserts nothing and resuming a live
+    /// one inserts only the new tail; and because `OR IGNORE` never deletes,
+    /// the external-content FTS `AFTER INSERT` trigger fires exactly for rows
+    /// that really landed, so the index cannot drift. (Contrast
+    /// [`Store::extract_facts`], which uses `INSERT OR REPLACE` and therefore
+    /// depends on `recursive_triggers`.)
+    ///
+    /// `created_at` is the **transcript's** timestamp, not now. That bends
+    /// the usual "created_at is transaction time" reading, and it has to:
+    /// `recall` orders by `created_at`, so stamping a whole conversation with
+    /// one wall-clock instant would destroy its reading order. `valid_from`
+    /// is set to the same value so the bi-temporal view agrees.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the transaction fails.
+    pub fn ingest_turns(
+        &mut self,
+        scope: &str,
+        turns: &[IngestTurn],
+    ) -> rusqlite::Result<IngestReport> {
+        let tx = self.conn.transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO memories
+                 (id, agent, scope, role, content, created_at, valid_from)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            )?;
+            for turn in turns {
+                inserted += stmt.execute(params![
+                    turn.id,
+                    turn.agent,
+                    scope,
+                    turn.role,
+                    turn.content,
+                    turn.created_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(IngestReport {
+            inserted,
+            skipped_existing: turns.len() - inserted,
+        })
+    }
+
+    /// Every message in a scope, chronological, for archival export.
+    ///
+    /// Three deliberate differences from [`Store::recall`], each of which was
+    /// a defect when `save-chat` used `recall` instead:
+    ///
+    /// * **Untracked.** Archiving is not reading. Bumping `access_count` here
+    ///   would make every exported memory look freshly used and corrupt the
+    ///   decay signal `consolidate --report` computes — the same distinction
+    ///   the `--no-track` flag exists to draw.
+    /// * **Rules excluded.** An archive is a transcript. Rules have their own
+    ///   delivery mechanism ([`crate::rules`]) and would otherwise interleave
+    ///   into the narrative by `created_at`.
+    /// * **No validity filter.** Superseded rows stay in the archive: it is a
+    ///   record of what was said, not a view of what is currently true.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if the query fails.
+    pub fn export_history(&self, scope: &str) -> rusqlite::Result<Vec<Memory>> {
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories
+             WHERE scope = ?1 AND role <> ?2 ORDER BY created_at ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![scope, crate::rules::ROLE], row_to_memory)?;
+        rows.collect()
     }
 
     /// Full-text search across all scopes, or restricted to one scope.

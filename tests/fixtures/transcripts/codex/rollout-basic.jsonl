@@ -1,0 +1,18 @@
+{"timestamp":"2026-06-25T15:26:28.000Z","type":"session_meta","payload":{"session_id":"019eff61-7a56-7da1-b0ce-308ec7793715","id":"019eff61-7a56-7da1-b0ce-308ec7793715","timestamp":"2026-06-25T15:23:58.934Z","cwd":"{{CWD}}","originator":"codex-tui","cli_version":"0.142.2","source":"cli"}}
+{"timestamp":"2026-06-25T15:26:28.010Z","type":"turn_context","payload":{"turn_id":"019eff63-c031-77e0-85fb-117ce4b99320","cwd":"{{CWD}}","approval_policy":"on-request"}}
+{"timestamp":"2026-06-25T15:26:28.020Z","type":"event_msg","payload":{"type":"task_started","model_context_window":272000}}
+{"timestamp":"2026-06-25T15:26:28.030Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer instructions that are not conversation"}]}}
+{"timestamp":"2026-06-25T15:26:28.040Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>{{CWD}}</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-06-25T15:26:28.060Z","type":"event_msg","payload":{"type":"user_message","message":"Should the Codex reader stream line by line?"}}
+{"timestamp":"2026-06-25T15:26:28.070Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Should the Codex reader stream line by line?"}]}}
+{"timestamp":"2026-06-25T15:26:30.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"internal deliberation that must not be stored"}}
+{"timestamp":"2026-06-25T15:26:31.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Checking the rollout sizes first.","phase":"commentary"}}
+{"timestamp":"2026-06-25T15:26:32.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"du\",\"-h\"]}","call_id":"c1"}}
+{"timestamp":"2026-06-25T15:26:33.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"AWS_SECRET_ACCESS_KEY=hunter2\n114M rollout.jsonl"}}
+{"timestamp":"2026-06-25T15:26:34.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200}}}}
+{"timestamp":"2026-06-25T15:26:35.000Z","type":"event_msg","payload":{"type":"patch_apply_end","success":true}}
+{"timestamp":"2026-06-25T15:26:36.000Z","type":"event_msg","payload":{"type":"something_new_in_a_future_release","detail":"unrecognized"}}
+{"timestamp":"2026-06-25T15:26:37.000Z","type":"event_msg","payload":{"type":"user_message","message":"Here is my token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA please ignore it"}}
+{"timestamp":"2026-06-25T15:26:40.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Decided: stream the rollout and cap it with --max-bytes.","phase":"final_answer"}}
+{"timestamp":"2026-06-25T15:26:41.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Decided: stream the rollout and cap it with --max-bytes."}]}}
+{"timestamp":"2026-06-25T15:26:42.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}

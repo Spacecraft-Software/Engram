@@ -9,6 +9,147 @@ All notable changes to Engram. Dates are ISO 8601 UTC. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semver](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [Unreleased]
+
+Groundwork for the harness integration subsystem: before `save-chat` becomes
+the command harnesses invoke by name, it had to stop corrupting its own
+output.
+
+### Fixed
+- **`save-chat` no longer duplicates the history on every run.** Writing to an
+  existing archive used to strip the trailing `@bye` and re-emit the entire
+  scope, so each invocation appended a second copy of every message. The
+  document is now rendered whole from a pure function of the scope, so a
+  re-run over unchanged content is byte-identical and skips the write
+  (`outcome: "unchanged"`).
+- **`save-chat` no longer archives rules.** It read through `recall`, which
+  returns `role="rule"` rows; an archive is a transcript, and rules have their
+  own delivery mechanism.
+- **`save-chat` no longer corrupts the decay signal.** Reading through
+  `recall` bumped `access_count` on every exported row, making a whole scope
+  look freshly used to `consolidate --report`. The new `Store::export_history`
+  is untracked — archiving is not retrieval.
+- **`save-chat` writes at the project root**, resolved the same way
+  `rule sync` resolves it, instead of the process's current directory.
+  Running it from a subdirectory used to scatter `chat/` directories and
+  `.gitignore` edits through the tree.
+- The generated Texinfo is now valid: it carries `@documentencoding UTF-8`
+  (required for the non-ASCII content real transcripts contain) and a legal
+  heading hierarchy. `makeinfo` compiles it without warnings, asserted by a
+  test that skips when `makeinfo` is absent.
+
+### Added
+- **`engram ingest` — transcript capture.** Reads the session file a harness
+  already writes for itself and stores each message as an ordinary memory, so
+  `recall`, `search`, `context`, and `consolidate` see the real conversation
+  rather than only the notes an agent chose to record. **Readers for Claude
+  Code and Codex.** This is what makes "shared verbatim chat memory" literally
+  true: until now, `save-chat` could only export what something had
+  deliberately `remember`ed.
+  - The two harnesses locate a session in incompatible ways, and neither
+    approach generalizes: Claude Code names its directory after the working
+    directory (mangled, and forward-only — a dash in a path makes the inverse
+    ambiguous), while Codex encodes the *date* and records the working
+    directory verbatim in each rollout's first line.
+  - Codex carries the conversation twice. Engram prefers the display channel
+    (`event_msg`) over the raw one (`response_item`) because the raw channel
+    is *noisier*, not more complete: it held an extra "user message" that was
+    an injected `<environment_context>` block.
+  - Codex session ids are keyed on the rollout **file name**, not
+    `session_meta.session_id`, which is reused across resumed sessions — three
+    files sharing one id exist in the wild. Trusting it would have collided
+    turn ids across rollouts and silently discarded messages.
+  - `--max-bytes` (64 MiB default) refuses an oversized transcript rather than
+    reading it by surprise; a 114 MB rollout exists on a real machine. Both
+    readers stream line by line.
+  - Roles `user`/`assistant` — values the schema has always declared and that
+    nothing ever wrote.
+  - **Tool payloads and thinking are excluded by default**, and a tool result
+    is summarized to its size even with `--include-tools`. On a real 1.7 MB
+    session: 935 records in, 46 turns out.
+  - Credential-shaped substrings are redacted before storage and counted per
+    kind in the response. Best-effort, not a guarantee.
+  - Idempotent by construction: turn ids are UUID v5 over
+    `(harness, session, record)`, so re-ingesting inserts nothing and
+    resuming a live session inserts only the new tail.
+  - `created_at` comes from the transcript, not the wall clock — `recall`
+    orders by it, so stamping a conversation with one instant would destroy
+    its reading order.
+  - A harness with no reader exits 2 with a hint naming the fallback and
+    writes **nothing** to stdout; an empty success would be indistinguishable
+    from "there is nothing here".
+- **`engram install` — the command surface.** Writes `/engram-save-chat`,
+  `/engram-ingest`, and `/engram-context` into each detected harness's own
+  command directory. Engram was already an MCP server nearly everywhere; this
+  is what lets a user invoke it by name from inside a session.
+  - Only detected harnesses; only files carrying engram's banner (a
+    hand-written one is reported `skipped` with a reason unless `--force`);
+    never a delete. Idempotent by byte comparison — a second run reports every
+    file `unchanged` and does not touch mtimes.
+  - Each command pins `--db` to the path that harness **already registered
+    engram against**, discovered from its own MCP config (JSON, JSONC, or
+    TOML, each scanned narrowly — no TOML dependency, and comments survive
+    because engram only ever reads those files). Without this, a generated
+    command would fall back to a relative default and write to a different
+    store than the agents read.
+  - Of the seven known harnesses, only Claude Code, Codex, and Opencode have a
+    writable command surface. The other four are reported as having none
+    rather than silently omitted.
+  - CLI-only, and deliberately never an HTTP route: it writes into `$HOME`.
+- **`save_chat` — the tenth and final MCP tool.** Archives a scope, and with
+  `from_transcript: true` captures this harness's session first, so the MCP
+  surface can record a conversation rather than only export one.
+  - **No `file` argument.** The destination derives from the server's resolved
+    project root. A caller-chosen path would be a traversal primitive handed
+    to a model whose input includes attacker-influenceable text — the same
+    reasoning that keeps `--file` off `rule_sync`'s MCP surface.
+  - **The ten-tool ceiling is now reached.** An eleventh must displace an
+    existing one, and the displacement must be argued in the manual. The
+    ledger now lives in exactly one place; it had drifted across three.
+- **`engram install --hooks`** — an opt-in `SessionEnd` hook (Claude Code
+  only; no other surveyed harness has a hook system engram can write).
+  - The hook runs **`ingest`, never `save-chat`**: capturing into the database
+    is invisible and reversible, whereas writing a `.texi` into a repository
+    at every session end, unasked, is not.
+  - Merging into a settings file engram does not own is done carefully: a
+    timestamped backup first, only engram's own entry replaced, **other hooks
+    on the same event left alone** (several hooks per event is legitimate),
+    and a file that does not parse is refused rather than overwritten.
+- **`plugins/engram/`** — the Claude Code plugin, and the single source of
+  truth for command bodies (`install.rs` embeds them with `include_str!`, so
+  the two cannot drift). Ships `hooks/hooks.json` for the plugin path.
+- **A `Harness Integration` chapter** in the manual, collecting the support
+  matrix, the format-drift rules, the privacy posture, and the constraints on
+  writing into a home directory.
+- `src/archive.rs`: the Texinfo renderer and archive writer, lifted out of
+  `main.rs` so the CLI and the MCP tool share one implementation.
+  `transcript::capture` does the same for the capture path.
+- `src/harness.rs`: a registry of the seven known harnesses, where transcript
+  support is a typed variant carrying its reason rather than a `bool`.
+- `save-chat --dry-run`, matching `remember` and `rule sync`.
+- `save-chat` reports `scope_origin`, `root`, `gitignore_updated`, and a
+  `file` object with the `created`/`updated`/`unchanged` outcome.
+- `src/managed_file.rs`: the idempotent file-write primitive lifted out of
+  `rules.rs`, now parameterized by a sentinel and a `WritePolicy` — `Spliced`
+  for files engram shares with another author (`AGENTS.md`, `CLAUDE.md`),
+  `Owned` for files engram authored outright (archives).
+- Tests for `save-chat`, which previously had none: five integration tests and
+  five unit tests over the renderer.
+
+### Changed
+- `serde_json` is now built with `preserve_order`. Without it, merging one
+  hook into a user's `settings.json` would rewrite every key of that file in
+  alphabetical order — engram reformatting a config it does not own as a side
+  effect. Note this also makes engram's own JSON object output follow
+  insertion order rather than alphabetical.
+- **Breaking (envelope):** `save-chat`'s `metadata.command` is now
+  `engram save-chat`, not `engram memory save-chat` — the only command that
+  carried the stray `memory` noun. Its `data` shape changed accordingly
+  (`file_path` → `file.path`).
+- `--model`'s last-resort fallback is `unknown-model` rather than a specific
+  model name, which was attributing archives to a model that had not written
+  them.
+
 ## [0.5.0] — 2026-08-02
 
 The research-driven retrieval generation (`research/research.md`), spanning

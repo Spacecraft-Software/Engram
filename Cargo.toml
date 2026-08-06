@@ -39,7 +39,11 @@ vector-bundled = ["vector"]
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: `engram install --hooks` merges a fragment into the user's
+# ~/.claude/settings.json. Without this, serde_json's BTreeMap-backed Map would
+# rewrite every key of that file in alphabetical order — engram would be
+# reformatting a config it does not own as a side effect of adding one hook.
+serde_json = { version = "1", features = ["preserve_order"] }
 jiff = "0.1"
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 owo-colors = "4"

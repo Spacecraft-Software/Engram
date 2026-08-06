@@ -282,6 +282,109 @@ EXAMPLES:
         /// Optional signature model/agent name (e.g. gpt-5.6-pro).
         #[arg(long)]
         model: Option<String>,
+
+        /// Report the archive that would be written without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Capture a harness's own session transcript into a scope.
+    ///
+    /// Reads the transcript the harness already writes for itself and stores
+    /// each message as an ordinary memory, so `recall`, `search`, `context`
+    /// and `consolidate` see the real conversation rather than only the notes
+    /// an agent chose to record.
+    ///
+    /// Tool payloads and model thinking are excluded by default: they are the
+    /// bulk of a transcript, they are useless for retrieval, and they are
+    /// where file contents and credentials live. Everything dropped is
+    /// counted and reported.
+    Ingest {
+        /// Harness to read from. Detected from the environment, then the
+        /// filesystem, when omitted.
+        #[arg(long, value_enum)]
+        harness: Option<crate::harness::Harness>,
+
+        /// Session to read: an id, `latest` (default), or `all`.
+        #[arg(long, default_value = "latest")]
+        session: String,
+
+        /// Scope to store into. Resolves like the `rule` commands when omitted.
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Working directory whose sessions to look for. Defaults to the
+        /// current directory.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+
+        /// Include the model's thinking blocks.
+        #[arg(long)]
+        include_thinking: bool,
+
+        /// Include tool calls and results, summarized to one line each.
+        /// Payloads are never stored, even with this flag.
+        #[arg(long)]
+        include_tools: bool,
+
+        /// Include subagent side-chains.
+        #[arg(long)]
+        include_sidechains: bool,
+
+        /// Refuse a transcript larger than this many bytes.
+        #[arg(long, default_value_t = crate::transcript::DEFAULT_MAX_BYTES)]
+        max_bytes: u64,
+
+        /// Truncate any single turn longer than this many characters.
+        #[arg(long, default_value_t = crate::transcript::DEFAULT_MAX_CHARS_PER_TURN)]
+        max_chars_per_turn: usize,
+
+        /// List the sessions available for this directory and write nothing.
+        #[arg(long)]
+        list: bool,
+
+        /// Parse and filter, reporting what would be stored, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Write engram's slash commands into the harnesses on this machine.
+    ///
+    /// Engram is usually already registered as an MCP server everywhere; what
+    /// is missing is a command surface. This writes `/engram-save-chat`,
+    /// `/engram-ingest`, and `/engram-context` into each detected harness's
+    /// own command directory.
+    ///
+    /// Only files engram authored are ever overwritten, only detected
+    /// harnesses are written to, and nothing is ever deleted. Start with
+    /// `--list`.
+    Install {
+        /// Harnesses to install into. Every detected harness with a command
+        /// surface when omitted.
+        #[arg(long, value_enum)]
+        harness: Vec<crate::harness::Harness>,
+
+        /// Database path to bake into the generated commands. Defaults to the
+        /// one the harness already registered engram against.
+        #[arg(long)]
+        db_path: Option<String>,
+
+        /// Report what engram sees and writes nothing.
+        #[arg(long)]
+        list: bool,
+
+        /// Report every file that would be written, without writing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite command files engram did not generate.
+        #[arg(long)]
+        force: bool,
+
+        /// Also install an opt-in SessionEnd hook that captures each finished
+        /// session. The hook runs `ingest` only: it never writes an archive
+        /// into your repository. Merges into the harness's settings file,
+        /// taking a timestamped backup first and leaving other hooks alone.
+        #[arg(long)]
+        hooks: bool,
     },
 }
 

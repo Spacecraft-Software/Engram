@@ -4,17 +4,22 @@
 //! Maintained by Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 //! https://Engram.SpacecraftSoftware.org/
 
+mod archive;
 mod cli;
 mod embed;
 mod error;
 mod facts;
+mod harness;
 mod http;
+mod install;
+mod managed_file;
 mod mcp;
 mod output;
 mod retrieval;
 mod rules;
 mod store;
 mod time;
+mod transcript;
 
 use clap::Parser;
 use cli::{Cli, Command, RuleAction};
@@ -466,11 +471,45 @@ fn run(
                 "version": env!("CARGO_PKG_VERSION"),
                 "maintainer": "Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>",
                 "website": "https://Engram.SpacecraftSoftware.org/",
+                "mcp": {
+                    "tools": ["remember", "recall", "search", "get", "context",
+                              "rule_add", "rule_list", "rule_retire", "rule_sync", "save_chat"],
+                    "ceiling": 10,
+                    "ceiling_reached": true,
+                    "note": "every tool's schema costs context on every turn, so the surface is \
+                             capped at ten; an eleventh must displace an existing one. save_chat \
+                             takes no file argument: the destination is derived server-side.",
+                    "cli_only": ["install", "ingest", "consolidate", "index", "rule purge"]
+                },
                 "commands": [
                     "remember", "recall", "search", "context", "index", "consolidate",
                     "rule add", "rule list", "rule retire", "rule sync", "rule purge",
-                    "save-chat", "mcp", "serve", "schema", "describe"
+                    "save-chat", "ingest", "mcp", "serve", "schema", "describe"
                 ],
+                "ingest": {
+                    "purpose": "capture a harness's own session transcript into a scope as \
+                                ordinary memories, so recall/search/context/consolidate see the \
+                                real conversation rather than only what an agent chose to record",
+                    "harnesses": harness::ALL.iter().map(|h| serde_json::json!({
+                        "name": h.name,
+                        "reader": matches!(h.transcript, harness::TranscriptSupport::Reader(_)),
+                    })).collect::<Vec<_>>(),
+                    "excluded_by_default": ["tool_use", "tool_result", "thinking", "sidechains"],
+                    "tool_payloads": "never stored, even with --include-tools: a tool result is \
+                                      summarized to its size. Payloads are where file contents, \
+                                      command output, and credentials live",
+                    "redaction": "credential-shaped substrings are replaced before storage and \
+                                  counted per kind in the response; best-effort, not a guarantee",
+                    "idempotent": "turn ids are uuid v5 over (harness, session, record), so \
+                                   re-ingesting a session inserts nothing and resuming one \
+                                   inserts only the new tail",
+                    "created_at": "the transcript's own timestamp, not the ingest time — recall \
+                                   orders by created_at, so a wall-clock stamp would destroy the \
+                                   conversation's reading order",
+                    "unreadable_harness": "a structured exit-2 error naming the fallback, never \
+                                           an empty success",
+                    "cli_only": true
+                },
                 "consolidate": {
                     "phases": ["extract", "dedup", "report"],
                     "extract": "deterministic fact extraction into the facts index (honors --dry-run)",
@@ -554,48 +593,410 @@ fn run(
             println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
             0
         }
-        Command::SaveChat { scope, file, model } => {
-            let guard = store.lock().expect("store lock poisoned");
-            // A chat archive wants the full verbatim history, superseded
-            // rows included — save-chat is a record, not a context view.
-            match guard.recall(&scope, u32::MAX, store::Validity::All) {
-                Ok(mems) => {
-                    if mems.is_empty() {
-                        let err = AppError::new(
-                            error::ErrorCode::NotFound,
-                            3,
-                            format!("no memories found for scope '{}'", scope),
-                            "verify the scope name is correct",
-                        );
-                        emit_error(&err, mode);
-                        return err.exit_code;
-                    }
+        Command::SaveChat {
+            scope,
+            file,
+            model,
+            dry_run,
+        } => {
+            // The archive lands at the project root, not wherever the process
+            // happened to start: a harness slash command runs from an
+            // arbitrary subdirectory, and `chat/` belongs in exactly one place.
+            let resolved = match rules::resolve_scope(Some(&scope)) {
+                Ok(r) => r,
+                Err(e) => return fail(scope_error(e), mode),
+            };
 
-                    match handle_save_chat(&scope, mems, file, model) {
-                        Ok(result) => {
-                            emit_ok(Response::new("engram memory save-chat", result), mode);
-                            0
-                        }
-                        Err(e) => {
-                            let err = AppError::new(
-                                error::ErrorCode::InternalError,
-                                1,
-                                format!("failed to save chat: {}", e),
-                                "check filesystem permissions and directory configuration",
-                            );
-                            emit_error(&err, mode);
-                            err.exit_code
-                        }
-                    }
+            let mems = {
+                let guard = store.lock().expect("store lock poisoned");
+                match guard.export_history(&resolved.name) {
+                    Ok(m) => m,
+                    Err(e) => return fail(AppError::from(e), mode),
                 }
-                Err(e) => {
-                    let err = AppError::from(e);
-                    emit_error(&err, mode);
-                    err.exit_code
+            };
+            if mems.is_empty() {
+                return fail(
+                    AppError::new(
+                        error::ErrorCode::NotFound,
+                        3,
+                        format!("no memories found for scope '{}'", resolved.name),
+                        "verify the scope name is correct",
+                    ),
+                    mode,
+                );
+            }
+
+            match archive::save_chat(&resolved, mems, file, model, dry_run) {
+                Ok(result) => {
+                    let resp = Response::new("engram save-chat", result);
+                    let resp = if dry_run { resp.with_dry_run() } else { resp };
+                    emit_ok(resp, mode);
+                    0
                 }
+                Err(e) => fail(
+                    AppError::new(
+                        error::ErrorCode::InternalError,
+                        1,
+                        format!("failed to save chat: {}", e),
+                        "check filesystem permissions and directory configuration",
+                    ),
+                    mode,
+                ),
             }
         }
+
+        Command::Ingest {
+            harness: requested,
+            session,
+            scope,
+            cwd,
+            include_thinking,
+            include_tools,
+            include_sidechains,
+            max_bytes,
+            max_chars_per_turn,
+            list,
+            dry_run,
+        } => {
+            let opts = transcript::ReadOptions {
+                include_thinking,
+                include_tools,
+                include_sidechains,
+                max_bytes,
+                max_chars_per_turn,
+            };
+            handle_ingest(
+                &store, mode, requested, &session, scope, cwd, opts, list, dry_run,
+            )
+        }
+
+        Command::Install {
+            harness: requested,
+            db_path,
+            list,
+            dry_run,
+            force,
+            hooks,
+        } => handle_install(
+            mode,
+            &requested,
+            db_path.as_deref(),
+            list,
+            dry_run,
+            force,
+            hooks,
+        ),
     }
+}
+
+/// `engram install --list` payload: what engram sees, before it writes.
+#[derive(serde::Serialize)]
+struct InstallListResult {
+    harnesses: Vec<InstallCandidate>,
+    /// Where the plugin lives in the source tree, for users who would rather
+    /// reference it declaratively than have files written into their home.
+    plugin_dir: String,
+}
+
+#[derive(serde::Serialize)]
+struct InstallCandidate {
+    #[serde(flatten)]
+    detected: harness::Detected,
+    /// `null` when the harness has no command surface engram can write.
+    commands_dir: Option<String>,
+    /// The database this harness already registered engram against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registered_db: Option<String>,
+}
+
+fn handle_install(
+    mode: OutputMode,
+    requested: &[harness::Harness],
+    db_override: Option<&str>,
+    list: bool,
+    dry_run: bool,
+    force: bool,
+    hooks: bool,
+) -> i32 {
+    if harness::home_dir().is_none() {
+        return fail(
+            AppError::new(
+                error::ErrorCode::InvalidArgument,
+                2,
+                "cannot resolve the home directory",
+                "set HOME to the account whose harnesses should be configured",
+            ),
+            mode,
+        );
+    }
+
+    if list {
+        let harnesses = harness::ALL
+            .iter()
+            .map(|spec| InstallCandidate {
+                detected: harness::describe(spec),
+                commands_dir: harness::commands_dir(spec).map(|p| p.to_string_lossy().into_owned()),
+                registered_db: harness::registered_db(spec)
+                    .map(|p| p.to_string_lossy().into_owned()),
+            })
+            .collect();
+        emit_ok(
+            Response::new(
+                "engram install --list",
+                InstallListResult {
+                    harnesses,
+                    plugin_dir: install::plugin_dir_hint().to_string_lossy().into_owned(),
+                },
+            ),
+            mode,
+        );
+        return 0;
+    }
+
+    let targets: Vec<&'static harness::HarnessSpec> = if requested.is_empty() {
+        install::default_targets()
+    } else {
+        requested.iter().map(|id| harness::spec(*id)).collect()
+    };
+
+    match install::install(&targets, db_override, force, dry_run, hooks) {
+        Ok(result) => {
+            let resp = Response::new("engram install", result);
+            let resp = if dry_run { resp.with_dry_run() } else { resp };
+            emit_ok(resp, mode);
+            0
+        }
+        Err(e) => fail(
+            AppError::new(
+                error::ErrorCode::InternalError,
+                1,
+                format!("failed to install commands: {e}"),
+                "check write permissions on the harness command directories",
+            ),
+            mode,
+        ),
+    }
+}
+
+/// `engram ingest --list` payload.
+///
+/// Carries the full harness table alongside the sessions found, so a user
+/// looking at an empty list can tell "engram found no session here" from
+/// "engram cannot read this harness at all" without running a second command.
+#[derive(serde::Serialize)]
+struct IngestListResult {
+    harness: &'static str,
+    cwd: String,
+    sessions: Vec<transcript::SessionRef>,
+    harnesses: Vec<harness::Detected>,
+}
+
+/// `engram ingest` payload: the shared capture summary plus where it ran.
+#[derive(serde::Serialize)]
+struct IngestResult {
+    harness: &'static str,
+    scope: String,
+    scope_origin: rules::ScopeOrigin,
+    cwd: String,
+    dry_run: bool,
+    /// Sessions, totals, filter histogram, and redaction counts — produced by
+    /// [`transcript::capture`], which the MCP `save_chat` tool also calls, so
+    /// the two surfaces cannot disagree about what was captured.
+    #[serde(flatten)]
+    capture: transcript::CaptureSummary,
+}
+
+/// Resolves the harness to read from.
+///
+/// Explicit `--harness` wins. Otherwise the environment marker of the harness
+/// engram is running under, then — only if exactly one installed harness has
+/// a reader — that one. Two candidates is an error, never a guess: ingesting
+/// the wrong harness's transcript into a scope is not something a user can
+/// easily undo.
+/// The error is boxed because [`AppError`] is large and this `Result` is
+/// returned on the common path; clippy's `result_large_err` is right that
+/// paying for it on every success would be wasteful.
+fn resolve_harness(
+    requested: Option<harness::Harness>,
+) -> Result<&'static harness::HarnessSpec, Box<AppError>> {
+    if let Some(id) = requested {
+        return Ok(harness::spec(id));
+    }
+    if let Some(spec) = harness::from_env() {
+        return Ok(spec);
+    }
+    let readable = harness::readable_and_present();
+    match readable.len() {
+        1 => Ok(readable[0]),
+        0 => Err(Box::new(AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            "no harness with a transcript reader is installed",
+            format!(
+                "engram can read transcripts from: {}. Pass --harness to name one explicitly.",
+                readable_names()
+            ),
+        ))),
+        _ => Err(Box::new(AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            "several harnesses are installed and engram will not guess between them",
+            format!("pass --harness with one of: {}", readable_names()),
+        ))),
+    }
+}
+
+/// Comma-separated names of every harness engram can read from.
+fn readable_names() -> String {
+    harness::ALL
+        .iter()
+        .filter(|s| matches!(s.transcript, harness::TranscriptSupport::Reader(_)))
+        .map(|s| s.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Turns a [`transcript::TranscriptError`] into a structured CLI error.
+///
+/// The no-reader case names the fallback explicitly. Reporting "0 sessions"
+/// for a harness engram simply cannot read would be the silent-failure mode
+/// this whole design exists to prevent.
+fn transcript_error(e: transcript::TranscriptError, harness_name: &str) -> AppError {
+    match e {
+        transcript::TranscriptError::NoReader(detail) => AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            format!("harness '{harness_name}' has no transcript reader"),
+            format!(
+                "{detail}. Use the notes path instead: call `remember` during the session, \
+                 then `engram save-chat --scope <id>`."
+            ),
+        ),
+        transcript::TranscriptError::NoHome => AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            "cannot resolve the home directory",
+            "set HOME to the account whose harness transcripts should be read",
+        ),
+        transcript::TranscriptError::TooLarge { bytes, max_bytes } => AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            format!("transcript is {bytes} bytes, above the {max_bytes}-byte ceiling"),
+            "raise the ceiling with --max-bytes if this session really is that large",
+        ),
+        transcript::TranscriptError::BadTimestamp { record, value } => AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            format!("record {record} carries an unparseable timestamp '{value}'"),
+            "engram will not substitute the current time: doing so would silently destroy the \
+             conversation's reading order. Report this as a transcript-format change.",
+        ),
+        transcript::TranscriptError::Io(e) => AppError::new(
+            error::ErrorCode::InternalError,
+            1,
+            format!("cannot read the transcript: {e}"),
+            "check that the transcript file is readable",
+        ),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one flag per CLI option; grouping them into a struct would only \
+              move the argument list one call further out"
+)]
+fn handle_ingest(
+    store: &Arc<Mutex<Store>>,
+    mode: OutputMode,
+    requested: Option<harness::Harness>,
+    session_selector: &str,
+    scope: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+    opts: transcript::ReadOptions,
+    list: bool,
+    dry_run: bool,
+) -> i32 {
+    let spec = match resolve_harness(requested) {
+        Ok(s) => s,
+        Err(e) => return fail(*e, mode),
+    };
+
+    let cwd = match cwd.map_or_else(std::env::current_dir, Ok) {
+        Ok(c) => c,
+        Err(e) => return fail(scope_error(e), mode),
+    };
+
+    let sessions = match transcript::sessions_for(spec, &cwd) {
+        Ok(s) => s,
+        Err(e) => return fail(transcript_error(e, spec.name), mode),
+    };
+
+    if list {
+        emit_ok(
+            Response::new(
+                "engram ingest --list",
+                IngestListResult {
+                    harness: spec.name,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    sessions,
+                    harnesses: harness::detect(),
+                },
+            ),
+            mode,
+        );
+        return 0;
+    }
+
+    let selected: Vec<transcript::SessionRef> = match session_selector {
+        "latest" => sessions.into_iter().take(1).collect(),
+        "all" => sessions,
+        id => sessions
+            .into_iter()
+            .filter(|s| s.session_id == id)
+            .collect(),
+    };
+    if selected.is_empty() {
+        return fail(
+            AppError::new(
+                error::ErrorCode::NotFound,
+                3,
+                format!(
+                    "no {} session matching '{session_selector}' for {}",
+                    spec.name,
+                    cwd.display()
+                ),
+                "run `engram ingest --list` to see the sessions engram can find",
+            ),
+            mode,
+        );
+    }
+
+    let resolved = match rules::resolve_scope(scope.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return fail(scope_error(e), mode),
+    };
+
+    let capture = match transcript::capture(store, spec, &selected, &resolved.name, &opts, dry_run)
+    {
+        Ok(c) => c,
+        Err(transcript::CaptureError::Transcript(e)) => {
+            return fail(transcript_error(e, spec.name), mode)
+        }
+        Err(transcript::CaptureError::Storage(e)) => return fail(AppError::from(e), mode),
+    };
+
+    let result = IngestResult {
+        harness: spec.name,
+        scope: resolved.name,
+        scope_origin: resolved.origin,
+        cwd: cwd.to_string_lossy().into_owned(),
+        dry_run,
+        capture,
+    };
+    let resp = Response::new("engram ingest", result);
+    let resp = if dry_run { resp.with_dry_run() } else { resp };
+    emit_ok(resp, mode);
+    0
 }
 
 /// `engram consolidate` payload: one optional section per phase that ran,
@@ -1142,121 +1543,6 @@ fn scope_error(e: std::io::Error) -> AppError {
 fn fail(err: AppError, mode: OutputMode) -> i32 {
     emit_error(&err, mode);
     err.exit_code
-}
-
-#[derive(serde::Serialize)]
-struct SaveChatResult {
-    scope: String,
-    file_path: String,
-    signed_by: String,
-    messages_saved: usize,
-}
-
-fn handle_save_chat(
-    scope: &str,
-    mems: Vec<store::Memory>,
-    custom_file: Option<std::path::PathBuf>,
-    model: Option<String>,
-) -> Result<SaveChatResult, Box<dyn std::error::Error>> {
-    let current_dir = std::env::current_dir()?;
-
-    // Ensure chat directory exists
-    let chat_dir = current_dir.join("chat");
-    std::fs::create_dir_all(&chat_dir)?;
-
-    // Ensure chat/ is gitignored
-    let gitignore_path = current_dir.join(".gitignore");
-    let mut gitignore_content = if gitignore_path.exists() {
-        std::fs::read_to_string(&gitignore_path)?
-    } else {
-        String::new()
-    };
-
-    if !gitignore_content
-        .lines()
-        .any(|l| l.trim() == "chat" || l.trim() == "chat/")
-    {
-        if !gitignore_content.ends_with('\n') && !gitignore_content.is_empty() {
-            gitignore_content.push('\n');
-        }
-        gitignore_content.push_str("chat/\n");
-        std::fs::write(&gitignore_path, &gitignore_content)?;
-    }
-
-    // Resolve model name
-    let model_name = model
-        .or_else(|| std::env::var("MODEL").ok())
-        .or_else(|| std::env::var("LLM_MODEL").ok())
-        .or_else(|| std::env::var("AI_AGENT").ok())
-        .or_else(|| std::env::var("AGENT").ok())
-        .unwrap_or_else(|| "gemini-3.5-flash-high".to_string());
-
-    // Resolve target file
-    let target_file = match custom_file {
-        Some(f) => f,
-        None => {
-            let timestamp = crate::time::now_iso8601().replace(':', "-");
-            chat_dir.join(format!("{}.texi", timestamp))
-        }
-    };
-
-    let exists = target_file.exists();
-    let mut file_content = String::new();
-
-    if exists {
-        // Read existing content and strip trailing @bye to support clean append
-        let existing = std::fs::read_to_string(&target_file)?;
-        let trimmed = existing.trim();
-        if let Some(stripped) = trimmed.strip_suffix("@bye") {
-            file_content = stripped.to_string();
-        } else {
-            file_content = existing;
-        }
-    } else {
-        // Write header
-        file_content.push_str("\\input texinfo\n");
-        file_content.push_str(&format!("@settitle Chat history for scope: {}\n\n", scope));
-    }
-
-    // Sign the block
-    let sign_timestamp = crate::time::now_iso8601();
-    file_content.push_str(&format!(
-        "@c Signed by: {} on {}\n",
-        model_name, sign_timestamp
-    ));
-    file_content.push_str(&format!("@chapter Chat history for scope: {}\n\n", scope));
-
-    let num_saved = mems.len();
-    for mem in mems {
-        file_content.push_str(&format!(
-            "@section Message by {} ({}) at {}\n",
-            mem.agent, mem.role, mem.created_at
-        ));
-        file_content.push_str(&format!("{}\n\n", escape_texinfo(&mem.content)));
-    }
-
-    file_content.push_str("@bye\n");
-    std::fs::write(&target_file, file_content)?;
-
-    Ok(SaveChatResult {
-        scope: scope.to_string(),
-        file_path: target_file.to_string_lossy().to_string(),
-        signed_by: model_name,
-        messages_saved: num_saved,
-    })
-}
-
-fn escape_texinfo(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        match c {
-            '@' => out.push_str("@@"),
-            '{' => out.push_str("@{"),
-            '}' => out.push_str("@}"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 // Rust guideline compliant 2026-05-18
