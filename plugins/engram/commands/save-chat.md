@@ -1,5 +1,5 @@
 ---
-description: Capture this session into engram and archive it as Texinfo
+description: Save this conversation: capture the transcript into engram's memory store, then archive it as a Texinfo document
 argument-hint: "[scope]"
 allowed-tools: Bash(engram:*)
 ---
@@ -27,7 +27,7 @@ Run these in order and report what happened:
 
 4. Archive the scope:
 
-   !`engram --db {{DB}} save-chat --scope $1`
+   !`engram --db {{DB}} save-chat --scope "$1"`
 
 5. Report the archive path, the message count, and the write outcome. An
    outcome of `unchanged` is a success, not a no-op failure: it means the

@@ -319,12 +319,20 @@ fn run(
                 Err(e) => return fail(scope_error(e), mode),
             };
             let guard = store.lock().expect("store lock poisoned");
+            // An empty --query means "no query", exactly as an empty --scope
+            // means "resolve it". A slash command interpolating an absent
+            // argument yields `--query ""`, and treating that as a real search
+            // for the empty string would drop the recency channel's ordering
+            // on the floor for no reason.
+            let query = query
+                .as_deref()
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .map(str::to_string);
             // Same auto rule as search: the vector channel joins only when
             // the gate passes; any miss silently keeps the two-channel path.
             let ready: Option<embed::HybridReady> = query
                 .as_deref()
-                .map(str::trim)
-                .filter(|q| !q.is_empty())
                 .and_then(|q| embed::try_hybrid(&guard, model_path.as_deref(), q).ok());
             let vector = ready.as_ref().map(|r| store::HybridQuery {
                 model: &r.model,
@@ -602,7 +610,7 @@ fn run(
             // The archive lands at the project root, not wherever the process
             // happened to start: a harness slash command runs from an
             // arbitrary subdirectory, and `chat/` belongs in exactly one place.
-            let resolved = match rules::resolve_scope(Some(&scope)) {
+            let resolved = match rules::resolve_scope(scope.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return fail(scope_error(e), mode),
             };

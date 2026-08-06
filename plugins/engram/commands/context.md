@@ -1,12 +1,12 @@
 ---
-description: Load this project's engram rules and prior context
-argument-hint: "[topic]"
+description: Load this project's engram rules and prior decisions before continuing work
+argument-hint: "[topic to focus on]"
 allowed-tools: Bash(engram:*)
 ---
 
 Load prior context for this project from engram before we continue.
 
-!`engram --db {{DB}} context --budget-tokens 3000 $ARGUMENTS`
+!`engram --db {{DB}} context --budget-tokens 3000 --query "$ARGUMENTS"`
 
 Read the result and use it as background:
 
