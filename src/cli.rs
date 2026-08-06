@@ -271,9 +271,10 @@ EXAMPLES:
     Describe,
     /// Save a complete chat history for a scope to a Texinfo file.
     SaveChat {
-        /// The scope of the chat to save.
+        /// The scope of the chat to save. Omitted (or empty) resolves via the
+        /// usual cascade: ENGRAM_SCOPE, git working-tree name, directory name.
         #[arg(long)]
-        scope: String,
+        scope: Option<String>,
 
         /// Optional custom destination file path. Defaults to chat/<timestamp>.texi.
         #[arg(long)]

@@ -1,5 +1,5 @@
 ---
-description: Capture this session's transcript into engram's memory store
+description: Capture this conversation into engram's memory store so later sessions can recall and search it
 argument-hint: "[scope]"
 allowed-tools: Bash(engram:*)
 ---

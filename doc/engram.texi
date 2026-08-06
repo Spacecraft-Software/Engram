@@ -657,7 +657,7 @@ Print the machine-readable CLI Standard capability manifest (JSON).
 @cindex chat history, exporting
 
 @example
-engram save-chat --scope @var{id} [--file @var{path}] [--model @var{name}]
+engram save-chat [--scope @var{id}] [--file @var{path}] [--model @var{name}]
                  [--dry-run]
 @end example
 
