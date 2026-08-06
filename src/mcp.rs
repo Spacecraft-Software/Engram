@@ -1,7 +1,24 @@
 // SPDX-FileCopyrightText: 2026 Mohamed Hammad & Spacecraft Software
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! MCP surface. Three tools, dispatching to the exact same `Store` methods
-//! the CLI and HTTP API use — one source of truth, three transports.
+//! MCP surface. Ten tools, dispatching to the exact same `Store` methods the
+//! CLI and HTTP API use — one source of truth, three transports.
+//!
+//! # The ceiling is now reached
+//!
+//! Every tool's schema costs context on every turn of every conversation, so
+//! the surface is capped at ten (see `doc/engram.texi`). With `save_chat`
+//! that cap is met: an eleventh tool must **displace** an existing one, and
+//! the displacement has to be argued in the manual rather than decided here.
+//!
+//! `save_chat` was worth the last slot only because it carries both halves of
+//! the capture story — `from_transcript` captures the session, then the
+//! archive is written. Spending the slot on archiving alone would have left
+//! the MCP surface able to export a conversation but never to record one, and
+//! no slot remaining to fix that.
+//!
+//! Deliberately CLI-only, and not candidates for the last slot: `install`
+//! (writes into `$HOME`), `consolidate` and `index` (operator batch jobs),
+//! `rule purge` (destructive operations are not agent-invocable).
 //!
 //! NOTE: written against rmcp 0.16's `#[tool_router]`/`#[tool_handler]`
 //! macros per the official examples (modelcontextprotocol/rust-sdk). This
@@ -76,6 +93,38 @@ pub struct ContextArgs {
 }
 fn default_context_budget() -> u32 {
     3000
+}
+
+/// Arguments for the `save_chat` tool.
+///
+/// # There is deliberately no `file` field
+///
+/// The destination is derived server-side and cannot be influenced by the
+/// caller — the same omission, for the same reason, as `rule_sync`'s missing
+/// `--file`. A path argument here would be a traversal primitive handed to a
+/// model whose input includes attacker-influenceable text: file contents,
+/// tool output, fetched pages. `save_chat(file: "~/.ssh/authorized_keys")` is
+/// a one-line prompt-injection payoff.
+///
+/// The nine tools that came before this one write to exactly two places: the
+/// database, and sentinel-managed markdown at the project root. Accepting an
+/// arbitrary path would be the single largest expansion of engram's blast
+/// radius to date, in exchange for a convenience nobody asked for.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SaveChatArgs {
+    /// Scope to archive. Omitted: resolves via ENGRAM_SCOPE, then the git
+    /// working tree, then the cwd — of the SERVER process, so a shared
+    /// server should always pass it explicitly.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Capture this harness's own session transcript into the scope before
+    /// archiving. Requires a harness engram has a reader for; an error names
+    /// the harness and the fallback when it does not.
+    #[serde(default)]
+    pub from_transcript: bool,
+    /// Report what would be captured and written without touching anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -515,6 +564,124 @@ impl EngramMcp {
         Ok(CallToolResult::success(vec![Content::text(
             payload.to_string(),
         )]))
+    }
+
+    #[tool(
+        description = "Archive a scope's full history to a Texinfo file under the project's \
+                       chat/ directory, optionally capturing this harness's own session \
+                       transcript into the scope first (from_transcript). The destination is \
+                       derived server-side and cannot be chosen by the caller. Re-archiving an \
+                       unchanged scope is byte-identical and reports outcome 'unchanged'."
+    )]
+    async fn save_chat(
+        &self,
+        Parameters(args): Parameters<SaveChatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = crate::rules::resolve_scope(args.scope.as_deref()).map_err(scope_err)?;
+
+        // Capture first, so the archive includes this session rather than
+        // only what was deliberately remembered before it.
+        let captured = if args.from_transcript {
+            Some(self.capture_current_session(&resolved.name, args.dry_run)?)
+        } else {
+            None
+        };
+
+        let mems = {
+            let store = self.store.lock().map_err(lock_err)?;
+            store.export_history(&resolved.name).map_err(store_err)?
+        };
+        if mems.is_empty() {
+            return Err(McpError::invalid_params(
+                format!("no memories found for scope '{}'", resolved.name),
+                None,
+            ));
+        }
+
+        // No `file` argument reaches this call — the destination is always
+        // the project root's chat/ directory. See `SaveChatArgs`.
+        let result = crate::archive::save_chat(&resolved, mems, None, None, args.dry_run)
+            .map_err(|e| McpError::internal_error(format!("failed to save chat: {e}"), None))?;
+
+        let payload = serde_json::json!({
+            "scope": result.scope,
+            "scope_origin": result.scope_origin,
+            "root": result.root,
+            "file": result.file,
+            "signed_by": result.signed_by,
+            "messages_saved": result.messages_saved,
+            "gitignore_updated": result.gitignore_updated,
+            "dry_run": args.dry_run,
+            "captured": captured,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]))
+    }
+}
+
+impl EngramMcp {
+    /// Captures the transcript of the session this server is serving.
+    ///
+    /// Shares [`crate::transcript::capture`] with `engram ingest`, so the two
+    /// surfaces cannot disagree about what is filtered, redacted, or counted.
+    /// A harness engram cannot read is an `invalid_params` error naming the
+    /// fallback — never an empty success.
+    fn capture_current_session(
+        &self,
+        scope: &str,
+        dry_run: bool,
+    ) -> Result<crate::transcript::CaptureSummary, McpError> {
+        let spec = crate::harness::from_env().ok_or_else(|| {
+            McpError::invalid_params(
+                "cannot tell which harness this server is running under, so there is no \
+                 transcript to capture. Run `engram ingest --harness <name>` from the project \
+                 directory instead.",
+                None,
+            )
+        })?;
+        let cwd = std::env::current_dir()
+            .map_err(|e| McpError::internal_error(format!("cannot read cwd: {e}"), None))?;
+
+        let sessions = crate::transcript::sessions_for(spec, &cwd).map_err(|e| {
+            McpError::invalid_params(
+                format!(
+                    "harness '{}' has no transcript reader: {e}. Use the notes path instead: \
+                     call `remember` during the session, then save_chat without from_transcript.",
+                    spec.name
+                ),
+                None,
+            )
+        })?;
+        // `latest` only: an MCP caller is archiving the conversation it is
+        // having, not backfilling a directory's history.
+        let selected: Vec<_> = sessions.into_iter().take(1).collect();
+        if selected.is_empty() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "no {} session found for {} — note that scope and transcript are resolved \
+                     against the SERVER process's directory",
+                    spec.name,
+                    cwd.display()
+                ),
+                None,
+            ));
+        }
+
+        crate::transcript::capture(
+            &self.store,
+            spec,
+            &selected,
+            scope,
+            &crate::transcript::ReadOptions::default(),
+            dry_run,
+        )
+        .map_err(|e| match e {
+            crate::transcript::CaptureError::Transcript(e) => {
+                McpError::invalid_params(format!("cannot read the transcript: {e}"), None)
+            }
+            crate::transcript::CaptureError::Storage(e) => store_err(e),
+        })
     }
 }
 
@@ -1204,6 +1371,78 @@ mod tests {
         assert_eq!(v["rules"].as_array().unwrap().len(), 1);
         assert_eq!(v["memories"].as_array().unwrap().len(), 1);
         assert!(v["budget"]["estimator"].is_string());
+    }
+    /// The tenth and final tool. Two properties are asserted because both are
+    /// load-bearing: the destination is server-derived (there is no `file`
+    /// argument at all), and `dry_run` writes nothing.
+    #[tokio::test]
+    async fn save_chat_tool_archives_server_side_and_honors_dry_run() {
+        let (mcp, dir) = test_mcp();
+        // The archive lands relative to the SERVER process's resolved scope
+        // root, so run this from the temp dir rather than the crate.
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(dir.path()).expect("chdir");
+
+        mcp.remember(Parameters(RememberArgs {
+            agent: "a".to_string(),
+            scope: "m4-archive".to_string(),
+            role: "note".to_string(),
+            content: "a decision worth archiving".to_string(),
+            supersedes: None,
+        }))
+        .await
+        .expect("remember");
+
+        let planned = mcp
+            .save_chat(Parameters(SaveChatArgs {
+                scope: Some("m4-archive".to_string()),
+                from_transcript: false,
+                dry_run: true,
+            }))
+            .await
+            .expect("dry run");
+        let v: serde_json::Value =
+            serde_json::from_str(first_text(&planned)).expect("json payload");
+        assert_eq!(v["messages_saved"], 1);
+        assert_eq!(v["file"]["outcome"], "created");
+        assert_eq!(v["dry_run"], true);
+        let path = v["file"]["path"].as_str().expect("path").to_string();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "dry run must not write"
+        );
+
+        let done = mcp
+            .save_chat(Parameters(SaveChatArgs {
+                scope: Some("m4-archive".to_string()),
+                from_transcript: false,
+                dry_run: false,
+            }))
+            .await
+            .expect("archive");
+        let v: serde_json::Value = serde_json::from_str(first_text(&done)).expect("json payload");
+        let path = v["file"]["path"].as_str().expect("path");
+        let text = std::fs::read_to_string(path).expect("archive written");
+        assert!(text.contains("a decision worth archiving"));
+        // Destination is derived, never chosen: it is under the resolved
+        // root's chat/ directory.
+        assert!(path.contains("/chat/"), "unexpected destination: {path}");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn save_chat_tool_reports_an_unknown_scope_rather_than_writing_nothing() {
+        let (mcp, _dir) = test_mcp();
+        let err = mcp
+            .save_chat(Parameters(SaveChatArgs {
+                scope: Some("no-such-scope".to_string()),
+                from_transcript: false,
+                dry_run: true,
+            }))
+            .await
+            .expect_err("an empty scope must not silently succeed");
+        assert!(err.to_string().contains("no memories found"));
     }
 }
 

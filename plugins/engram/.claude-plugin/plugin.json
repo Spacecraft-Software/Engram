@@ -1,0 +1,13 @@
+{
+  "name": "engram",
+  "version": "0.6.0-dev",
+  "description": "Shared verbatim chat memory: capture this session's transcript, archive it, and load prior context.",
+  "author": {
+    "name": "Mohamed Hammad",
+    "email": "Mohamed.Hammad@SpacecraftSoftware.org"
+  },
+  "homepage": "https://Engram.SpacecraftSoftware.org/",
+  "repository": "https://github.com/Spacecraft-Software/engram",
+  "license": "GPL-3.0-or-later",
+  "keywords": ["memory", "transcript", "mcp", "sqlite"]
+}

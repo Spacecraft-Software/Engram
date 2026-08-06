@@ -15,9 +15,15 @@
 //! the durable source of truth; the managed markdown block is the delivery
 //! mechanism. Storing a rule without syncing it stores a rule nobody reads.
 
+use crate::managed_file::{self, WritePolicy};
 use crate::store::Rule;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+/// Per-file result of a sync. The file-writing machinery itself lives in
+/// [`crate::managed_file`], which engram also uses for the files it owns
+/// outright; this alias keeps the rules-facing name at the call sites.
+pub use crate::managed_file::ManagedFile as SyncedFile;
 
 /// `role` value marking a memory row as a durable rule rather than a message.
 pub const ROLE: &str = "rule";
@@ -36,14 +42,14 @@ pub const STATUS_RETIRED: &str = "retired";
 /// auto-loaded by agent harnesses, which is the entire point of syncing.
 pub const DEFAULT_TARGETS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
-/// Opening sentinel. Matched by prefix so attributes can be added to the tag
-/// later without orphaning blocks written by an older version.
-const BEGIN_PREFIX: &str = "<!-- engram:rules:begin";
-const END_MARKER: &str = "<!-- engram:rules:end -->";
+/// Sentinel pair delimiting the managed block. Defined in
+/// [`crate::managed_file`] so the splice machinery and the renderer cannot
+/// drift apart.
+const SENTINEL: managed_file::Sentinel = managed_file::RULES;
 
 /// Rule text containing this substring could terminate its own managed block
 /// and corrupt every subsequent `sync`, so it is rejected at write time.
-pub const SENTINEL_NEEDLE: &str = "engram:rules:";
+pub const SENTINEL_NEEDLE: &str = SENTINEL.needle;
 
 /// How the effective scope was determined, surfaced so callers can tell an
 /// explicit choice from a directory-name guess.
@@ -81,7 +87,7 @@ pub struct ResolvedScope {
 /// Returns an error if the current working directory cannot be read.
 pub fn resolve_scope(explicit: Option<&str>) -> std::io::Result<ResolvedScope> {
     let cwd = std::env::current_dir()?;
-    let git_root = find_git_root(&cwd);
+    let git_root = managed_file::find_git_root(&cwd);
     let root = git_root.clone().unwrap_or_else(|| cwd.clone());
 
     if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
@@ -116,15 +122,6 @@ pub fn resolve_scope(explicit: Option<&str>) -> std::io::Result<ResolvedScope> {
         root,
         origin: ScopeOrigin::Cwd,
     })
-}
-
-/// Walks up from `start` looking for `.git`. Tested with `exists` rather than
-/// `is_dir` because linked worktrees and submodules store `.git` as a file.
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .map(Path::to_path_buf)
 }
 
 fn basename(path: &Path) -> String {
@@ -190,7 +187,8 @@ pub fn validate_rule_text(text: &str) -> Result<(), String> {
 pub fn render_block(scope: &str, rules: &[Rule]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{BEGIN_PREFIX} scope=\"{scope}\" count=\"{}\" -->\n",
+        "{} scope=\"{scope}\" count=\"{}\" -->\n",
+        SENTINEL.begin_prefix,
         rules.len()
     ));
     out.push_str(
@@ -219,29 +217,8 @@ pub fn render_block(scope: &str, rules: &[Rule]) -> String {
         }
     }
 
-    out.push_str(END_MARKER);
+    out.push_str(SENTINEL.end_marker);
     out
-}
-
-/// What a single target file did during a sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FileOutcome {
-    /// File did not exist and was written from scratch.
-    Created,
-    /// Managed block was inserted or replaced.
-    Updated,
-    /// File already contained exactly this block; nothing written.
-    Unchanged,
-}
-
-/// Per-file result of a sync, including whether the write was actually made.
-#[derive(Debug, Clone, Serialize)]
-pub struct SyncedFile {
-    pub path: String,
-    pub outcome: FileOutcome,
-    /// True when `--dry-run` suppressed the write that `outcome` describes.
-    pub dry_run: bool,
 }
 
 /// Writes `block` into `path`, replacing an existing managed block or
@@ -252,73 +229,7 @@ pub struct SyncedFile {
 /// Returns an error if the file exists but cannot be read, or if the write
 /// fails. Nothing is written when `dry_run` is set or the content is unchanged.
 pub fn sync_file(path: &Path, block: &str, dry_run: bool) -> std::io::Result<SyncedFile> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
-    };
-
-    let (next, outcome) = match existing {
-        Some(current) => {
-            let next = splice_block(&current, block);
-            let outcome = if next == current {
-                FileOutcome::Unchanged
-            } else {
-                FileOutcome::Updated
-            };
-            (next, outcome)
-        }
-        None => (format!("{block}\n"), FileOutcome::Created),
-    };
-
-    if outcome != FileOutcome::Unchanged && !dry_run {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, &next)?;
-    }
-
-    Ok(SyncedFile {
-        path: path.to_string_lossy().into_owned(),
-        outcome,
-        dry_run,
-    })
-}
-
-/// Replaces the region between the sentinels, or appends the block when the
-/// file has no managed region yet. Content outside the sentinels is preserved
-/// verbatim — that is the whole reason for the sentinel scheme.
-fn splice_block(existing: &str, block: &str) -> String {
-    if let Some(begin) = existing.find(BEGIN_PREFIX) {
-        if let Some(rel_end) = existing[begin..].find(END_MARKER) {
-            let end = begin + rel_end + END_MARKER.len();
-            let mut out = String::with_capacity(existing.len() + block.len());
-            out.push_str(&existing[..begin]);
-            out.push_str(block);
-            out.push_str(&existing[end..]);
-            return out;
-        }
-        // Opening sentinel with no closing one: a truncated or hand-mangled
-        // block. Appending would leave two openers and make the next sync
-        // ambiguous, so treat everything from the opener onward as the block.
-        let mut out = String::with_capacity(begin + block.len() + 1);
-        out.push_str(&existing[..begin]);
-        out.push_str(block);
-        out.push('\n');
-        return out;
-    }
-
-    let mut out = String::with_capacity(existing.len() + block.len() + 2);
-    out.push_str(existing);
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        out.push('\n');
-    }
-    if !existing.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(block);
-    out.push('\n');
-    out
+    managed_file::write_managed(path, block, WritePolicy::Spliced(SENTINEL), dry_run)
 }
 
 /// Absolute paths to write for a scope: the caller's `--file` list if given,
@@ -361,11 +272,18 @@ mod tests {
         assert_eq!(render_block("demo", &rules), render_block("demo", &rules));
     }
 
+    /// The generic splice contract is covered in [`crate::managed_file`];
+    /// these exercise it through the *rendered rules block* specifically, so
+    /// a change to the renderer that broke round-tripping would be caught.
     #[test]
     fn splice_preserves_surrounding_content() {
         let block = render_block("demo", &[rule("a", "First.")]);
         let original = format!("# Title\n\nIntro paragraph.\n\n{block}\n\nTrailing section.\n");
-        let updated = splice_block(&original, &render_block("demo", &[rule("a", "Changed.")]));
+        let updated = managed_file::splice_block(
+            &original,
+            &render_block("demo", &[rule("a", "Changed.")]),
+            &SENTINEL,
+        );
 
         assert!(updated.starts_with("# Title\n\nIntro paragraph.\n"));
         assert!(updated.ends_with("Trailing section.\n"));
@@ -376,21 +294,23 @@ mod tests {
     #[test]
     fn splice_is_idempotent() {
         let block = render_block("demo", &[rule("a", "First.")]);
-        let once = splice_block("# Title\n", &block);
-        let twice = splice_block(&once, &block);
+        let once = managed_file::splice_block("# Title\n", &block, &SENTINEL);
+        let twice = managed_file::splice_block(&once, &block, &SENTINEL);
         assert_eq!(once, twice);
-        assert_eq!(once.matches(BEGIN_PREFIX).count(), 1);
+        assert_eq!(once.matches(SENTINEL.begin_prefix).count(), 1);
     }
 
     #[test]
     fn splice_repairs_block_missing_its_terminator() {
-        let mangled =
-            format!("# Title\n\n{BEGIN_PREFIX} scope=\"demo\" count=\"1\" -->\nhalf a block\n");
+        let mangled = format!(
+            "# Title\n\n{} scope=\"demo\" count=\"1\" -->\nhalf a block\n",
+            SENTINEL.begin_prefix
+        );
         let block = render_block("demo", &[rule("a", "First.")]);
-        let repaired = splice_block(&mangled, &block);
+        let repaired = managed_file::splice_block(&mangled, &block, &SENTINEL);
 
-        assert_eq!(repaired.matches(BEGIN_PREFIX).count(), 1);
-        assert_eq!(repaired.matches(END_MARKER).count(), 1);
+        assert_eq!(repaired.matches(SENTINEL.begin_prefix).count(), 1);
+        assert_eq!(repaired.matches(SENTINEL.end_marker).count(), 1);
         assert!(!repaired.contains("half a block"));
     }
 

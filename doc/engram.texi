@@ -57,10 +57,11 @@ the full terms.
 @menu
 * Introduction::            What Engram is and the three surfaces.
 * Invocation::              The command-line interface.
-* MCP Server::              The nine Model Context Protocol tools.
+* MCP Server::              The ten Model Context Protocol tools.
 * HTTP API::                Routes and their status-code behavior.
 * Environment Variables::   Every variable Engram reads.
 * Rules::                   Durable project policy.
+* Harness Integration::     Reading and writing the tools around Engram.
 * Index::                   Concept index.
 @end menu
 
@@ -657,12 +658,234 @@ Print the machine-readable CLI Standard capability manifest (JSON).
 
 @example
 engram save-chat --scope @var{id} [--file @var{path}] [--model @var{name}]
+                 [--dry-run]
 @end example
 
-Save a complete chat history for a scope to a Texinfo file.
-@code{--file} defaults to @file{chat/@var{timestamp}.texi};
-@code{--model} records an optional signature model/agent name (for
-example @code{gpt-5.6-pro}).
+Archive a scope's history as a complete Texinfo document.
+@code{--file} defaults to @file{chat/@var{timestamp}.texi} and, when
+relative, resolves against the project root rather than the process's
+current directory --- so the command targets the same file from any
+subdirectory.  @code{--model} records the archiving model or agent name
+(falling back to @env{MODEL}, @env{LLM_MODEL}, @env{AI_AGENT}, then
+@env{AGENT}).  @file{chat/} is added to the project's @file{.gitignore}
+when absent, and the response reports whether it was.
+
+@cindex idempotence, save-chat
+The rendered document is a @emph{pure function} of the scope's contents,
+exactly as the @command{engram rule sync} block is (@pxref{Rules}).
+Re-running @command{save-chat} over an unchanged scope therefore produces
+byte-identical output, the write is skipped, and the response reports
+@code{outcome: "unchanged"}.  This is why the provenance header carries the
+@emph{last message's} timestamp rather than the export's wall clock: a
+wall-clock stamp would rewrite the file on every invocation.  An existing
+archive is rewritten whole --- never appended to.
+
+Two exclusions are deliberate.  Rules never appear in an archive: an
+archive is a transcript, and rules have their own delivery mechanism.
+Reads performed for an export do not bump access counters: archiving is
+not retrieval, and counting it would corrupt the decay signal that
+@command{engram consolidate --report} computes.  Superseded rows @emph{are}
+included --- an archive records what was said, not what is currently true.
+
+@section engram ingest
+
+@cindex ingest command
+@cindex transcript capture
+@cindex harness transcripts
+
+@example
+engram ingest [--harness @var{name}] [--session @var{id}|latest|all]
+              [--scope @var{id}] [--cwd @var{path}]
+              [--include-thinking] [--include-tools] [--include-sidechains]
+              [--max-bytes @var{n}] [--max-chars-per-turn @var{n}]
+              [--list] [--dry-run]
+@end example
+
+Capture a harness's own session transcript into a scope, storing each
+message as an ordinary memory with role @code{user} or @code{assistant}.
+Those two role values have been in the schema since the beginning; until
+this command existed, nothing ever wrote them, because the only way into
+the store was an agent deciding to call @command{remember}.
+
+The harness is resolved from @code{--harness}, then from the environment
+marker of the harness engram is running under, then --- only when exactly
+one installed harness has a reader --- from that one.  Two candidates is
+an error.  Engram does not guess which conversation to copy into a scope.
+
+@subsection What is dropped
+
+@cindex filtering, transcript
+A session is mostly not prose.  Measured on one real 1.7@tie{}MB session:
+935 records in, @strong{46 turns out} --- 140 tool calls, 139 tool
+results, 52 thinking blocks, 226 non-message records.  Tool payloads and
+model thinking are therefore excluded by default, and everything dropped
+is counted and reported under @code{filtered}.
+
+Tool payloads are @emph{never} stored, even with @code{--include-tools}:
+a tool result is summarized to its size.  Payloads are where file
+contents, command output, and credentials live, and copying them into a
+database shared by every model on the machine is the largest privacy
+exposure engram could create.  What survives is additionally passed
+through a credential scrubber, whose replacements are counted per kind in
+the response.  That scrubber is a best-effort net, not a guarantee.
+
+@subsection Never guess
+
+Harness transcript formats are private, undocumented, and change without
+notice.  Two consequences are deliberate:
+
+@itemize @bullet
+@item
+An unrecognized record type increments @code{filtered.unknown_record}
+rather than being skipped quietly.  A format change then shows up as a
+count instead of as a silently shorter capture.
+@item
+An unparseable timestamp is an error, never a substitution of the current
+time.  @command{recall} orders by @code{created_at}, so a wall-clock
+fallback would collapse an entire conversation into one instant and
+destroy its reading order invisibly.
+@end itemize
+
+For the same reason, a harness engram cannot read fails with exit
+status@tie{}2 and a hint naming the fallback --- call @command{remember}
+during the session, then @command{save-chat} --- and writes nothing at
+all to standard output.  An empty success would be indistinguishable from
+``there is nothing here.''
+
+@subsection Idempotence
+
+Each turn's id is a version@tie{}5 UUID over the harness, session, and
+source record, the same discipline as the fact index uses.  Re-ingesting
+a session therefore inserts nothing, and resuming a live one inserts only
+the new tail.  Idempotence falls out of the identifier rather than out of
+bookkeeping about which files have been seen.
+
+That places real weight on what counts as a ``session.''  Codex reuses one
+identifier across every rollout of a resumed conversation --- three files
+sharing one were found on a single machine --- so engram keys on the
+rollout's file name instead.  Had it trusted the recorded identifier, two
+turns at the same position in different rollouts would have derived the
+same id, and the second would have been discarded as already present.
+Losing messages quietly is the one behaviour this command must not have.
+
+@subsection Supported harnesses
+
+@cindex Claude Code transcripts
+@cindex Codex transcripts
+Readers exist for Claude Code and Codex.  They locate a session quite
+differently, and neither approach generalizes to the other:
+
+@table @asis
+@item Claude Code
+Transcripts live under a directory named for the working directory, with
+each separator rewritten as a dash.  That mapping is applied forwards
+only: a directory name may itself contain a dash, so the inverse does not
+exist and is not offered.
+
+@item Codex
+The directory tree records the date rather than the working directory, so
+there is nothing to reverse.  Each rollout opens with a record stating its
+working directory verbatim, and listing reads exactly that one line from
+each file.
+@end table
+
+A rollout carries the conversation twice: once as the events the interface
+displayed, and once as the raw exchange with the model.  Engram prefers the
+displayed events, and not merely because they are simpler to read.  The raw
+channel is @emph{noisier}: on a real rollout it held one more user message
+than the display channel, and that message was an environment block the
+harness had injected rather than anything a person wrote.  The raw channel
+remains a fallback, used when a rollout carries no displayed conversation
+at all, so a change that retires one representation degrades rather than
+silently producing nothing.
+
+@cindex transcript size
+Transcripts can be very large --- one rollout on a developer machine was
+114@tie{}MB.  Both readers stream line by line, and
+@code{--max-bytes} (64@tie{}MiB by default) refuses an oversized
+transcript with an error naming the override rather than attempting it.
+
+@section engram install
+
+@cindex install command
+@cindex slash commands
+@cindex harness commands
+
+@example
+engram install [--harness @var{name}]@dots{} [--db-path @var{path}]
+               [--list] [--dry-run] [--force]
+@end example
+
+Write engram's slash commands --- @code{/engram-save-chat},
+@code{/engram-ingest}, and @code{/engram-context} --- into the command
+directory each harness loads for itself.  Engram is typically already
+registered as an MCP server everywhere; what this adds is a command
+surface, so engram can be invoked by name from inside a session.
+
+Begin with @code{--list}, which reports every harness engram knows,
+whether it is installed, where its commands would go, and which database
+it already registered engram against, and writes nothing.
+
+@subsection What it will and will not touch
+
+@itemize @bullet
+@item
+Only @emph{detected} harnesses.  Engram does not create a home directory
+for software that is not installed.
+@item
+Only files carrying engram's generated-by banner.  A command file written
+by hand is reported as skipped, with the reason, and left exactly as it
+was unless @code{--force} is given.
+@item
+Nothing is ever deleted, and no file outside a harness's command
+directory is touched.
+@end itemize
+
+The operation is idempotent by byte comparison: running it twice reports
+every file @code{unchanged} and does not so much as alter a modification
+time.  The banner deliberately carries no version number, because
+embedding one would make every release rewrite every installed file.
+
+@subsection The database is discovered, not assumed
+
+@cindex database discovery
+Each generated command pins @code{--db} explicitly, to the path that
+harness already registered engram against.  This matters more than it
+looks: the harnesses on a machine normally share one database, and a
+command that omitted the flag would fall back to a relative default and
+quietly write somewhere else.
+
+Configuration files are scanned narrowly rather than deserialized ---
+JSON, JSON-with-comments, and TOML each by their own small reader, so
+engram needs no TOML dependency and does not choke on comments.  Engram
+only ever @emph{reads} these files.  It will not rewrite a commented
+configuration, because a round-trip through a serializer would silently
+delete the comments.
+
+@subsection Harnesses without a command surface
+
+Of the harnesses engram knows, only some load user-written commands from
+a directory it can write.  The rest are reported plainly as having no
+command surface rather than omitted from the output.  Claiming otherwise
+would make the feature look broken on the harnesses it was never able to
+reach.
+
+@cindex Nix, home-manager
+On a declaratively managed home, skill directories are read-only symlinks
+into the Nix store, which is why engram ships commands rather than a
+skill.  When a target resolves into the store, @command{install} warns
+that the next @command{home-manager switch} will replace whatever it
+writes; reference the plugin directory from the configuration instead.
+
+@subsection Why this is not an HTTP route
+
+@command{install} writes into the user's home directory, a step beyond
+anything else engram does --- @command{rule sync} stays inside the
+project root.  The HTTP surface has no authentication, which already
+means any local process can rewrite a project's @file{AGENTS.md}.
+Exposing @command{install} there would extend that reach to the home
+directory, and eventually to code executed at the end of every session.
+There is no route, and there should not be one.
 
 @node MCP Server
 @chapter MCP Server
@@ -678,11 +901,28 @@ suitable for wiring into Claude Code, Codex, and other MCP clients:
 engram mcp --db /path/to/engram.db
 @end example
 
-The server exposes nine tools.  The memory tools mirror the CLI
-commands of the same names; the rule tools mirror @command{engram
-rule}.  (The tool surface is deliberately narrow: every tool's schema
-costs context on every turn of every conversation, so Engram budgets a
-hard ceiling of ten.)
+The server exposes ten tools.  The memory tools mirror the CLI commands
+of the same names; the rule tools mirror @command{engram rule}.
+
+@cindex tool ceiling (MCP)
+The tool surface is deliberately narrow: every tool's schema costs
+context on every turn of every conversation, so Engram budgets a hard
+ceiling of ten --- and @strong{that ceiling is now reached}.  An
+eleventh tool must displace an existing one, and the displacement must
+be argued here rather than decided in passing.
+
+@code{save_chat} earned the last slot only because it carries both
+halves of the capture story: it can capture the session transcript and
+then archive it.  Spending the slot on archiving alone would have left
+the server able to export a conversation but never to record one, with
+no slot left to fix that.
+
+Several commands are deliberately absent and are not candidates for the
+last slot.  @command{engram install} writes into the user's home
+directory.  @command{engram consolidate} and @command{engram index} are
+operator batch jobs whose results agents receive automatically through
+ranking.  @command{engram rule purge} deletes, and destructive
+operations are not agent-invocable.
 
 @table @code
 @item remember
@@ -732,6 +972,24 @@ deletes.
 @cindex rule_sync tool (MCP)
 Render a scope's rules into @file{AGENTS.md} and @file{CLAUDE.md} at
 the project root.
+
+@item save_chat
+@cindex save_chat tool (MCP)
+Archive a scope's history as a Texinfo document under the project's
+@file{chat/} directory, optionally capturing this harness's own session
+transcript into the scope first (@code{from_transcript}).
+
+@cindex path traversal, MCP
+There is deliberately no @code{file} argument.  The destination is
+derived from the server's resolved project root and cannot be
+influenced by the caller --- the same omission, for the same reason, as
+@code{rule_sync}'s missing @code{--file}.  A path argument here would be
+a traversal primitive handed to a model whose input includes text an
+attacker may have influenced: file contents, tool output, fetched pages.
+The nine tools that preceded it write to exactly two places, the
+database and sentinel-managed markdown at the project root; accepting an
+arbitrary path would be the largest expansion of Engram's blast radius
+to date, in exchange for a convenience nobody asked for.
 @end table
 
 @cindex scope, under MCP
@@ -959,6 +1217,157 @@ The current directory basename.
 Under MCP this cascade resolves against the server process's working
 directory, so a shared server needs an explicit scope
 (@pxref{MCP Server}).
+
+@node Harness Integration
+@chapter Harness Integration
+
+@cindex harness integration
+@cindex agent harnesses
+Engram reaches outside itself in two directions.  @command{engram
+ingest} @emph{reads} the session transcripts a harness writes for its own
+purposes, and @command{engram install} @emph{writes} command files, and
+optionally a hook, into the places a harness loads them from.  Both are
+described under @ref{Invocation}; this chapter collects what governs them,
+because the constraints are the interesting part and they are easy to
+lose track of when they are scattered across command descriptions.
+
+@section What Engram knows about each harness
+
+@cindex harness registry
+One table describes every harness, and detection is nothing more than
+asking whether a path exists.  Engram never runs a subprocess to find a
+harness, never reads a configuration file to decide whether one is
+installed, and never creates a directory for one that is not.
+
+Support is uneven, and the manual would rather say so than imply
+otherwise:
+
+@multitable @columnfractions .22 .26 .22 .30
+@headitem Harness @tab Transcripts @tab Commands @tab Hooks
+@item claude-code @tab read @tab written @tab written (opt-in)
+@item codex @tab read @tab written @tab ---
+@item opencode @tab --- @tab written @tab ---
+@item qwen @tab --- @tab --- @tab ---
+@item goose @tab --- @tab --- @tab ---
+@item antigravity @tab --- @tab --- @tab ---
+@item copilot-cli @tab --- @tab --- @tab ---
+@end multitable
+
+Every gap in that table is reported at runtime with its reason attached,
+rather than omitted.  @command{engram install --list} names the harnesses
+with no command surface; @command{engram ingest} fails with exit
+status@tie{}2 and an explanation when asked to read a harness it cannot.
+A feature that quietly does nothing on four of seven harnesses would read
+as broken; one that says which four, and why, is merely honest about its
+reach.
+
+@section Formats Engram does not control
+
+@cindex transcript format drift
+@cindex format changes
+Session transcripts are private, undocumented implementation details of
+the tools that write them.  They will change without notice, and a reader
+built on them has to expect that rather than assume it away.  Three
+consequences run through the implementation:
+
+@table @asis
+@item Unrecognized records are counted, never skipped
+Every record whose type Engram does not recognize increments
+@code{filtered.unknown_record} in the response.  A format change then
+announces itself as a number that was zero yesterday, instead of
+disappearing as a capture that is quietly shorter than it should be.
+
+This has already paid for itself twice.  It caught three kinds of tool
+record that an early version of the Codex reader had miscategorized, and
+it correctly flags genuinely truncated records --- one exists in the
+middle of a real rollout, left by an interrupted write.
+
+@item Unparseable timestamps are errors
+Engram will not substitute the current time for one it cannot read.
+@command{recall} orders by that field, so a wall-clock fallback would
+collapse a conversation into a single instant and destroy its reading
+order without any visible sign.
+
+@item Nothing is inferred from a file name
+Claude Code encodes a working directory in a directory name by replacing
+each separator with a dash.  Engram applies that mapping forwards only:
+a directory name may contain a dash of its own, so the inverse is not
+well defined and is not offered.  Codex records its working directory
+verbatim, so nothing needs reversing there.
+@end table
+
+@section Privacy
+
+@cindex privacy, transcript capture
+@cindex credentials, redaction
+Capturing a transcript is a different act from recording a note, and the
+difference deserves stating plainly.  When a model calls
+@command{remember}, it has chosen a sentence.  When Engram ingests a
+transcript, it copies whatever the session contained --- including
+everything the user pasted into it.
+
+That matters more than it might because the database is shared.  A
+typical machine has every harness pointed at one file, several of them
+backed by models running on somebody else's computer.  A credential that
+lands in that file has effectively been handed to all of them.
+
+Four measures follow, and none of them is decoration:
+
+@enumerate
+@item
+@strong{Tool payloads never enter.}  Not by default, and not with
+@code{--include-tools} either --- that flag adds a one-line summary of
+each tool call, and the payload is reduced to its size.  Payloads are
+where file contents, command output, and environment files live, and on
+a real session they are the majority of the transcript.
+
+@item
+@strong{Model reasoning is excluded by default.}
+
+@item
+@strong{What survives is scrubbed.}  Credential-shaped text is replaced
+before storage, and the replacements are counted by kind in the response
+so the user can see that it happened.  This is a best-effort net rather
+than a guarantee: it recognizes the shapes of machine-issued tokens,
+which are the ones that end up in transcripts by accident.  It cannot
+recognize a password someone typed as prose.
+
+@item
+@strong{Capture is never automatic.}  There is no background ingestion.
+The hook that can capture at the end of a session is installed only when
+explicitly requested, and it captures rather than archives.
+@end enumerate
+
+@section Writing into a home directory
+
+@cindex installation safety
+@command{engram install} writes outside the project, which nothing else
+in Engram does --- @command{engram rule sync} stays within the project
+root.  The additional care that warrants:
+
+@itemize @bullet
+@item
+Only harnesses that are actually installed are written to.
+@item
+Only files carrying Engram's own generated-by banner are overwritten.  A
+command file written by hand is reported as skipped, with the reason.
+@item
+Nothing is deleted, and the operation is idempotent by byte comparison:
+running it twice reports every file unchanged and does not alter a
+modification time.
+@item
+The one structured file Engram merges into --- a settings file, and only
+under @code{--hooks} --- is backed up first, has only its own hook entry
+replaced, and is refused outright rather than overwritten if it does not
+parse.  Other hooks on the same event are left where they are.
+@end itemize
+
+@cindex Nix, home-manager
+On a declaratively managed home directory, skill directories are
+read-only links into the Nix store.  That is why Engram ships commands
+rather than a skill: command directories are writable.  When a target
+resolves into the store, @command{install} says so, because the next
+rebuild would replace whatever it wrote.
 
 @node Index
 @unnumbered Index

@@ -1,0 +1,16 @@
+{
+  "description": "Optionally capture each finished session into engram. Captures only — it never writes an archive into your repository.",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram ingest --harness claude-code --session latest",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
