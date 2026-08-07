@@ -53,6 +53,12 @@ const NON_MESSAGE_TYPES: &[&str] = &[
     "queue-operation",
     "system",
     "summary",
+    // Bookkeeping for the web / remote-control bridge: session ids and a
+    // sequence number, no `message` at all.
+    "bridge-session",
+    // A pull request opened from this session. Re-appended on every update, so
+    // one PR yields several records.
+    "pr-link",
 ];
 
 /// Lists this working directory's transcripts, newest first.
@@ -432,6 +438,25 @@ mod tests {
         );
         assert_eq!(stats.unknown_record, 1);
         assert_eq!(stats.non_message, 0);
+    }
+
+    /// Both types appeared in Claude Code transcripts after the allowlist was
+    /// written, and between them accounted for every `unknown_record` in a
+    /// 1372-line session — 55 `bridge-session` and 10 `pr-link`. Neither
+    /// carries a `message`, so nothing was ever dropped; the count was pure
+    /// false alarm, which is worse than useless because it desensitizes a
+    /// reader to the one signal that is supposed to mean something.
+    #[test]
+    fn bridge_session_and_pr_link_are_non_messages() {
+        for record in [
+            r#"{"type":"bridge-session","sessionId":"s1","bridgeSessionId":"cse_1","lastSequenceNum":0}"#,
+            r#"{"type":"pr-link","sessionId":"s1","prNumber":25,"prUrl":"https://example.invalid/pull/25","prRepository":"owner/repo","timestamp":"2026-08-06T21:12:33.853Z"}"#,
+        ] {
+            let (turn, stats) = parse(record, &ReadOptions::default());
+            assert!(turn.is_none(), "{record} must not become a turn");
+            assert_eq!(stats.non_message, 1, "{record} must count as non_message");
+            assert_eq!(stats.unknown_record, 0, "{record} must not be unknown");
+        }
     }
 
     #[test]

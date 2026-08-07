@@ -13,7 +13,20 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
-- `save-chat --scope` is now optional, resolving through the same cascade as
+- The Claude Code reader recognizes `bridge-session` and `pr-link` as
+  non-message records. Both appeared in transcripts after
+  `NON_MESSAGE_TYPES` was written, so both were counted as `unknown_record` —
+  the deliberate early-warning signal for a format change in a file engram
+  does not own. In one 1372-line session they accounted for **every** such
+  record: 55 `bridge-session` and 10 `pr-link`, reported as 65 unknown
+  records. Neither carries a `message` at all (`bridge-session` is bridge
+  bookkeeping — session ids and a sequence number; `pr-link` records a pull
+  request opened from the session, re-appended on each update, so one PR
+  yields several records), so **no conversation was ever dropped** and the
+  ingested turn count was already complete. The bug was the false alarm
+  itself: a warning that fires on every capture trains a reader to ignore the
+  one signal that is supposed to mean something. Nothing about which turns get
+  ingested changes.
   every other scoped command (`ENGRAM_SCOPE`, git working-tree name, directory
   name). It was the only scoped command requiring the flag, which made the
   generated `/engram-save-chat` slash command fail outright when invoked with
