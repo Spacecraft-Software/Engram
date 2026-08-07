@@ -668,7 +668,29 @@ current directory --- so the command targets the same file from any
 subdirectory.  @code{--model} records the archiving model or agent name
 (falling back to @env{MODEL}, @env{LLM_MODEL}, @env{AI_AGENT}, then
 @env{AGENT}).  @file{chat/} is added to the project's @file{.gitignore}
-when absent, and the response reports whether it was.
+when absent, and the response says so explicitly rather than doing it
+silently: it edits a tracked file.
+
+@cindex gitignore, save-chat
+The report is a @code{gitignore} object naming the file engram considered
+(@code{path}), the entry it keeps (@code{entry}, @file{chat/}), what it did
+(@code{action}), and a @code{detail} sentence naming engram as the actor.
+The three actions are distinct, and only the first writes:
+
+@table @code
+@item added
+Engram appended the entry.
+@item already-ignored
+The entry was already present; engram wrote nothing.
+@item would-add
+A dry run: engram would have appended the entry, and wrote nothing.
+@end table
+
+@noindent
+This replaces an earlier boolean @code{gitignore_updated}, which left the
+reader to supply who had acted and on which file, reported @code{false} for
+the ordinary no-op in a way that read as a failure, and reported @code{true}
+for a dry run that had written nothing at all.
 
 @cindex idempotence, save-chat
 The rendered document is a @emph{pure function} of the scope's contents,

@@ -610,7 +610,7 @@ impl EngramMcp {
             "file": result.file,
             "signed_by": result.signed_by,
             "messages_saved": result.messages_saved,
-            "gitignore_updated": result.gitignore_updated,
+            "gitignore": result.gitignore,
             "dry_run": args.dry_run,
             "captured": captured,
         });
@@ -1406,6 +1406,13 @@ mod tests {
         assert_eq!(v["messages_saved"], 1);
         assert_eq!(v["file"]["outcome"], "created");
         assert_eq!(v["dry_run"], true);
+        // MCP carries the same self-describing gitignore report as the CLI:
+        // both surfaces serialize one struct, so they cannot drift.
+        assert_eq!(v["gitignore"]["action"], "would-add");
+        assert!(v["gitignore"]["detail"]
+            .as_str()
+            .expect("detail")
+            .contains(".gitignore"));
         let path = v["file"]["path"].as_str().expect("path").to_string();
         assert!(
             !std::path::Path::new(&path).exists(),

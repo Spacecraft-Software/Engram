@@ -19,9 +19,42 @@ pub struct SaveChatResult {
     pub file: crate::managed_file::ManagedFile,
     pub signed_by: String,
     pub messages_saved: usize,
-    /// Whether `chat/` had to be added to the project's `.gitignore`. Reported
+    /// What engram did to the project's `.gitignore`, if anything. Reported
     /// rather than performed silently: it edits a tracked file.
-    pub gitignore_updated: bool,
+    pub gitignore: GitignoreOutcome,
+}
+
+/// Engram's handling of the project `.gitignore` during an archive.
+///
+/// This is a self-describing structure rather than the bare
+/// `gitignore_updated: bool` it replaces. A lone boolean forced the reader to
+/// supply three facts from memory — *whose* `.gitignore`, *what* entry, and
+/// who the actor was — and `false` in particular read as a failure report
+/// ("something did not get updated") when it actually means engram found the
+/// entry already present and correctly left the file alone.
+#[derive(serde::Serialize)]
+pub struct GitignoreOutcome {
+    /// The `.gitignore` engram considered, absolute.
+    pub path: String,
+    /// The entry engram ensures is present, so archives are never committed.
+    pub entry: &'static str,
+    pub action: GitignoreAction,
+    /// One sentence, naming engram as the actor and the file as the object.
+    /// Machine callers read `action`; this exists so a human reading the raw
+    /// envelope needs no further explanation.
+    pub detail: String,
+}
+
+/// What engram did to `.gitignore`.
+#[derive(serde::Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitignoreAction {
+    /// Engram appended the entry.
+    Added,
+    /// The entry was already there; engram wrote nothing.
+    AlreadyIgnored,
+    /// Dry run: engram would have appended the entry, and wrote nothing.
+    WouldAdd,
 }
 
 /// Fallback signature when neither `--model` nor any of the model environment
@@ -69,7 +102,7 @@ pub fn save_chat(
         dry_run,
     )?;
 
-    let gitignore_updated = sync_gitignore(&resolved.root, dry_run)?;
+    let gitignore = sync_gitignore(&resolved.root, dry_run)?;
 
     Ok(SaveChatResult {
         scope: resolved.name.clone(),
@@ -78,20 +111,52 @@ pub fn save_chat(
         file,
         signed_by: model_name,
         messages_saved: mems.len(),
-        gitignore_updated,
+        gitignore,
     })
 }
 
+/// The entry engram keeps in `.gitignore`, so archived transcripts are never
+/// committed to the project by accident.
+const CHAT_IGNORE_ENTRY: &str = "chat/";
+
 /// Adds `chat/` to the project's `.gitignore` when it is not already ignored,
-/// reporting whether it did. Returns `false` without touching the file when
-/// the entry is already present or `dry_run` is set.
+/// and describes what it did.
+///
+/// Writes nothing when the entry is already present or `dry_run` is set — the
+/// two cases are distinct in the report ([`GitignoreAction::AlreadyIgnored`]
+/// versus [`GitignoreAction::WouldAdd`]), because the old boolean returned
+/// `true` for a dry run and so claimed an update that never happened.
 ///
 /// # Errors
 ///
 /// Returns an error if `.gitignore` exists but cannot be read, or the write
 /// fails.
-fn sync_gitignore(root: &std::path::Path, dry_run: bool) -> std::io::Result<bool> {
+fn sync_gitignore(root: &std::path::Path, dry_run: bool) -> std::io::Result<GitignoreOutcome> {
     let path = root.join(".gitignore");
+    let display = path.display().to_string();
+    let describe = |action: GitignoreAction| {
+        let detail = match action {
+            GitignoreAction::Added => format!(
+                "engram added `{CHAT_IGNORE_ENTRY}` to this project's .gitignore ({display}), \
+                 so archived chat transcripts are not committed"
+            ),
+            GitignoreAction::AlreadyIgnored => format!(
+                "engram made no change: `{CHAT_IGNORE_ENTRY}` is already ignored by this \
+                 project's .gitignore ({display})"
+            ),
+            GitignoreAction::WouldAdd => format!(
+                "dry run, nothing written: engram would add `{CHAT_IGNORE_ENTRY}` to this \
+                 project's .gitignore ({display})"
+            ),
+        };
+        GitignoreOutcome {
+            path: display.clone(),
+            entry: CHAT_IGNORE_ENTRY,
+            action,
+            detail,
+        }
+    };
+
     let mut content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -102,18 +167,19 @@ fn sync_gitignore(root: &std::path::Path, dry_run: bool) -> std::io::Result<bool
         .lines()
         .any(|l| matches!(l.trim(), "chat" | "chat/" | "/chat" | "/chat/"))
     {
-        return Ok(false);
+        return Ok(describe(GitignoreAction::AlreadyIgnored));
     }
     if dry_run {
-        return Ok(true);
+        return Ok(describe(GitignoreAction::WouldAdd));
     }
 
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str("chat/\n");
+    content.push_str(CHAT_IGNORE_ENTRY);
+    content.push('\n');
     std::fs::write(&path, &content)?;
-    Ok(true)
+    Ok(describe(GitignoreAction::Added))
 }
 
 /// Renders a scope's history as a complete Texinfo document.
