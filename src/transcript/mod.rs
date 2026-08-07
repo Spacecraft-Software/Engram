@@ -168,11 +168,32 @@ impl From<std::io::Error> for TranscriptError {
 /// Counts of everything a read discarded, reported so a user can see what a
 /// transcript is actually made of — and so a format change shows up as a
 /// spike in `unknown_record` rather than as silence.
+///
+/// The three "could not read this" counters are kept apart because they mean
+/// different things and call for different responses. An unrecognized `type` is
+/// a format change: benign, fixed by extending an allowlist. A torn line is a
+/// write interrupted mid-flight: nothing to fix in engram, and transient if the
+/// file was being appended while it was read. A record without a `uuid` is a
+/// real conversation turn that had to be dropped for want of a stable id. One
+/// combined counter made all three read as "the format moved", which is wrong
+/// twice out of three times and desensitizes a reader to the case that matters.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FilterStats {
     /// Records whose `type` engram does not recognize. A non-zero count on a
     /// harness that used to read cleanly means the format moved.
     pub unknown_record: usize,
+    /// Lines that are not valid JSON — an interrupted write, which can land
+    /// mid-file and not only at the end.
+    ///
+    /// Not a format change, and not necessarily a defect: reading a transcript
+    /// while its harness is still appending to it can catch a partial line that
+    /// is complete moments later.
+    pub torn_line: usize,
+    /// Conversation records carrying no `uuid`, which cannot be given a stable
+    /// id and so cannot be ingested.
+    ///
+    /// The only one of the three that means a real turn was lost.
+    pub missing_uuid: usize,
     /// Recognized record types that are not conversation (mode changes,
     /// snapshots, titles).
     pub non_message: usize,
@@ -194,6 +215,8 @@ impl FilterStats {
     /// sessions of one `--session all` run.
     pub fn merge(&mut self, other: &FilterStats) {
         self.unknown_record += other.unknown_record;
+        self.torn_line += other.torn_line;
+        self.missing_uuid += other.missing_uuid;
         self.non_message += other.non_message;
         self.thinking += other.thinking;
         self.tool_use += other.tool_use;

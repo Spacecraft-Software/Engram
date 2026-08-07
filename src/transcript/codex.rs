@@ -244,8 +244,9 @@ pub fn read(path: &Path, opts: &ReadOptions) -> Result<ReadResult, TranscriptErr
             // A torn line — an interrupted write. Observed mid-file in a real
             // rollout, not only at the end, so this is counted rather than
             // ignored: one unreadable record is worth reporting, and a rising
-            // count means something worse.
-            stats.unknown_record += 1;
+            // count means something worse. Kept apart from `unknown_record`,
+            // which means a format change and calls for a different response.
+            stats.torn_line += 1;
             continue;
         };
 
@@ -570,6 +571,29 @@ mod tests {
         assert!(turn.is_none());
         assert_eq!(stats.unknown_record, 1);
         assert_eq!(stats.non_message, 0);
+    }
+
+    /// The torn line observed mid-rollout is an interrupted write, not a
+    /// format change, and must not be reported as one.
+    #[test]
+    fn a_torn_line_is_not_a_format_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("torn.jsonl");
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-06-25T15:26:35Z\",\"type\":\"event_msg\",\
+             \"payload\":{\"type\":\"user_message\",\"message\":\"kept\"}}\n\
+             {\"timestamp\":\"2026-06-25T15:26:36Z\",\"type\":\"event_ms\n",
+        )
+        .expect("write");
+
+        let result = read(&path, &ReadOptions::default()).expect("read");
+
+        assert_eq!(result.filtered.torn_line, 1);
+        assert_eq!(
+            result.filtered.unknown_record, 0,
+            "an interrupted write must not look like a format change"
+        );
     }
 
     #[test]

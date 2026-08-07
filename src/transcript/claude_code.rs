@@ -144,8 +144,11 @@ pub fn read(path: &Path, opts: &ReadOptions) -> Result<ReadResult, TranscriptErr
         }
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             // A torn line — an interrupted write, which can land mid-file and
-            // not only at the end. Counted rather than ignored.
-            stats.unknown_record += 1;
+            // not only at the end. Counted rather than ignored, but kept apart
+            // from `unknown_record`: this is not a format change, and reading a
+            // transcript the harness is still appending to can catch a line
+            // that is complete a moment later.
+            stats.torn_line += 1;
             continue;
         };
         if let Some(turn) = parse_record(&record, opts, &mut stats, &mut redactions)? {
@@ -222,7 +225,7 @@ pub(crate) fn parse_record(
     // record without a uuid cannot be given a stable id, so it is reported as
     // unknown rather than ingested under a fabricated one.
     let Some(source_uuid) = record.get("uuid").and_then(Value::as_str) else {
-        stats.unknown_record += 1;
+        stats.missing_uuid += 1;
         return Ok(None);
     };
     let raw_ts = record
@@ -498,6 +501,8 @@ mod tests {
         assert!(matches!(err, TranscriptError::BadTimestamp { .. }));
     }
 
+    /// Counted apart from `unknown_record` because it is the only one of the
+    /// three unreadable cases where a real conversation turn was lost.
     #[test]
     fn a_record_without_a_uuid_cannot_be_given_a_stable_id() {
         let (turn, stats) = parse(
@@ -506,7 +511,37 @@ mod tests {
             &ReadOptions::default(),
         );
         assert!(turn.is_none());
-        assert_eq!(stats.unknown_record, 1);
+        assert_eq!(stats.missing_uuid, 1);
+        assert_eq!(
+            stats.unknown_record, 0,
+            "a lost turn is not a format change"
+        );
+    }
+
+    /// A torn line is an interrupted write, not a format change. Reporting it
+    /// as one sent a reader chasing a harness that had not moved: a transcript
+    /// read while it was still being appended to showed 56 of these, all of
+    /// which were complete lines minutes later.
+    #[test]
+    fn a_torn_line_is_not_a_format_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("torn.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-08-01T00:00:00Z\",\
+             \"message\":{\"role\":\"user\",\"content\":\"kept\"}}\n\
+             {\"type\":\"user\",\"uuid\":\"u2\",\"timestamp\":\"2026-08-01T00\n",
+        )
+        .expect("write");
+
+        let result = read(&path, &ReadOptions::default()).expect("read");
+
+        assert_eq!(result.turns.len(), 1, "the intact record still reads");
+        assert_eq!(result.filtered.torn_line, 1);
+        assert_eq!(
+            result.filtered.unknown_record, 0,
+            "an interrupted write must not look like a format change"
+        );
     }
 }
 

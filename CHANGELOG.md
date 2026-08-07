@@ -13,6 +13,23 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Changed
 
+- **Breaking (envelope).** The `filtered` histogram splits `unknown_record`
+  into three counters, because one number meant three unrelated things and
+  therefore could not be acted on. `unknown_record` now means only an
+  unrecognized record `type` — a genuine format change, fixed by extending an
+  allowlist. `torn_line` counts lines that are not valid JSON, from a write
+  interrupted mid-flight. `missing_uuid` counts conversation records with no
+  `uuid`, the only one of the three where a real turn is lost.
+
+  The merge made every torn line read as a format change, which is what the
+  counter is documented to signal. A session reading a transcript while its
+  harness was still appending reported 56 "unknown records"; every one was a
+  partial line that was complete minutes later, and none indicated any change
+  in the format. Two false alarms in three teaches a reader to ignore the
+  counter, which costs precisely the early warning it exists to give.
+
+  Callers reading `filtered.unknown_record` will see a smaller number for the
+  same transcript; the total across the three matches the old value.
 - **Breaking (envelope).** `save-chat` replaces the boolean `gitignore_updated`
   with a self-describing `gitignore` object: `path` (which file), `entry`
   (`chat/`), `action` (`added` | `already-ignored` | `would-add`) and `detail`,
