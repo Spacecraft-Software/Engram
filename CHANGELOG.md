@@ -11,6 +11,38 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Added
+
+- **`flake.nix`** — Engram is now consumable as a Nix flake input
+  (`github:Spacecraft-Software/Engram`), exposing `packages.default`,
+  `packages.engram`, `apps.default`, `checks.default`, and `default`/`docs`
+  dev shells. The package itself is still defined once in
+  `packaging/default.nix` (Standard §5.5); the flake passes `srcOverride =
+  self` so it builds the checkout rather than a tagged tarball, which is
+  necessary while 0.6.0 is unreleased.
+
+  There is deliberately no `nixosModule`. Engram is entirely `$HOME` state —
+  its store, its `~/.claude/commands/` output, its MCP server spawned by a
+  user's harness — so a `programs.engram.enable` whose only body is
+  `environment.systemPackages` would advertise a system scope the tool does
+  not have. Consumers install `packages.default` into `home.packages`.
+
+### Fixed
+
+- `packaging/default.nix` claimed `version = "0.5.0"` while `Cargo.toml` said
+  `0.6.0-dev`, and hand-rolled a `builtins.path` source filter that excluded
+  `.git`/`target`/`engram.db` but silently missed `chat/` and `research/`.
+  It now takes Vacuum's `srcOverride ? null` parameter, so under a flake the
+  source is the git tree and `.gitignore` does the filtering. (The argument is
+  not named `src` because `callPackage` fills unbound arguments from nixpkgs,
+  which has its own `src` attribute — a `src ? null` default is silently
+  overridden.)
+- The same `0.5.0` skew in `packaging/PKGBUILD`, `packaging/guix.scm` and
+  `doc/engram.texi`. `engram --version` reads `CARGO_PKG_VERSION` and was
+  always correct; only the packaging metadata and the manual were stale.
+  `guix.scm` still does not build — its source hash is a placeholder of zeros
+  — and now says so unambiguously instead of implying otherwise.
+
 ### Changed
 
 - **Breaking (envelope).** The `filtered` histogram splits `unknown_record`

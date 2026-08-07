@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Arch Linux PKGBUILD for engram (Steelbore Standard §5.5).
-# 0.2.0-dev is unreleased, so this builds from the main branch.
+# 0.6.0 is unreleased, so this builds from the main branch.
 
 pkgname=engram
 # PKGBUILD forbids hyphens in pkgver; a -dev suffix would be spelled .dev.
-pkgver=0.5.0
+# Left as the plain release number so vercmp still orders it below the real
+# 0.6.0 tag when that lands.
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="Shared verbatim chat memory for multi-model LLM pipelines (SQLite FTS5; CLI, MCP, HTTP)"
 arch=('x86_64' 'aarch64')

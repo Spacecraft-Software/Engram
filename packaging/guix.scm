@@ -5,10 +5,14 @@
 ;;
 ;; Build:  guix build -f packaging/guix.scm
 ;;
-;; 0.2.0-dev is unreleased, so the buildable path below fetches the git
-;; tree.  The hashes are placeholders and MUST be replaced before this
-;; definition can actually build — Guix refuses a wrong hash, it never
-;; ignores one.
+;; 0.6.0 is unreleased, so the buildable path below fetches the git tree.
+;;
+;; THIS DEFINITION DOES NOT BUILD AS IT STANDS.  The source hash is a
+;; placeholder of zeros and MUST be replaced first — Guix refuses a wrong
+;; hash, it never ignores one.  The version string below is kept in step
+;; with Cargo.toml so the file is not also *stale*, but that is the only
+;; thing correct about it; use packaging/default.nix (Nix) or the flake for
+;; a build that works today.
 
 (use-modules (guix packages)
              (guix download)
@@ -19,7 +23,7 @@
 (define-public engram
   (package
     (name "engram")
-    (version "0.5.0")
+    (version "0.6.0")
     ;; Release stanza — swap in at the first tagged release:
     ;;
     ;; (source
