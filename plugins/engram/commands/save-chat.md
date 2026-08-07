@@ -17,9 +17,21 @@ Run these in order and report what happened:
    !`engram --db {{DB}} ingest --harness {{HARNESS}} --dry-run`
 
 2. Read the `filtered` counts in that output. Most of a transcript is tool
-   traffic, so a large `tool_result` count is normal, not a problem. If
-   `unknown_record` is non-zero, say so — it means this harness's transcript
-   format has changed and the reader may be missing messages.
+   traffic, so a large `tool_result` count is normal, not a problem.
+
+   Three counters mean a record could not be read, and they are not
+   interchangeable. Report whichever is non-zero, and say which it was:
+
+   - `unknown_record` — a record `type` engram does not recognize. This is the
+     one that means the harness's transcript format has moved and the reader
+     may be missing messages. Worth acting on.
+   - `torn_line` — a line that is not valid JSON, from a write interrupted
+     mid-flight. Nothing in engram is wrong. Often *transient*: reading a
+     transcript the harness is still appending to catches partial lines that
+     are complete moments later, so re-running usually shows fewer. Do not
+     report this as a format change.
+   - `missing_uuid` — a conversation record with no `uuid`, which cannot be
+     given a stable id. This is the one where a real turn was dropped.
 
 3. If step 1 reports turns to insert, run it for real:
 
