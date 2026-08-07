@@ -11,6 +11,21 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (envelope).** `save-chat` replaces the boolean `gitignore_updated`
+  with a self-describing `gitignore` object: `path` (which file), `entry`
+  (`chat/`), `action` (`added` | `already-ignored` | `would-add`) and `detail`,
+  a sentence naming engram as the actor. The boolean was ambiguous about whose
+  `.gitignore` was meant and who had acted on it, and `gitignore_updated: false`
+  read as a failure report when it actually meant engram correctly left an
+  already-correct file alone. Both the CLI and the MCP `save_chat` tool
+  serialize the same struct. Callers reading `gitignore_updated` must read
+  `gitignore.action` instead.
+- `save-chat --dry-run` no longer claims it updated `.gitignore`. The boolean
+  returned `true` for a dry run — reporting an update that never happened —
+  where the new report distinguishes `would-add` from `added`.
+
 ### Fixed
 
 - The Claude Code reader recognizes `bridge-session` and `pr-link` as

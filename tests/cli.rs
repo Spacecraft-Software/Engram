@@ -1576,9 +1576,62 @@ fn save_chat_resolves_relative_file_against_the_project_root() {
     assert!(predicate::path::missing().eval(&nested.join("archive.texi")));
 
     // `chat/` is gitignored at the root, once, and reported rather than
-    // written silently.
-    assert_eq!(json["data"]["gitignore_updated"], true);
+    // written silently. The report names engram as the actor and the file as
+    // the object: a bare `gitignore_updated: false` read as a failure.
+    let gi = &json["data"]["gitignore"];
+    assert_eq!(gi["action"], "added");
+    assert_eq!(gi["entry"], "chat/");
+    assert_eq!(
+        gi["path"].as_str().expect("path"),
+        project.join(".gitignore").to_string_lossy()
+    );
+    let detail = gi["detail"].as_str().expect("detail");
+    assert!(detail.starts_with("engram "), "{detail}");
+    assert!(detail.contains(".gitignore"), "{detail}");
     let ignored = std::fs::read_to_string(project.join(".gitignore")).expect("gitignore written");
+    assert_eq!(ignored.matches("chat/").count(), 1);
+}
+
+/// The three `.gitignore` outcomes are distinguishable, and only one of them
+/// writes. The replaced boolean reported `true` for a dry run, claiming an
+/// update that never happened, and `false` for "already ignored", which read
+/// as a failure rather than as the no-op it is.
+#[test]
+fn save_chat_reports_each_gitignore_outcome_distinctly() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(project.join(".git"), "gitdir: elsewhere\n").expect("write .git marker");
+    let scope = "gitignore-outcomes";
+    remember(&db, "a", scope, "a message");
+
+    let action = |args: &[&str]| -> (String, String) {
+        let assert = save_chat(&db, &project, args).assert().success();
+        let json = parse_single_line_json(&assert.get_output().stdout);
+        let gi = &json["data"]["gitignore"];
+        (
+            gi["action"].as_str().expect("action").to_string(),
+            gi["detail"].as_str().expect("detail").to_string(),
+        )
+    };
+
+    // Dry run: reported as would-add, and nothing is written.
+    let (act, detail) = action(&["--scope", scope, "--file", "a.texi", "--dry-run"]);
+    assert_eq!(act, "would-add");
+    assert!(detail.contains("dry run"), "{detail}");
+    assert!(predicate::path::missing().eval(&project.join(".gitignore")));
+
+    // First real run: added.
+    let (act, detail) = action(&["--scope", scope, "--file", "a.texi"]);
+    assert_eq!(act, "added");
+    assert!(detail.starts_with("engram added"), "{detail}");
+
+    // Second run: already ignored, no second entry.
+    let (act, detail) = action(&["--scope", scope, "--file", "a.texi"]);
+    assert_eq!(act, "already-ignored");
+    assert!(detail.contains("already ignored"), "{detail}");
+    let ignored = std::fs::read_to_string(project.join(".gitignore")).expect("read");
     assert_eq!(ignored.matches("chat/").count(), 1);
 }
 
