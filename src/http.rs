@@ -445,7 +445,7 @@ async fn rule_add(State(store): State<SharedStore>, Json(body): Json<RuleAddBody
                 "created": upsert.created,
                 "scope": resolved.name,
                 "scope_origin": resolved.origin,
-                "next_step": "POST /v1/rules/sync to render this rule into AGENTS.md and CLAUDE.md",
+                "next_step": "POST /v1/rules/sync to render this rule into AGENTS.md",
             }),
         ),
         Err(e) => err(
@@ -541,7 +541,7 @@ async fn rule_retire(
                 "outcome": retire.outcome,
                 "rule": retire.rule,
                 "scope_origin": resolved.origin,
-                "next_step": "POST /v1/rules/sync to drop this rule from AGENTS.md and CLAUDE.md",
+                "next_step": "POST /v1/rules/sync to drop this rule from AGENTS.md",
             }),
         ),
         Err(e) => err(
@@ -559,8 +559,8 @@ struct RuleSyncBody {
     dry_run: bool,
 }
 
-/// `POST /v1/rules/sync` — render a scope's rules into `AGENTS.md` and
-/// `CLAUDE.md` at the project root.
+/// `POST /v1/rules/sync` — render a scope's rules into `AGENTS.md` at the
+/// project root.
 ///
 /// This is the only route that writes outside the database. The target paths
 /// are derived from the server process's own working directory, never from

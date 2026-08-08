@@ -601,7 +601,7 @@ explicit).  @code{--dry-run} previews the deletion.
 engram rule sync [--scope @var{id}] [--file @var{path}]@dots{} [--dry-run]
 @end example
 
-Render the scope's rules into @file{AGENTS.md} and @file{CLAUDE.md}
+Render the scope's rules into @file{AGENTS.md}
 (or the given @code{--file} targets, repeatable).  Only the region
 between the engram sentinels is rewritten.  With @code{--dry-run},
 reports what would be written without touching any file.
@@ -992,7 +992,7 @@ deletes.
 
 @item rule_sync
 @cindex rule_sync tool (MCP)
-Render a scope's rules into @file{AGENTS.md} and @file{CLAUDE.md} at
+Render a scope's rules into @file{AGENTS.md} at
 the project root.
 
 @item save_chat
@@ -1099,7 +1099,7 @@ unknown rule, @code{200} with the outcome on success.
 
 @item POST /v1/rules/sync
 @cindex POST /v1/rules/sync
-Render the scope's rules into @file{AGENTS.md} and @file{CLAUDE.md}.
+Render the scope's rules into @file{AGENTS.md}.
 This is the only route that writes outside the database; targets
 derive from the server process's working directory, never from caller
 input.
@@ -1175,9 +1175,10 @@ Four invariants worth not breaking:
 @item
 @cindex sync, as delivery
 @emph{Sync is the delivery mechanism, not an export.}  A row in SQLite
-never reaches a model's context.  Rendering into @file{AGENTS.md} and
-@file{CLAUDE.md} --- files harnesses auto-load --- is what makes a rule
-take effect.
+never reaches a model's context.  Rendering into @file{AGENTS.md} ---
+the file harnesses auto-load, and that Claude Code reaches through the
+@code{@@AGENTS.md} import in its @file{CLAUDE.md} (Steelbore Standard
+§5.7) --- is what makes a rule take effect.
 
 @item
 @emph{The rendered block is a pure function of the rules.}  No

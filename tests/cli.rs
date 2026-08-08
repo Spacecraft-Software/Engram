@@ -468,7 +468,7 @@ fn rule_sync_dry_run_writes_no_files() {
         .success();
 
     // Run from the temp dir: it has no .git, so the project root — and the
-    // default AGENTS.md/CLAUDE.md targets — resolve there.
+    // default AGENTS.md target — resolves there.
     let assert = engram(&db)
         .current_dir(tmp.path())
         .args(["rule", "sync", "--scope", scope, "--dry-run"])
@@ -486,8 +486,15 @@ fn rule_sync_dry_run_writes_no_files() {
         .expect("data.files is an array");
     assert_eq!(
         files.len(),
-        2,
-        "default targets are AGENTS.md and CLAUDE.md"
+        1,
+        "AGENTS.md is the sole default target (Standard §5.7); CLAUDE.md \
+         receives the block through its @AGENTS.md import, so writing both \
+         would deliver it twice and create two copies that can disagree"
+    );
+    assert_eq!(
+        files[0]["path"].as_str().expect("file path is a string"),
+        tmp.path().join("AGENTS.md").to_string_lossy(),
+        "the default target is AGENTS.md, not CLAUDE.md"
     );
     for file in files {
         assert_eq!(file["dry_run"], true);
@@ -500,7 +507,7 @@ fn rule_sync_dry_run_writes_no_files() {
     );
     assert!(
         missing.eval(&tmp.path().join("CLAUDE.md")),
-        "dry run must not create CLAUDE.md"
+        "CLAUDE.md is not a sync target at all (§5.7), dry run or not"
     );
 }
 

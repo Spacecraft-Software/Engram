@@ -106,7 +106,7 @@ engram rule add --id skill-description-1000 \
 # Read what's in effect.
 engram rule list
 
-# Render into AGENTS.md and CLAUDE.md at the project root.
+# Render into AGENTS.md at the project root.
 engram rule sync
 
 # Withdraw one when it stops applying, then re-sync.
@@ -134,7 +134,7 @@ engram rule purge --id old-policy --yes                      # delete a retired 
 ```
 
 Everything outside them is preserved verbatim, so the block can sit inside a
-hand-written `CLAUDE.md` indefinitely. The rendered block is a pure function of
+hand-written `AGENTS.md` indefinitely. The rendered block is a pure function of
 the rules — no generation timestamp — so re-running `sync` with unchanged rules
 writes nothing at all. That makes it safe in a `SessionStart` hook, a pre-commit
 gate, or a CI check (`engram rule sync --dry-run` reports `updated` if someone
@@ -214,7 +214,7 @@ storage failure. New routes should keep following that pattern.
 > touches anything outside the database. Target paths come from the server
 > process's own working directory and never from caller input, so there is no
 > path-traversal surface — but combined with the no-auth posture it means any
-> local process can rewrite that project's `AGENTS.md` and `CLAUDE.md`. The
+> local process can rewrite that project's `AGENTS.md`. The
 > CLI's `--file` override is deliberately not exposed over HTTP. Weigh this
 > before binding the server anywhere but `127.0.0.1`.
 

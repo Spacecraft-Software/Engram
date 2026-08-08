@@ -6,9 +6,9 @@
 //! single implementation of both:
 //!
 //! * [`WritePolicy::Spliced`] — the file belongs to someone else and engram
-//!   owns only the region between a pair of sentinels. `AGENTS.md` and
-//!   `CLAUDE.md` are the canonical case: everything outside the sentinels is
-//!   preserved byte-for-byte (see [`crate::rules`]).
+//!   owns only the region between a pair of sentinels. `AGENTS.md` is the
+//!   canonical case: everything outside the sentinels is preserved
+//!   byte-for-byte (see [`crate::rules`]).
 //! * [`WritePolicy::Owned`] — engram authored the whole file and rewrites it
 //!   wholesale. A chat archive is the canonical case.
 //!
