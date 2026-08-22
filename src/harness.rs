@@ -26,6 +26,15 @@ use std::path::PathBuf;
 #[clap(rename_all = "kebab-case")]
 pub enum Harness {
     ClaudeCode,
+    /// A Claude Code fork with its own config root.
+    ///
+    /// Renamed explicitly on both derives: kebab-casing the variant would give
+    /// `open-claude`, but the fork calls itself `openclaude` and that is what
+    /// [`HarnessSpec::name`] carries. The two must agree — the name is what
+    /// `--harness` accepts and what every response serializes.
+    #[serde(rename = "openclaude")]
+    #[clap(name = "openclaude")]
+    OpenClaude,
     Codex,
     Opencode,
     Antigravity,
@@ -55,6 +64,38 @@ pub enum TranscriptSupport {
 
 /// Everything engram knows about one harness.
 #[derive(Debug, Clone, Copy)]
+/// How a harness lets engram install something the user can invoke by name.
+///
+/// A bool was enough while every target was a markdown command file that either
+/// did or did not carry frontmatter. Antigravity broke that: it has **no
+/// slash-command directory at all** — its extension surface is skills, packaged
+/// in plugins — so the shape of the artifact differs, not just its header. An
+/// enum makes each surface carry exactly the fields it needs, and makes
+/// "engram cannot install here" carry its reason instead of a shared sentence
+/// that fits none of the harnesses it was applied to.
+pub enum CommandSurface {
+    /// Markdown command files in a home-relative directory.
+    Markdown {
+        /// Home-relative directory the harness loads user commands from.
+        dir: &'static str,
+        /// File-name pattern; `{name}` is the command's short name.
+        file: &'static str,
+        /// Whether the harness reads YAML frontmatter. Codex prompts are plain
+        /// markdown and would render the block as literal text.
+        frontmatter: bool,
+    },
+    /// A Gemini-family plugin directory. Skills inside it are discovered as
+    /// `plugins/<plugin>/skills/<skill>/SKILL.md`, and expand the way a slash
+    /// command does (`agy --disable-slash-commands` disables both).
+    Plugin {
+        /// Home-relative directory holding plugin subdirectories.
+        dir: &'static str,
+    },
+    /// Nothing engram can write, and why not. The reason is per-harness
+    /// because the reasons genuinely differ.
+    None { detail: &'static str },
+}
+
 pub struct HarnessSpec {
     pub id: Harness,
     /// Stable kebab-case identifier, as accepted by `--harness` and emitted
@@ -67,20 +108,11 @@ pub struct HarnessSpec {
     /// has one. `None` when transcripts live somewhere unstructured.
     pub sessions_dir: Option<&'static str>,
     pub transcript: TranscriptSupport,
-    /// Home-relative directory the harness loads user commands from.
-    ///
-    /// `None` means the harness has **no command surface engram can write**,
-    /// which is reported plainly rather than papered over. Of the seven
-    /// harnesses here, only some can host a slash command; claiming otherwise
-    /// would make `install` look broken on the rest.
-    pub commands_dir: Option<&'static str>,
-    /// File-name pattern for a command in `commands_dir`. `{name}` is
-    /// replaced by the command's short name.
-    pub command_file: &'static str,
-    /// Whether this harness reads YAML frontmatter at the top of a command
-    /// file. Codex prompts are plain markdown and would render the
-    /// frontmatter as literal text.
-    pub command_frontmatter: bool,
+    /// How, if at all, engram can put a command in front of this harness's
+    /// user. Reported plainly rather than papered over: only some harnesses
+    /// can host one, and claiming otherwise would make `install` look broken
+    /// on the rest.
+    pub command_surface: CommandSurface,
     /// Where this harness registers MCP servers, when engram knows. Read to
     /// discover which database the user already shares between harnesses.
     pub mcp_config: Option<McpConfigSource>,
@@ -119,11 +151,36 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[".claude", ".claude.json"],
         sessions_dir: Some(".claude/projects"),
         transcript: TranscriptSupport::Reader(ReaderKind::ClaudeCode),
-        commands_dir: Some(".claude/commands"),
-        command_file: "engram-{name}.md",
-        command_frontmatter: true,
+        command_surface: CommandSurface::Markdown {
+            dir: ".claude/commands",
+            file: "engram-{name}.md",
+            frontmatter: true,
+        },
         mcp_config: Some(McpConfigSource::Json(".claude.json")),
         hooks_config: Some(".claude/settings.json"),
+    },
+    HarnessSpec {
+        id: Harness::OpenClaude,
+        name: "openclaude",
+        // A Claude Code fork: same config layout under its own root, so the
+        // MCP registration lives in `~/.openclaude.json` (the `~/.claude.json`
+        // analogue) and NOT in `~/.openclaude/settings.json`, which holds
+        // env/model/hooks and no mcpServers block.
+        probe: &[".openclaude", ".openclaude.json"],
+        sessions_dir: Some(".openclaude/projects"),
+        // The transcripts are Claude Code's format down to the record keys, so
+        // the same reader serves both. Fork-specific record types are handled
+        // in the reader's allowlist rather than by a second reader.
+        transcript: TranscriptSupport::Reader(ReaderKind::ClaudeCode),
+        command_surface: CommandSurface::Markdown {
+            dir: ".openclaude/commands",
+            file: "engram-{name}.md",
+            frontmatter: true,
+        },
+        mcp_config: Some(McpConfigSource::Json(".openclaude.json")),
+        // The fork has a `hooks` key, but its shape is unverified against a
+        // real run; `install --hooks` stays Claude-Code-only until it is.
+        hooks_config: None,
     },
     HarnessSpec {
         id: Harness::Codex,
@@ -131,9 +188,11 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[".codex/config.toml", ".codex"],
         sessions_dir: Some(".codex/sessions"),
         transcript: TranscriptSupport::Reader(ReaderKind::Codex),
-        commands_dir: Some(".codex/prompts"),
-        command_file: "engram-{name}.md",
-        command_frontmatter: false,
+        command_surface: CommandSurface::Markdown {
+            dir: ".codex/prompts",
+            file: "engram-{name}.md",
+            frontmatter: false,
+        },
         mcp_config: Some(McpConfigSource::Toml(".codex/config.toml")),
         hooks_config: None,
     },
@@ -145,9 +204,11 @@ pub const ALL: &[HarnessSpec] = &[
         transcript: TranscriptSupport::NotImplemented {
             detail: "opencode's session storage has not been surveyed",
         },
-        commands_dir: Some(".config/opencode/command"),
-        command_file: "engram-{name}.md",
-        command_frontmatter: true,
+        command_surface: CommandSurface::Markdown {
+            dir: ".config/opencode/command",
+            file: "engram-{name}.md",
+            frontmatter: true,
+        },
         mcp_config: Some(McpConfigSource::Jsonc(".config/opencode/opencode.jsonc")),
         hooks_config: None,
     },
@@ -159,9 +220,9 @@ pub const ALL: &[HarnessSpec] = &[
         transcript: TranscriptSupport::Unsupported {
             detail: "antigravity stores conversations as protocol buffers plus a SQLite summaries database; there is no line-oriented transcript to read",
         },
-        commands_dir: None,
-        command_file: "engram-{name}.md",
-        command_frontmatter: true,
+        command_surface: CommandSurface::Plugin {
+            dir: ".gemini/config/plugins",
+        },
         mcp_config: Some(McpConfigSource::Json(".gemini/antigravity/mcp_config.json")),
         hooks_config: None,
     },
@@ -173,9 +234,9 @@ pub const ALL: &[HarnessSpec] = &[
         transcript: TranscriptSupport::NotImplemented {
             detail: "goose's session storage has not been surveyed",
         },
-        commands_dir: None,
-        command_file: "engram-{name}.md",
-        command_frontmatter: true,
+        command_surface: CommandSurface::None {
+            detail: "goose has no user command directory engram has surveyed",
+        },
         mcp_config: None,
         hooks_config: None,
     },
@@ -187,9 +248,9 @@ pub const ALL: &[HarnessSpec] = &[
         transcript: TranscriptSupport::Unsupported {
             detail: "copilot cli stores sessions in session-store.db, a SQLite database with an undocumented schema",
         },
-        commands_dir: None,
-        command_file: "engram-{name}.md",
-        command_frontmatter: true,
+        command_surface: CommandSurface::None {
+            detail: "copilot cli has no user-writable command or prompt directory",
+        },
         mcp_config: Some(McpConfigSource::Json(".copilot/mcp-config.json")),
         hooks_config: None,
     },
@@ -201,9 +262,9 @@ pub const ALL: &[HarnessSpec] = &[
         transcript: TranscriptSupport::NotImplemented {
             detail: "qwen's session storage has not been surveyed",
         },
-        commands_dir: None,
-        command_file: "engram-{name}.md",
-        command_frontmatter: true,
+        command_surface: CommandSurface::None {
+            detail: "qwen's command format is unverified; engram will not guess at it",
+        },
         mcp_config: Some(McpConfigSource::Json(".qwen/settings.json")),
         hooks_config: None,
     },
@@ -288,7 +349,18 @@ pub fn sessions_dir(spec: &HarnessSpec) -> Option<PathBuf> {
 
 /// Absolute path to a harness's command directory, when it has one.
 pub fn commands_dir(spec: &HarnessSpec) -> Option<PathBuf> {
-    spec.commands_dir.and_then(in_home)
+    match spec.command_surface {
+        CommandSurface::Markdown { dir, .. } | CommandSurface::Plugin { dir } => in_home(dir),
+        CommandSurface::None { .. } => None,
+    }
+}
+
+/// Why engram cannot install a command here, when it cannot.
+pub fn no_command_detail(spec: &HarnessSpec) -> Option<&'static str> {
+    match spec.command_surface {
+        CommandSurface::None { detail } => Some(detail),
+        _ => None,
+    }
 }
 
 /// The database path this harness already registered engram against.
@@ -468,6 +540,43 @@ pub fn from_env() -> Option<&'static HarnessSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--harness <v>` and the `harness` field in every response must be the
+    /// same string. They come from different places — clap derives one from the
+    /// enum variant, `HarnessSpec::name` hardcodes the other — so nothing but a
+    /// test keeps them aligned. `OpenClaude` broke this on arrival: clap
+    /// derived `open-claude` while the spec said `openclaude`.
+    #[test]
+    fn value_enum_names_match_spec_names() {
+        use clap::ValueEnum;
+        for spec in ALL {
+            let variant = spec
+                .id
+                .to_possible_value()
+                .expect("every harness is selectable");
+            assert_eq!(
+                variant.get_name(),
+                spec.name,
+                "--harness value and HarnessSpec::name disagree for {:?}",
+                spec.id
+            );
+        }
+    }
+
+    /// Serialization must agree too: a response's `harness` field is read back
+    /// by scripts and fed to `--harness`.
+    #[test]
+    fn serialized_harness_names_match_spec_names() {
+        for spec in ALL {
+            let json = serde_json::to_string(&spec.id).expect("serialize");
+            assert_eq!(
+                json.trim_matches('"'),
+                spec.name,
+                "serde name and HarnessSpec::name disagree for {:?}",
+                spec.id
+            );
+        }
+    }
 
     #[test]
     fn every_variant_has_exactly_one_spec() {

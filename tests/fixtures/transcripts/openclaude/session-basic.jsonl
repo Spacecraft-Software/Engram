@@ -1,0 +1,6 @@
+{"type":"mode","mode":"normal","sessionId":"11111111-2222-3333-4444-555555555555"}
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"aaaaaaa1-0000-4000-8000-000000000001","timestamp":"2026-08-20T10:00:00.000Z","message":{"role":"user","content":"Why is the pin stale?"}}
+{"parentUuid":"aaaaaaa1-0000-4000-8000-000000000001","isSidechain":false,"type":"assistant","uuid":"aaaaaaa1-0000-4000-8000-000000000002","timestamp":"2026-08-20T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Because the registration moved after install ran."}]}}
+{"type":"file-history-snapshot","uuid":"aaaaaaa1-0000-4000-8000-000000000003","timestamp":"2026-08-20T10:00:06.000Z"}
+{"type":"last-prompt","prompt":"Why is the pin stale?"}
+{"type":"system","subtype":"local_command","content":"<command-name>/status</command-name>","uuid":"aaaaaaa1-0000-4000-8000-000000000004","timestamp":"2026-08-20T10:00:07.000Z"}

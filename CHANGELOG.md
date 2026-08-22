@@ -13,6 +13,45 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **OpenClaude** is a supported harness (the eighth). It is a Claude Code fork
+  with its own config root: commands go to `~/.openclaude/commands/`, the MCP
+  registration is read from `~/.openclaude.json`, and its transcripts are read
+  by the existing Claude Code reader — the record types the fork adds are
+  recognised rather than counted as format drift.
+- **Antigravity** now gets a plugin at `~/.gemini/config/plugins/engram/`
+  (`plugin.json` plus one `skills/engram-<name>/SKILL.md` per command). It has
+  no slash-command directory at all; `agy plugin validate` reports a plugin's
+  own `commands/` as "converted to skills", so engram writes skills directly.
+- `install` reports `db_origin` (`override` / `registered` / `env` / `default`)
+  alongside the database it pins, so the relative-`engram.db` fallback is
+  visible rather than silent.
+
+### Fixed
+
+- **`install` now detects a stale database pin.** When a generated command
+  points at a different database than the harness currently registers, the
+  drift is reported on both the file and the harness before being corrected.
+  Previously the two could diverge indefinitely: if a harness's registration
+  moved after `install` ran, its `/engram-*` commands and its engram MCP tools
+  read different stores with nothing to say so.
+- **`find_git_root` requires a working tree, not merely a `.git` entry.** A
+  directory must contain `.git/HEAD`; a `.git` file (worktree or submodule
+  pointer) also counts. An empty `.git` directory in a shared location — e.g.
+  `/tmp/.git` — previously captured every path beneath it, so `save-chat` would
+  resolve its project root there, create `chat/`, and edit that directory's
+  `.gitignore`.
+- Harnesses with no writable surface each state their own reason instead of
+  sharing one sentence that described none of them precisely.
+
+### Changed
+
+- `HarnessSpec` models its command surface as an enum —
+  `CommandSurface::{Markdown, Plugin, None}` — replacing `commands_dir`,
+  `command_file`, and the `command_frontmatter` bool. Antigravity's surface
+  differs in artifact *shape*, not just in whether a header is read.
+
+### Added
+
 - **`flake.nix`** — Engram is now consumable as a Nix flake input
   (`github:Spacecraft-Software/Engram`), exposing `packages.default`,
   `packages.engram`, `apps.default`, `checks.default`, and `default`/`docs`
