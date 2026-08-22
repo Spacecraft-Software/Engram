@@ -460,14 +460,14 @@ EXAMPLES:
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Render the scope's rules into AGENTS.md and CLAUDE.md.
+    /// Render the scope's rules into AGENTS.md.
     ///
     /// Rewrites only the region between the engram sentinels, leaving the rest
     /// of each file untouched. Running it twice with unchanged rules is a
     /// no-op, so it is safe to wire into a hook or a commit gate.
     #[command(after_help = "\
 EXAMPLES:
-  # Render into AGENTS.md and CLAUDE.md at the project root.
+  # Render into AGENTS.md at the project root.
   engram rule sync
 
   # Read-only check: reports 'updated' if the block is stale or hand-edited.
@@ -481,7 +481,7 @@ EXAMPLES:
         #[arg(long)]
         scope: Option<String>,
         /// Target file, repeatable. Relative paths resolve against the project
-        /// root. Defaults to AGENTS.md and CLAUDE.md.
+        /// root. Defaults to AGENTS.md.
         #[arg(long = "file")]
         files: Vec<std::path::PathBuf>,
         /// Report what would be written without touching any file.

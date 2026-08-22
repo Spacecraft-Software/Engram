@@ -601,7 +601,7 @@ explicit).  @code{--dry-run} previews the deletion.
 engram rule sync [--scope @var{id}] [--file @var{path}]@dots{} [--dry-run]
 @end example
 
-Render the scope's rules into @file{AGENTS.md} and @file{CLAUDE.md}
+Render the scope's rules into @file{AGENTS.md}
 (or the given @code{--file} targets, repeatable).  Only the region
 between the engram sentinels is rewritten.  With @code{--dry-run},
 reports what would be written without touching any file.
@@ -992,7 +992,7 @@ deletes.
 
 @item rule_sync
 @cindex rule_sync tool (MCP)
-Render a scope's rules into @file{AGENTS.md} and @file{CLAUDE.md} at
+Render a scope's rules into @file{AGENTS.md} at
 the project root.
 
 @item save_chat
@@ -1099,7 +1099,7 @@ unknown rule, @code{200} with the outcome on success.
 
 @item POST /v1/rules/sync
 @cindex POST /v1/rules/sync
-Render the scope's rules into @file{AGENTS.md} and @file{CLAUDE.md}.
+Render the scope's rules into @file{AGENTS.md}.
 This is the only route that writes outside the database; targets
 derive from the server process's working directory, never from caller
 input.
@@ -1175,9 +1175,10 @@ Four invariants worth not breaking:
 @item
 @cindex sync, as delivery
 @emph{Sync is the delivery mechanism, not an export.}  A row in SQLite
-never reaches a model's context.  Rendering into @file{AGENTS.md} and
-@file{CLAUDE.md} --- files harnesses auto-load --- is what makes a rule
-take effect.
+never reaches a model's context.  Rendering into @file{AGENTS.md} ---
+the file harnesses auto-load, and that Claude Code reaches through the
+@code{@@AGENTS.md} import in its @file{CLAUDE.md} (Steelbore Standard
+§5.7) --- is what makes a rule take effect.
 
 @item
 @emph{The rendered block is a pure function of the rules.}  No
@@ -1264,24 +1265,48 @@ installed, and never creates a directory for one that is not.
 Support is uneven, and the manual would rather say so than imply
 otherwise:
 
-@multitable @columnfractions .22 .26 .22 .30
+@multitable @columnfractions .22 .26 .26 .26
 @headitem Harness @tab Transcripts @tab Commands @tab Hooks
 @item claude-code @tab read @tab written @tab written (opt-in)
+@item openclaude @tab read @tab written @tab ---
 @item codex @tab read @tab written @tab ---
 @item opencode @tab --- @tab written @tab ---
+@item antigravity @tab --- @tab plugin (skills) @tab ---
 @item qwen @tab --- @tab --- @tab ---
 @item goose @tab --- @tab --- @tab ---
-@item antigravity @tab --- @tab --- @tab ---
 @item copilot-cli @tab --- @tab --- @tab ---
 @end multitable
+
+@cindex openclaude
+@cindex forks, harness
+OpenClaude is a fork of Claude Code with its own configuration root.  Its
+transcripts match Claude Code's format down to the record keys, so one
+reader serves both; the records the fork adds are recognized rather than
+counted as drift.  Its MCP registration lives in @file{~/.openclaude.json},
+the analogue of @file{~/.claude.json} --- not in
+@file{~/.openclaude/settings.json}, which holds unrelated settings.
+
+@cindex antigravity, plugin
+@cindex skills
+Antigravity is the one harness with no slash-command directory at all.
+Its extension surface is @dfn{skills}, packaged in @dfn{plugins}, and a
+plugin's own @file{commands/} directory is reported by
+@command{agy plugin validate} as ``converted to skills'' --- so a command
+there would become a skill regardless.  Engram therefore writes a plugin
+directly: a manifest plus one skill per command.  The skill frontmatter is
+a different contract from a command file's, but its description is lifted
+from the same template, so the two surfaces cannot disagree about what a
+command does.
 
 Every gap in that table is reported at runtime with its reason attached,
 rather than omitted.  @command{engram install --list} names the harnesses
 with no command surface; @command{engram ingest} fails with exit
 status@tie{}2 and an explanation when asked to read a harness it cannot.
-A feature that quietly does nothing on four of seven harnesses would read
-as broken; one that says which four, and why, is merely honest about its
-reach.
+A feature that quietly does nothing on three of eight harnesses would read
+as broken; one that says which three, and why, is merely honest about its
+reach.  Each of those three states its own reason: unsurveyed session
+storage and an absent command directory are different problems, and one
+sentence shared between them described neither.
 
 @section Formats Engram does not control
 

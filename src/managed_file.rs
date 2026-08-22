@@ -6,9 +6,9 @@
 //! single implementation of both:
 //!
 //! * [`WritePolicy::Spliced`] — the file belongs to someone else and engram
-//!   owns only the region between a pair of sentinels. `AGENTS.md` and
-//!   `CLAUDE.md` are the canonical case: everything outside the sentinels is
-//!   preserved byte-for-byte (see [`crate::rules`]).
+//!   owns only the region between a pair of sentinels. `AGENTS.md` is the
+//!   canonical case: everything outside the sentinels is preserved
+//!   byte-for-byte (see [`crate::rules`]).
 //! * [`WritePolicy::Owned`] — engram authored the whole file and rewrites it
 //!   wholesale. A chat archive is the canonical case.
 //!
@@ -182,13 +182,68 @@ pub fn splice_block(existing: &str, block: &str, sentinel: &Sentinel) -> String 
 pub fn find_git_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|dir| dir.join(".git").exists())
+        .find(|dir| is_git_root(dir))
         .map(Path::to_path_buf)
+}
+
+/// True when `dir` is the root of a real working tree.
+///
+/// Existence of `.git` alone is not enough. An empty `.git` directory is not a
+/// repository, and one sitting somewhere shared — `/tmp/.git` is the case that
+/// prompted this — silently captures every path beneath it: `save-chat` would
+/// resolve its project root to `/tmp`, write `/tmp/chat/`, and add `chat/` to
+/// `/tmp/.gitignore`. Both forms git actually produces are accepted: a
+/// directory containing `HEAD`, and the `gitdir:` *file* a worktree or submodule
+/// checkout uses.
+fn is_git_root(dir: &Path) -> bool {
+    let git = dir.join(".git");
+    match std::fs::metadata(&git) {
+        Ok(m) if m.is_dir() => git.join("HEAD").exists(),
+        Ok(m) if m.is_file() => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty `.git` directory is not a repository, and must not capture
+    /// every path beneath it.
+    ///
+    /// This is not hypothetical: an empty `/tmp/.git` on the author's machine
+    /// made `save-chat` resolve its project root to `/tmp`, where it created
+    /// `/tmp/chat/` and added `chat/` to `/tmp/.gitignore`. Existence of `.git`
+    /// is not the test; being a working tree is.
+    #[test]
+    fn an_empty_git_directory_is_not_a_working_tree() {
+        let tmp = std::env::temp_dir().join(format!("engram-gitroot-{}", std::process::id()));
+        let shallow = tmp.join("empty-git");
+        let nested = shallow.join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("create tree");
+        std::fs::create_dir_all(shallow.join(".git")).expect("empty .git dir");
+        assert_eq!(
+            find_git_root(&nested),
+            None,
+            "an empty .git directory must not be treated as a repository root"
+        );
+
+        // A real repository has HEAD.
+        std::fs::write(shallow.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        assert_eq!(find_git_root(&nested).as_deref(), Some(shallow.as_path()));
+
+        // A worktree or submodule uses a `.git` file instead.
+        let linked = tmp.join("worktree");
+        let linked_nested = linked.join("x");
+        std::fs::create_dir_all(&linked_nested).expect("create worktree tree");
+        std::fs::write(linked.join(".git"), "gitdir: /elsewhere\n").expect("write gitdir file");
+        assert_eq!(
+            find_git_root(&linked_nested).as_deref(),
+            Some(linked.as_path())
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     fn block(body: &str) -> String {
         format!(

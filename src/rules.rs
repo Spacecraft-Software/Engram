@@ -10,8 +10,9 @@
 //! # Why `sync` is not merely an export
 //!
 //! A row in SQLite never reaches a model's context on its own. Rendering rules
-//! into `AGENTS.md` / `CLAUDE.md` — files that agent harnesses load
-//! automatically — is what actually makes a rule take effect. The database is
+//! into `AGENTS.md` — the file that agent harnesses load automatically, and
+//! that Claude Code reaches through the `@AGENTS.md` import its `CLAUDE.md`
+//! carries (Standard §5.7) — is what makes a rule take effect. The database is
 //! the durable source of truth; the managed markdown block is the delivery
 //! mechanism. Storing a rule without syncing it stores a rule nobody reads.
 
@@ -38,9 +39,18 @@ pub const STATUS_ACTIVE: &str = "active";
 /// session needs to be able to find, and `search` still reaches retired rules.
 pub const STATUS_RETIRED: &str = "retired";
 
-/// Files `engram rule sync` writes when no `--file` is supplied. Both are
-/// auto-loaded by agent harnesses, which is the entire point of syncing.
-pub const DEFAULT_TARGETS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// File `engram rule sync` writes when no `--file` is supplied.
+///
+/// `AGENTS.md` only, deliberately. Steelbore Standard §5.7 makes `AGENTS.md`
+/// the single harness-neutral source of truth and reduces `CLAUDE.md` to an
+/// `@AGENTS.md` import plus Claude-only content — so a block written to both
+/// arrives twice in Claude's context and, worse, becomes two copies that can
+/// disagree once anything edits one of them. §5.7 puts the obligation on the
+/// tooling: rendered blocks target `AGENTS.md`, and every harness that reads
+/// `CLAUDE.md` picks them up through the import.
+///
+/// Callers that genuinely need another destination still pass `--file`.
+pub const DEFAULT_TARGETS: [&str; 1] = ["AGENTS.md"];
 
 /// Sentinel pair delimiting the managed block. Defined in
 /// [`crate::managed_file`] so the splice machinery and the renderer cannot

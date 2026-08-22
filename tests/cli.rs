@@ -468,7 +468,7 @@ fn rule_sync_dry_run_writes_no_files() {
         .success();
 
     // Run from the temp dir: it has no .git, so the project root — and the
-    // default AGENTS.md/CLAUDE.md targets — resolve there.
+    // default AGENTS.md target — resolves there.
     let assert = engram(&db)
         .current_dir(tmp.path())
         .args(["rule", "sync", "--scope", scope, "--dry-run"])
@@ -486,8 +486,15 @@ fn rule_sync_dry_run_writes_no_files() {
         .expect("data.files is an array");
     assert_eq!(
         files.len(),
-        2,
-        "default targets are AGENTS.md and CLAUDE.md"
+        1,
+        "AGENTS.md is the sole default target (Standard §5.7); CLAUDE.md \
+         receives the block through its @AGENTS.md import, so writing both \
+         would deliver it twice and create two copies that can disagree"
+    );
+    assert_eq!(
+        files[0]["path"].as_str().expect("file path is a string"),
+        tmp.path().join("AGENTS.md").to_string_lossy(),
+        "the default target is AGENTS.md, not CLAUDE.md"
     );
     for file in files {
         assert_eq!(file["dry_run"], true);
@@ -500,7 +507,7 @@ fn rule_sync_dry_run_writes_no_files() {
     );
     assert!(
         missing.eval(&tmp.path().join("CLAUDE.md")),
-        "dry run must not create CLAUDE.md"
+        "CLAUDE.md is not a sync target at all (§5.7), dry run or not"
     );
 }
 
@@ -1358,6 +1365,21 @@ fn describe_advertises_consolidate_phases_and_access_tracking() {
 
 // ---------------------------------------------------------------- save-chat
 
+/// Creates a project directory that is its own git root.
+///
+/// Pinning the root is not decoration. `find_git_root` walks *up* from the
+/// project, so without a marker a test's "project root" is whatever ancestor of
+/// the tempdir happens to contain a `.git`. On a machine with an empty
+/// `/tmp/.git`, that root is `/tmp` — and the suite then writes `chat/` and
+/// edits `.gitignore` there instead of inside its own tempdir. A test must not
+/// depend on whether the developer's `/tmp` looks like a repository.
+fn pinned_project(tmp: &TempDir) -> std::path::PathBuf {
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).expect("create project dir");
+    std::fs::write(project.join(".git"), "gitdir: elsewhere\n").expect("pin the git root");
+    project
+}
+
 /// A `save-chat` invocation rooted at `project`, so scope resolution walks up
 /// from a scratch directory instead of the crate's own git tree — the command
 /// writes `chat/` and `.gitignore` at whatever root it resolves.
@@ -1376,8 +1398,7 @@ fn save_chat(db: &Path, project: &Path, args: &[&str]) -> Command {
 fn save_chat_twice_is_byte_identical() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project dir");
+    let project = pinned_project(&tmp);
     let scope = "archive-idempotent";
 
     remember(&db, "a", scope, "the first message");
@@ -1447,8 +1468,7 @@ fn save_chat_twice_is_byte_identical() {
 fn save_chat_excludes_rule_rows() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project dir");
+    let project = pinned_project(&tmp);
     let scope = "archive-rules";
 
     remember(&db, "a", scope, "an ordinary message");
@@ -1490,8 +1510,7 @@ fn save_chat_excludes_rule_rows() {
 fn save_chat_does_not_bump_access_counts() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project dir");
+    let project = pinned_project(&tmp);
     let scope = "archive-untracked";
 
     remember(&db, "a", scope, "the archived memory");
@@ -1523,8 +1542,7 @@ fn save_chat_does_not_bump_access_counts() {
 fn save_chat_dry_run_writes_no_files() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project dir");
+    let project = pinned_project(&tmp);
     let scope = "archive-dry-run";
 
     remember(&db, "a", scope, "a message");
@@ -1600,8 +1618,7 @@ fn save_chat_resolves_relative_file_against_the_project_root() {
 fn save_chat_reports_each_gitignore_outcome_distinctly() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project");
+    let project = pinned_project(&tmp);
     std::fs::write(project.join(".git"), "gitdir: elsewhere\n").expect("write .git marker");
     let scope = "gitignore-outcomes";
     remember(&db, "a", scope, "a message");
@@ -1647,8 +1664,7 @@ fn save_chat_output_compiles_under_makeinfo() {
 
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project dir");
+    let project = pinned_project(&tmp);
     let scope = "archive-makeinfo";
 
     // Exercise the escaping and the encoding declaration together: markup
@@ -1719,10 +1735,8 @@ fn ingest(db: &Path, home: &Path, project: &Path, args: &[&str]) -> Command {
 /// Builds a fake home + project pair inside one tempdir.
 fn ingest_fixture(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let home = tmp.path().join("home");
-    let project = tmp.path().join("project");
     std::fs::create_dir_all(&home).expect("create fake home");
-    std::fs::create_dir_all(&project).expect("create project");
-    (home, project)
+    (home, pinned_project(tmp))
 }
 
 #[test]
@@ -2081,7 +2095,7 @@ fn install_list_reports_every_harness_and_writes_nothing() {
     let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
 
     let harnesses = data["harnesses"].as_array().expect("harnesses");
-    assert_eq!(harnesses.len(), 7, "every known harness must be reported");
+    assert_eq!(harnesses.len(), 8, "every known harness must be reported");
 
     let claude = harnesses
         .iter()
@@ -2093,13 +2107,34 @@ fn install_list_reports_every_harness_and_writes_nothing() {
         .expect("commands_dir")
         .ends_with(".claude/commands"));
 
-    // Harnesses without a command surface say so with a null rather than
-    // being quietly omitted.
+    // The fork is listed with its own config root, not Claude Code's.
+    let openclaude = harnesses
+        .iter()
+        .find(|h| h["name"] == "openclaude")
+        .expect("openclaude listed");
+    assert!(openclaude["commands_dir"]
+        .as_str()
+        .expect("commands_dir")
+        .ends_with(".openclaude/commands"));
+
+    // Antigravity has no *command* directory, but it does have a plugin root,
+    // so it reports a writable location rather than a null.
     let antigravity = harnesses
         .iter()
         .find(|h| h["name"] == "antigravity")
         .expect("antigravity listed");
-    assert!(antigravity["commands_dir"].is_null());
+    assert!(antigravity["commands_dir"]
+        .as_str()
+        .expect("plugin root")
+        .ends_with(".gemini/config/plugins"));
+
+    // Harnesses with nothing engram can write still say so with a null rather
+    // than being quietly omitted.
+    let goose = harnesses
+        .iter()
+        .find(|h| h["name"] == "goose")
+        .expect("goose listed");
+    assert!(goose["commands_dir"].is_null());
 
     // Nothing was created, not even for the harness that is "installed".
     assert!(predicate::path::missing().eval(&home.join(".claude/commands")));
@@ -2327,22 +2362,70 @@ fn install_discovers_the_database_from_the_harness_mcp_config() {
     );
 }
 
+/// Antigravity has no slash-command directory, but it does have a writable
+/// plugin root, and a skill there expands the way a command does. Engram writes
+/// a plugin: a manifest plus one skill directory per command.
 #[test]
-fn install_reports_harnesses_with_no_command_surface() {
+fn install_writes_an_antigravity_plugin_rather_than_commands() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("create fake home");
     pretend_installed(&home, ".gemini/antigravity");
 
+    install(&db, &home, &["--harness", "antigravity"])
+        .assert()
+        .success();
+
+    let plugin = home.join(".gemini/config/plugins/engram");
+    let manifest = std::fs::read_to_string(plugin.join("plugin.json")).expect("manifest written");
+    let value: Value = serde_json::from_str(&manifest).expect("manifest is JSON");
+    assert_eq!(value["name"], "engram");
+
+    for name in ["save-chat", "ingest", "context"] {
+        // A skill is a *directory* holding SKILL.md; the loader discovers it by
+        // that shape, so a flat file would never be seen.
+        let skill = plugin.join(format!("skills/engram-{name}/SKILL.md"));
+        let text = std::fs::read_to_string(&skill).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(text.starts_with("---\n"), "{name}: {text}");
+        assert!(text.contains(&format!("name: engram-{name}")), "{name}");
+        assert!(text.contains("description: "), "{name}");
+        // Gemini skill frontmatter, not Claude command frontmatter.
+        assert!(!text.contains("argument-hint:"), "{name}");
+        assert!(!text.contains("allowed-tools:"), "{name}");
+        assert!(!text.contains("{{DB}}"), "{name}: placeholder left");
+    }
+
+    // Idempotent, like every other surface.
     let assert = install(&db, &home, &["--harness", "antigravity"])
         .assert()
         .success();
     let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["installed"], 0);
+}
+
+/// A harness with genuinely no surface says which one it is and why, in its own
+/// words. One sentence shared by four harnesses described none of them.
+#[test]
+fn install_reports_harnesses_with_no_command_surface() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    pretend_installed(&home, ".config/goose");
+
+    let assert = install(&db, &home, &["--harness", "goose"])
+        .assert()
+        .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
     let entry = &json["data"]["harnesses"][0];
-    assert_eq!(entry["harness"], "antigravity");
+    assert_eq!(entry["harness"], "goose");
     assert!(entry["files"].as_array().expect("files").is_empty());
-    assert_eq!(entry["note"], "no command surface engram can write");
+    let note = entry["note"].as_str().expect("a reason, not a null");
+    assert!(
+        note.contains("goose"),
+        "the reason names the harness: {note}"
+    );
 }
 
 #[test]
@@ -2978,4 +3061,230 @@ fn shell_words(line: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// A command file pinned to a database the harness no longer registers must be
+/// reported, not silently corrected.
+///
+/// This is what happened on the author's machine: `install` ran, then every
+/// harness's MCP registration moved to a different store. The generated
+/// commands kept pointing at the old one, so `/engram-*` and engram's MCP tools
+/// read different databases for two weeks and nothing said so. Correcting the
+/// pin without a word would have erased the only evidence.
+#[test]
+fn install_reports_a_database_pin_that_drifted() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("create fake home");
+
+    // The harness registers one database...
+    let registered = tmp.path().join("registered.db");
+    std::fs::write(
+        home.join(".claude.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "engram": {
+                    "type": "stdio",
+                    "command": "engram",
+                    "args": ["--db", registered.to_string_lossy(), "mcp"],
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write registration");
+
+    // ...but an earlier install pinned another.
+    install(&db, &home, &["--db-path", "/stale/engram.db"])
+        .assert()
+        .success();
+    let cmd = home.join(".claude/commands/engram-context.md");
+    assert!(
+        std::fs::read_to_string(&cmd)
+            .expect("read")
+            .contains("--db /stale/engram.db"),
+        "precondition: the stale pin is in place"
+    );
+
+    // A plain re-install notices, says so, and corrects it.
+    let assert = install(&db, &home, &[]).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let harness = json["data"]["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "claude-code")
+        .expect("claude-code")
+        .clone();
+
+    assert_eq!(harness["db_origin"], "registered");
+    assert_eq!(
+        harness["db"].as_str().expect("db"),
+        registered.to_string_lossy()
+    );
+    let warning = harness["warning"].as_str().expect("drift warning");
+    assert!(warning.contains("/stale/engram.db"), "{warning}");
+    assert!(warning.contains("different databases"), "{warning}");
+    assert!(
+        harness["files"][0]["reason"]
+            .as_str()
+            .expect("per-file reason")
+            .contains("re-pinned"),
+        "the file itself carries the reason too"
+    );
+
+    let after = std::fs::read_to_string(&cmd).expect("read");
+    assert!(after.contains(&format!("--db {}", registered.to_string_lossy())));
+    assert!(!after.contains("/stale/engram.db"));
+
+    // Settled: a third run is quiet.
+    let assert = install(&db, &home, &[]).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let harness = json["data"]["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "claude-code")
+        .expect("claude-code")
+        .clone();
+    assert!(
+        harness["warning"].is_null(),
+        "a settled pin must not keep warning: {harness:?}"
+    );
+}
+
+/// `db_origin` names the fallback that silently writes to a relative path.
+#[test]
+fn install_reports_the_dangerous_default_database_origin() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("create fake home");
+    // No registration, and ENGRAM_DB is stripped by the hermetic env.
+    let assert = install(&db, &home, &[]).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let harness = json["data"]["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "claude-code")
+        .expect("claude-code")
+        .clone();
+    assert_eq!(harness["db_origin"], "default");
+    assert_eq!(harness["db"], "engram.db");
+}
+
+/// Plants an OpenClaude transcript in the fork's own config root.
+fn plant_openclaude_transcript(
+    home: &Path,
+    project: &Path,
+    session_id: &str,
+) -> std::path::PathBuf {
+    let mangled = project.to_string_lossy().replace('/', "-");
+    let dir = home.join(".openclaude").join("projects").join(mangled);
+    std::fs::create_dir_all(&dir).expect("create fake projects dir");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transcripts/openclaude/session-basic.jsonl");
+    let dest = dir.join(format!("{session_id}.jsonl"));
+    std::fs::copy(&src, &dest).expect("copy fixture into the fake home");
+    dest
+}
+
+/// OpenClaude is a Claude Code fork, so the existing reader serves it. The
+/// records that differ (`mode`, `file-history-snapshot`, `last-prompt`) are
+/// already in the non-message allowlist and must be counted there rather than
+/// as `unknown_record` — an unknown-record count is the signal that a harness
+/// changed its format, and a fork tripping it every run would train the reader
+/// to ignore it.
+#[test]
+fn ingest_reads_an_openclaude_transcript_with_the_claude_code_reader() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_openclaude_transcript(&home, &project, "11111111-2222-3333-4444-555555555555");
+
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "openclaude", "--scope", "oc"],
+    )
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+
+    assert_eq!(data["harness"], "openclaude");
+    assert_eq!(data["inserted"], 2, "one user turn and one assistant turn");
+    assert_eq!(
+        data["filtered"]["unknown_record"], 0,
+        "fork-specific record types must be recognised, not reported as drift"
+    );
+    assert_eq!(data["filtered"]["non_message"], 4);
+
+    // Idempotent, exactly as for Claude Code.
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "openclaude", "--scope", "oc"],
+    )
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["inserted"], 0);
+    assert_eq!(data["skipped_existing"], 2);
+
+    // The turns are ordinary memories.
+    let mems = recall_data(&db, "oc");
+    assert_eq!(mems.len(), 2);
+    assert_eq!(mems[0]["role"], "user");
+    assert_eq!(mems[1]["role"], "assistant");
+}
+
+/// OpenClaude has its own writable command directory, and its MCP registration
+/// lives in `~/.openclaude.json` — not in `~/.openclaude/settings.json`, which
+/// holds env/model/hooks and no servers block.
+#[test]
+fn install_writes_openclaude_commands_and_reads_its_registration() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".openclaude")).expect("create fake home");
+    // A settings.json with no mcpServers must not be mistaken for the config.
+    std::fs::write(
+        home.join(".openclaude/settings.json"),
+        r#"{"model":"x","hooks":{}}"#,
+    )
+    .expect("write settings");
+    std::fs::write(
+        home.join(".openclaude.json"),
+        r#"{"mcpServers":{"engram":{"command":"engram","args":["--db","/shared/oc.db","mcp"]}}}"#,
+    )
+    .expect("write registration");
+
+    let assert = install(&db, &home, &[]).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let harness = json["data"]["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "openclaude")
+        .expect("openclaude is a known harness")
+        .clone();
+
+    assert_eq!(harness["present"], true);
+    assert_eq!(harness["db"], "/shared/oc.db");
+    assert_eq!(harness["db_origin"], "registered");
+
+    for name in ["save-chat", "ingest", "context"] {
+        let path = home.join(format!(".openclaude/commands/engram-{name}.md"));
+        assert!(
+            path.exists(),
+            "{name} not written to the fork's command dir"
+        );
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.starts_with("---\n"), "frontmatter must open the file");
+        assert!(text.contains("--db /shared/oc.db"));
+    }
 }

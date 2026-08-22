@@ -386,7 +386,7 @@ impl EngramMcp {
             "created": upsert.created,
             "scope": resolved.name,
             "scope_origin": resolved.origin,
-            "next_step": "call rule_sync to render this rule into AGENTS.md and CLAUDE.md; \
+            "next_step": "call rule_sync to render this rule into AGENTS.md; \
                           until then no agent will read it",
         });
         Ok(CallToolResult::success(vec![Content::text(
@@ -453,7 +453,7 @@ impl EngramMcp {
             "outcome": retire.outcome,
             "rule": retire.rule,
             "scope_origin": resolved.origin,
-            "next_step": "call rule_sync to drop this rule from AGENTS.md and CLAUDE.md; \
+            "next_step": "call rule_sync to drop this rule from AGENTS.md; \
                           until then the synced files still assert it",
         });
         Ok(CallToolResult::success(vec![Content::text(
@@ -462,7 +462,7 @@ impl EngramMcp {
     }
 
     #[tool(
-        description = "Render a scope's rules into AGENTS.md and CLAUDE.md at the project root, \
+        description = "Render a scope's rules into AGENTS.md at the project root, \
                        rewriting only the region between the engram sentinels and leaving the rest \
                        of each file untouched. Idempotent: re-running with unchanged rules writes \
                        nothing. This is the step that actually puts rules in front of a model."
@@ -701,7 +701,7 @@ impl ServerHandler for EngramMcp {
                  Rules: call `rule_list` at session start to load the policy governing this \
                  project. Call `rule_add` when the user states a standing requirement — \
                  something that must keep applying in future sessions, not a one-off fact — then \
-                 `rule_sync` to render it into AGENTS.md and CLAUDE.md. A stored rule that is \
+                 `rule_sync` to render it into AGENTS.md. A stored rule that is \
                  never synced is read by nobody. Call `rule_retire` when a rule no longer \
                  applies, then `rule_sync` again."
                     .to_string(),

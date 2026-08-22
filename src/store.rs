@@ -352,6 +352,22 @@ pub struct ContextResult {
     pub budget: crate::retrieval::BudgetReport,
 }
 
+/// Decodes a stored embedding from its f32 little-endian blob.
+///
+/// `as_chunks::<4>()` yields `[u8; 4]` arrays directly, so there is no fallible
+/// conversion to justify with an `expect`. Any trailing bytes that do not fill
+/// a whole `f32` are dropped, exactly as the previous `chunks_exact` did: a
+/// truncated blob is a corrupt row, and a short vector cosines to 0.0 rather
+/// than panicking mid-query.
+fn decode_vector(blob: &[u8]) -> Vec<f32> {
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(f32::from_le_bytes)
+        .collect()
+}
+
 impl Store {
     /// Opens (creating if needed) the shared database file. Point every
     /// agent at the same path — that's the entire "shared memory" story.
@@ -979,10 +995,7 @@ impl Store {
         let mut scored: Vec<(String, f32)> = Vec::new();
         for row in rows {
             let (id, blob) = row?;
-            let vec: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact yields 4 bytes")))
-                .collect();
+            let vec = decode_vector(&blob);
             // A dimension mismatch (different-width model under the same
             // name) cosines to 0.0 rather than erroring — see `cosine`.
             scored.push((id, crate::embed::cosine(query_vec, &vec)));
@@ -1205,14 +1218,7 @@ impl Store {
             let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
             for row in fetched {
                 let (id, blob) = row?;
-                vectors.insert(
-                    id,
-                    blob.chunks_exact(4)
-                        .map(|b| {
-                            f32::from_le_bytes(b.try_into().expect("chunks_exact yields 4 bytes"))
-                        })
-                        .collect(),
-                );
+                vectors.insert(id, decode_vector(&blob));
             }
             for i in 0..rows.len() {
                 let Some(vec_i) = vectors.get(&rows[i].0) else {

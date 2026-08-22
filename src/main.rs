@@ -1148,7 +1148,7 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
                         rule: upsert.rule,
                         created: upsert.created,
                         scope_origin: resolved.origin,
-                        next_step: "run `engram rule sync` to render this rule into AGENTS.md and CLAUDE.md; \
+                        next_step: "run `engram rule sync` to render this rule into AGENTS.md; \
                                     until then no agent will read it",
                     };
                     emit_ok(Response::new("engram rule add", result), mode);
@@ -1211,8 +1211,8 @@ fn run_rule(action: RuleAction, store: &Arc<Mutex<Store>>, mode: OutputMode) -> 
                     let payload = RuleRetireResult {
                         retire,
                         scope_origin: resolved.origin,
-                        next_step: "run `engram rule sync` to drop this rule from AGENTS.md and \
-                                    CLAUDE.md; until then the synced files still assert it",
+                        next_step: "run `engram rule sync` to drop this rule from AGENTS.md; \
+                                    until then the synced file still asserts it",
                     };
                     emit_ok(Response::new("engram rule retire", payload), mode);
                     0
