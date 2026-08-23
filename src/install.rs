@@ -276,9 +276,29 @@ fn is_ours(path: &std::path::Path) -> bool {
 fn is_nix_managed(path: &std::path::Path) -> bool {
     // Walk up: the leaf usually does not exist yet, but its parent may
     // already be the store symlink.
+    //
+    // `canonicalize` rather than `read_link`, because the link is often a
+    // *chain*. Codex's skills root on the author's machine is
+    // `~/.codex/skills` -> `~/.agents/skills` -> `~/.local/state/construct/current`
+    // -> `/nix/store/...`; a single `read_link` sees only the first hop, finds
+    // no `/nix/store` prefix, and reports the directory as writable right up
+    // until the write fails with EROFS.
     path.ancestors()
-        .filter_map(|p| std::fs::read_link(p).ok())
+        .filter_map(|p| std::fs::canonicalize(p).ok())
         .any(|target| target.starts_with("/nix/store"))
+}
+
+/// True when this write failed only because the target is not writable.
+///
+/// A read-only target is a fact about the user's machine, not an engram error:
+/// a declaratively-managed skills or command directory is *supposed* to be
+/// immutable. It is reported per file and the run continues, so one immutable
+/// harness cannot stop the others from being installed.
+fn is_unwritable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    )
 }
 
 /// Installs into the given harnesses.
@@ -365,7 +385,24 @@ pub fn install(
                 _ => render_command(command.body, spec, &db),
             };
             let mut written =
-                managed_file::write_managed(&path, &body, WritePolicy::Owned, dry_run)?;
+                match managed_file::write_managed(&path, &body, WritePolicy::Owned, dry_run) {
+                    Ok(w) => w,
+                    Err(e) if is_unwritable(&e) => {
+                        skipped += 1;
+                        files.push(ManagedFile {
+                            path: path.to_string_lossy().into_owned(),
+                            outcome: managed_file::FileOutcome::Unchanged,
+                            dry_run,
+                            reason: Some(format!(
+                                "{e}; this directory is not writable. If it is managed \
+                                 declaratively, add engram's commands to that configuration \
+                                 instead."
+                            )),
+                        });
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             if let Some(old) = &stale {
                 drifted.push(old.clone());
                 written.reason = Some(format!(
