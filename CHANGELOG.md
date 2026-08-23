@@ -13,6 +13,15 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **An unwritable target no longer aborts the whole install.** A read-only
+  command or skills directory is now reported per file with its reason and the
+  run continues; previously the `EROFS` propagated and every harness after the
+  failing one was skipped entirely.
+- **`is_nix_managed` follows a symlink *chain*.** It used a single `read_link`,
+  so `~/.codex/skills` → `~/.agents/skills` → `~/.local/state/construct/current`
+  → `/nix/store/…` was reported as writable right up until the write failed. It
+  canonicalizes now.
+
 - **Codex commands went to a directory Codex no longer reads.** Codex 0.149
   removed `~/.codex/prompts/` entirely and moved to skills; engram had been
   writing three prompt files there that nothing loaded. Engram now writes

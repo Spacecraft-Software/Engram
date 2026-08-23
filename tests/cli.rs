@@ -3296,3 +3296,54 @@ fn install_writes_openclaude_commands_and_reads_its_registration() {
         assert!(text.contains("--db /shared/oc.db"));
     }
 }
+
+/// A target that cannot be written is reported per file and the run continues.
+///
+/// Codex's skills root is a symlink chain into the Nix store on the author's
+/// machine, so the write fails with EROFS. Before this, that error propagated
+/// and aborted the whole `install` — one immutable harness stopped every later
+/// harness from being installed at all.
+#[test]
+fn install_skips_an_unwritable_target_and_keeps_going() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    pretend_installed(&home, ".codex");
+    pretend_installed(&home, ".claude");
+
+    // Make Codex's skills root exist but be unwritable.
+    let skills = home.join(".codex/skills");
+    std::fs::create_dir_all(&skills).expect("create skills dir");
+    let mut perms = std::fs::metadata(&skills).expect("stat").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+    std::fs::set_permissions(&skills, perms).expect("chmod read-only");
+
+    let assert = install(&db, &home, &["--db-path", "/shared/engram.db"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+
+    let codex = data["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "codex")
+        .expect("codex reported")
+        .clone();
+    let reason = codex["files"][0]["reason"]
+        .as_str()
+        .expect("a reason, not a hard error");
+    assert!(reason.contains("not writable"), "{reason}");
+
+    // Crucially: Claude Code was still installed.
+    assert!(
+        home.join(".claude/commands/engram-save-chat.md").exists(),
+        "an unwritable harness must not stop the others"
+    );
+
+    // Restore permissions so the tempdir can be cleaned up.
+    let mut perms = std::fs::metadata(&skills).expect("stat").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&skills, perms).ok();
+}
