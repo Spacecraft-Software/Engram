@@ -203,6 +203,8 @@ fn command_path(spec: &HarnessSpec, dir: &std::path::Path, name: &str) -> PathBu
             .join("skills")
             .join(format!("engram-{name}"))
             .join("SKILL.md"),
+        // A bare skills root: no plugin wrapper, no manifest.
+        CommandSurface::Skill { .. } => dir.join(format!("engram-{name}")).join("SKILL.md"),
         // Unreachable: the caller returns early for a harness with no surface.
         CommandSurface::None { .. } => dir.join(name),
     }
@@ -357,7 +359,7 @@ pub fn install(
             let stale = pinned_db(&path).filter(|old| *old != db);
 
             let body = match spec.command_surface {
-                CommandSurface::Plugin { .. } => {
+                CommandSurface::Plugin { .. } | CommandSurface::Skill { .. } => {
                     render_skill(command.name, command.body, spec, &db)
                 }
                 _ => render_command(command.body, spec, &db),
