@@ -91,6 +91,16 @@ pub enum CommandSurface {
         /// Home-relative directory holding plugin subdirectories.
         dir: &'static str,
     },
+    /// A bare skills directory the harness scans directly, one subdirectory
+    /// per skill holding `SKILL.md`.
+    ///
+    /// Distinct from [`CommandSurface::Plugin`]: there is no plugin wrapper and
+    /// no manifest, and discovery is automatic — nothing has to be registered
+    /// in a config file engram does not own.
+    Skill {
+        /// Home-relative directory the harness scans for skills.
+        dir: &'static str,
+    },
     /// Nothing engram can write, and why not. The reason is per-harness
     /// because the reasons genuinely differ.
     None { detail: &'static str },
@@ -188,10 +198,11 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[".codex/config.toml", ".codex"],
         sessions_dir: Some(".codex/sessions"),
         transcript: TranscriptSupport::Reader(ReaderKind::Codex),
-        command_surface: CommandSurface::Markdown {
-            dir: ".codex/prompts",
-            file: "engram-{name}.md",
-            frontmatter: false,
+        // Codex 0.149 removed `~/.codex/prompts/` entirely --- the binary
+        // contains no such string --- and moved to skills. Engram wrote three
+        // files into that directory for a release and nothing ever read them.
+        command_surface: CommandSurface::Skill {
+            dir: ".codex/skills",
         },
         mcp_config: Some(McpConfigSource::Toml(".codex/config.toml")),
         hooks_config: None,
@@ -350,7 +361,9 @@ pub fn sessions_dir(spec: &HarnessSpec) -> Option<PathBuf> {
 /// Absolute path to a harness's command directory, when it has one.
 pub fn commands_dir(spec: &HarnessSpec) -> Option<PathBuf> {
     match spec.command_surface {
-        CommandSurface::Markdown { dir, .. } | CommandSurface::Plugin { dir } => in_home(dir),
+        CommandSurface::Markdown { dir, .. }
+        | CommandSurface::Plugin { dir }
+        | CommandSurface::Skill { dir } => in_home(dir),
         CommandSurface::None { .. } => None,
     }
 }

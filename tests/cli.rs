@@ -2299,9 +2299,12 @@ fn install_skips_files_it_did_not_write_unless_forced() {
 }
 
 /// Codex reads plain markdown prompts; frontmatter would render as literal
-/// text at the top of every prompt.
+/// Codex 0.149 removed `~/.codex/prompts/` and moved to skills, so engram
+/// writes it a skill directory rather than a prompt file. Claude Code still
+/// takes a markdown command with frontmatter — the two surfaces differ in the
+/// *shape* of the artifact, not merely in whether a header is read.
 #[test]
-fn install_strips_frontmatter_for_harnesses_that_do_not_read_it() {
+fn install_writes_codex_a_skill_and_claude_code_a_command() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
     let home = tmp.path().join("home");
@@ -2313,20 +2316,25 @@ fn install_strips_frontmatter_for_harnesses_that_do_not_read_it() {
         .assert()
         .success();
 
-    let codex = std::fs::read_to_string(home.join(".codex/prompts/engram-save-chat.md"))
-        .expect("codex prompt written");
-    assert!(
-        !codex.contains("argument-hint:"),
-        "frontmatter leaked: {codex}"
-    );
+    // Codex: one directory per skill, holding SKILL.md.
+    let codex = std::fs::read_to_string(home.join(".codex/skills/engram-save-chat/SKILL.md"))
+        .expect("codex skill written");
+    assert!(codex.starts_with("---\n"), "{codex}");
+    assert!(codex.contains("name: engram-save-chat"));
+    assert!(codex.contains("description: "));
+    // Skill frontmatter, not command frontmatter.
     assert!(codex.contains("--db /shared/engram.db"));
     assert!(codex.contains("--harness codex"));
 
+    // The directory Codex abandoned must not be written to any more.
+    assert!(predicate::path::missing().eval(&home.join(".codex/prompts")));
+
+    // Claude Code is unchanged: a markdown command that keeps its frontmatter.
     let claude = std::fs::read_to_string(home.join(".claude/commands/engram-save-chat.md"))
         .expect("claude command written");
     assert!(
         claude.contains("argument-hint:"),
-        "claude code reads frontmatter"
+        "claude code reads command frontmatter"
     );
     assert!(claude.contains("--harness claude-code"));
 }

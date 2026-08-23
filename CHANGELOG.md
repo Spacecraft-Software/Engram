@@ -11,6 +11,22 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex commands went to a directory Codex no longer reads.** Codex 0.149
+  removed `~/.codex/prompts/` entirely and moved to skills; engram had been
+  writing three prompt files there that nothing loaded. Engram now writes
+  `~/.codex/skills/engram-<name>/SKILL.md`, the location Codex discovers
+  automatically with no marketplace or config registration. Engram never
+  deletes, so the stale `~/.codex/prompts/engram-*.md` files are left in place
+  and can be removed by hand.
+
+### Added
+
+- `CommandSurface::Skill { dir }` — a bare skills root scanned directly by the
+  harness, distinct from `Plugin { dir }`, which wraps skills in a plugin
+  directory with a manifest.
+
 ### Added
 
 - **OpenClaude** is a supported harness (the eighth). It is a Claude Code fork
