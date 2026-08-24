@@ -852,11 +852,10 @@ mod tests {
         // work. Antigravity used to be one of these; it now has a plugin
         // surface, so the exclusion moved to the harnesses that really have
         // none.
-        for id in [
-            harness::Harness::Goose,
-            harness::Harness::CopilotCli,
-            harness::Harness::Qwen,
-        ] {
+        // Qwen used to be here; its bundled docs confirmed a real skills
+        // directory, so it moved to a surface. Goose and Copilot CLI remain
+        // genuinely unsurveyed.
+        for id in [harness::Harness::Goose, harness::Harness::CopilotCli] {
             assert!(
                 !targets.iter().any(|s| s.id == id),
                 "{id:?} has no command surface and must not be a default target"

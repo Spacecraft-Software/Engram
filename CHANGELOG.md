@@ -32,6 +32,17 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **Kimi** is a supported harness (the ninth). Skills go to
+  `~/.kimi-code/skills/engram-<name>/SKILL.md`; the MCP registration is read
+  from `~/.kimi-code/mcp.json`. Its transcripts (`~/.kimi/sessions/<project>/
+  <session>/context.jsonl`) are line-oriented and readable, but the project
+  directory is a hash with no published mapping back to a working directory, so
+  the reader stays `NotImplemented` with that reason recorded.
+- **Qwen now gets skills.** It was reported as having no writable surface on the
+  grounds that its "command format is unverified"; Qwen Code's own bundled
+  `docs/features/skills.md` documents `~/.qwen/skills/<name>/SKILL.md`, so the
+  claim was stale rather than true.
+
 - `CommandSurface::Skill { dir }` — a bare skills root scanned directly by the
   harness, distinct from `Plugin { dir }`, which wraps skills in a plugin
   directory with a manifest.
