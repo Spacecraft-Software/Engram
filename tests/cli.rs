@@ -2095,7 +2095,7 @@ fn install_list_reports_every_harness_and_writes_nothing() {
     let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
 
     let harnesses = data["harnesses"].as_array().expect("harnesses");
-    assert_eq!(harnesses.len(), 8, "every known harness must be reported");
+    assert_eq!(harnesses.len(), 9, "every known harness must be reported");
 
     let claude = harnesses
         .iter()
@@ -3346,4 +3346,37 @@ fn install_skips_an_unwritable_target_and_keeps_going() {
     let mut perms = std::fs::metadata(&skills).expect("stat").permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&skills, perms).ok();
+}
+
+/// Kimi and Qwen both take skills, in their own config roots.
+///
+/// Qwen was previously reported as having no surface at all ("command format
+/// unverified"); its own bundled `docs/features/skills.md` documents
+/// `~/.qwen/skills/<name>/SKILL.md`, so the claim was simply stale. Kimi's
+/// configuration moved to `~/.kimi-code` while its sessions stayed in
+/// `~/.kimi`, which is why both are probed.
+#[test]
+fn install_writes_kimi_and_qwen_skills() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    pretend_installed(&home, ".kimi-code");
+    pretend_installed(&home, ".qwen");
+
+    install(&db, &home, &["--db-path", "/shared/engram.db"])
+        .assert()
+        .success();
+
+    for (harness, path) in [
+        ("kimi", ".kimi-code/skills/engram-save-chat/SKILL.md"),
+        ("qwen", ".qwen/skills/engram-save-chat/SKILL.md"),
+    ] {
+        let text = std::fs::read_to_string(home.join(path))
+            .unwrap_or_else(|e| panic!("{harness}: {path}: {e}"));
+        assert!(text.starts_with("---\n"), "{harness}: {text}");
+        assert!(text.contains("name: engram-save-chat"), "{harness}");
+        assert!(text.contains("--db /shared/engram.db"), "{harness}");
+        assert!(text.contains(&format!("--harness {harness}")), "{harness}");
+    }
 }

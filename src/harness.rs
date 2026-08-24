@@ -37,6 +37,7 @@ pub enum Harness {
     OpenClaude,
     Codex,
     Opencode,
+    Kimi,
     Antigravity,
     Goose,
     CopilotCli,
@@ -224,6 +225,26 @@ pub const ALL: &[HarnessSpec] = &[
         hooks_config: None,
     },
     HarnessSpec {
+        id: Harness::Kimi,
+        name: "kimi",
+        // `~/.kimi` is the pre-migration root and still holds sessions; the
+        // `.migrated-to-kimi-code` marker inside it points at `~/.kimi-code`,
+        // which is where configuration lives now. Probing both means a user on
+        // either side of that migration is detected.
+        probe: &[".kimi-code", ".kimi"],
+        sessions_dir: Some(".kimi/sessions"),
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "kimi writes sessions/<project>/<session>/context.jsonl, a line-oriented \
+                     conversation engram could read; the project directory is a hash with no \
+                     published mapping back to a working directory",
+        },
+        command_surface: CommandSurface::Skill {
+            dir: ".kimi-code/skills",
+        },
+        mcp_config: Some(McpConfigSource::Json(".kimi-code/mcp.json")),
+        hooks_config: None,
+    },
+    HarnessSpec {
         id: Harness::Antigravity,
         name: "antigravity",
         probe: &[".gemini/antigravity", ".antigravity"],
@@ -273,8 +294,11 @@ pub const ALL: &[HarnessSpec] = &[
         transcript: TranscriptSupport::NotImplemented {
             detail: "qwen's session storage has not been surveyed",
         },
-        command_surface: CommandSurface::None {
-            detail: "qwen's command format is unverified; engram will not guess at it",
+        // Verified against Qwen Code's own bundled documentation
+        // (`docs/features/skills.md`): personal skills live in
+        // `~/.qwen/skills/<name>/SKILL.md`.
+        command_surface: CommandSurface::Skill {
+            dir: ".qwen/skills",
         },
         mcp_config: Some(McpConfigSource::Json(".qwen/settings.json")),
         hooks_config: None,
