@@ -13,6 +13,16 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **A project under a dotted directory was unreachable.** `mangle_cwd` replaced
+  only `/`, but the harness replaces every character outside `[A-Za-z0-9_-]`, so
+  anything beneath `.claude/worktrees/` — every worktree Claude Code creates —
+  resolved to a directory that does not exist and reported `NOT_FOUND` as though
+  the session were missing.
+- **`ingest --cwd` now sets the scope.** It selected which transcripts to read
+  while scope still resolved from the process's own directory, so importing many
+  projects from one terminal filed them all under one scope and reported
+  `scope_origin: "git-root"` while doing it. An explicit `--scope` still wins.
+
 - **A skill description containing a colon silently broke the whole skill.**
   `description: Save this conversation: capture ...` is invalid YAML, so
   Antigravity loaded two of engram's three commands and reported nothing.

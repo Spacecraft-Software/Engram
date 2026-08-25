@@ -1711,8 +1711,29 @@ fn which_makeinfo() -> Result<std::path::PathBuf, ()> {
 /// The directory name is produced by mangling `project` forward — `/` becomes
 /// `-`, case preserved — exactly as the reader does. Nothing here reverses a
 /// mangled name, because that mapping does not exist.
+/// Mangles a path the way the harness does, for planting a fake transcript.
+///
+/// This must mirror `transcript::mangle_cwd` exactly: every character outside
+/// `[A-Za-z0-9_-]` becomes `-`. Replacing only `/` is not equivalent, and the
+/// difference bites here in particular — a `TempDir` path contains `.tmpXXXX`,
+/// so a test that planted with the old rule would write a directory the reader
+/// no longer looks in, and every ingest test would fail for a reason that has
+/// nothing to do with what it is testing.
+fn mangle_like_the_harness(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 fn plant_claude_transcript(home: &Path, project: &Path, session_id: &str) -> std::path::PathBuf {
-    let mangled = project.to_string_lossy().replace('/', "-");
+    let mangled = mangle_like_the_harness(project);
     let dir = home.join(".claude").join("projects").join(mangled);
     std::fs::create_dir_all(&dir).expect("create fake projects dir");
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3189,7 +3210,7 @@ fn plant_openclaude_transcript(
     project: &Path,
     session_id: &str,
 ) -> std::path::PathBuf {
-    let mangled = project.to_string_lossy().replace('/', "-");
+    let mangled = mangle_like_the_harness(project);
     let dir = home.join(".openclaude").join("projects").join(mangled);
     std::fs::create_dir_all(&dir).expect("create fake projects dir");
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3493,4 +3514,106 @@ fn install_warns_when_two_harnesses_share_a_skills_directory() {
         .expect("codex reported")
         .clone();
     assert!(codex["warning"].is_null(), "codex: {:?}", codex["warning"]);
+}
+
+/// A project under a dotted directory is reachable.
+///
+/// `mangle_cwd` replaced only `/`, so `.claude/worktrees/x` was looked for as
+/// `-…-.claude-worktrees-x` while the harness had written
+/// `-…--claude-worktrees-x`. Ingest reported `NOT_FOUND` — indistinguishable
+/// from "that session does not exist" — and every worktree Claude Code creates
+/// lives under exactly that path, so the blind spot grew with use.
+#[test]
+fn ingest_reads_a_project_under_a_dotted_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+
+    // The shape Claude Code creates for a worktree.
+    let project = tmp.path().join(".claude/worktrees/peaceful-jones");
+    std::fs::create_dir_all(&project).expect("create worktree dir");
+    std::fs::write(project.join(".git"), "gitdir: elsewhere\n").expect("pin the git root");
+    plant_claude_transcript(&home, &project, "sess-dotted");
+
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--session", "all"],
+    )
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+
+    assert_eq!(data["sessions"].as_array().expect("sessions").len(), 1);
+    assert!(
+        data["inserted"].as_u64().expect("inserted") > 0,
+        "a dotted path must not read as an empty harness: {data}"
+    );
+}
+
+/// `--cwd` names the project, so it must name the scope too.
+///
+/// Reading another project's transcripts while filing them under the caller's
+/// own scope is silent mis-filing: the response said `scope_origin: "git-root"`
+/// and looked entirely correct. Importing many projects from one terminal put
+/// all of them in one scope.
+#[test]
+fn ingest_cwd_sets_the_scope_and_explicit_scope_still_wins() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+
+    // Two projects: one we stand in, one we point at.
+    let here = pinned_project(&tmp);
+    let elsewhere = tmp.path().join("other-project");
+    std::fs::create_dir_all(&elsewhere).expect("create other project");
+    std::fs::write(elsewhere.join(".git"), "gitdir: elsewhere\n").expect("pin the git root");
+    plant_claude_transcript(&home, &elsewhere, "sess-elsewhere");
+
+    let cwd = elsewhere.to_string_lossy().into_owned();
+    let assert = ingest(
+        &db,
+        &home,
+        &here,
+        &[
+            "--harness",
+            "claude-code",
+            "--cwd",
+            &cwd,
+            "--session",
+            "all",
+            "--dry-run",
+        ],
+    )
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["scope"], "other-project", "scope must follow --cwd");
+    assert_eq!(data["scope_origin"], "git-root");
+
+    // An explicit scope still beats the inferred one.
+    let assert = ingest(
+        &db,
+        &home,
+        &here,
+        &[
+            "--harness",
+            "claude-code",
+            "--cwd",
+            &cwd,
+            "--scope",
+            "pinned",
+            "--session",
+            "all",
+            "--dry-run",
+        ],
+    )
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["scope"], "pinned");
+    assert_eq!(data["scope_origin"], "explicit");
 }
