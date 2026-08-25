@@ -54,6 +54,10 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **Four native readers, covering five more harnesses**: Opencode (and ZCode,
+  whose CLI is an Opencode fork sharing its schema), Goose, Copilot CLI, and
+  Qwen. `engram ingest` now reads nine harnesses without any manual export.
+
 - **Ten more harnesses in the table** — grok, zcode, deepcode, poe-code, kilo,
   mimocode, warp, cline, aichat, bailian — recorded, not built for. An absent
   entry is indistinguishable from an unexamined one.

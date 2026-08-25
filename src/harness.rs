@@ -70,6 +70,11 @@ pub enum Harness {
 pub enum ReaderKind {
     ClaudeCode,
     Codex,
+    /// Serves Opencode and Z.ai's Z Code, which share one schema.
+    Opencode,
+    Goose,
+    CopilotCli,
+    Qwen,
 }
 
 /// Whether engram can read a harness's session transcripts, and if not, why.
@@ -259,10 +264,8 @@ pub const ALL: &[HarnessSpec] = &[
         id: Harness::Opencode,
         name: "opencode",
         probe: &[".config/opencode/opencode.jsonc", ".config/opencode"],
-        sessions_dir: None,
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "opencode's session storage has not been surveyed",
-        },
+        sessions_dir: Some(".local/share/opencode/opencode.db"),
+        transcript: TranscriptSupport::Reader(ReaderKind::Opencode),
         command_surface: CommandSurface::Markdown {
             dir: ".config/opencode/command",
             file: "engram-{name}.md",
@@ -365,12 +368,8 @@ pub const ALL: &[HarnessSpec] = &[
         id: Harness::Goose,
         name: "goose",
         probe: &[".config/goose/config.yaml", ".config/goose"],
-        sessions_dir: None,
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "goose stores sessions in .local/share/goose/sessions/sessions.db, \
-                     whose messages table carries role, content_json and created_timestamp \
-                     as first-class columns; a reader is not written yet",
-        },
+        sessions_dir: Some(".local/share/goose/sessions/sessions.db"),
+        transcript: TranscriptSupport::Reader(ReaderKind::Goose),
         command_surface: CommandSurface::None {
             detail: "goose has no user command directory engram has surveyed",
         },
@@ -383,10 +382,8 @@ pub const ALL: &[HarnessSpec] = &[
         id: Harness::CopilotCli,
         name: "copilot-cli",
         probe: &[".copilot/mcp-config.json", ".copilot"],
-        sessions_dir: None,
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "copilot cli stores sessions in session-store.db, whose turns table is already a flat pre-paired transcript — turns(session_id, turn_index, user_message, assistant_response, timestamp) with UNIQUE(session_id, turn_index), joined to sessions(cwd, repository, branch); a reader is not written yet",
-        },
+        sessions_dir: Some(".copilot/session-store.db"),
+        transcript: TranscriptSupport::Reader(ReaderKind::CopilotCli),
         command_surface: CommandSurface::None {
             detail: "copilot cli takes plugins, not loose command files, and installs \
                      them from a marketplace, a GitHub repository, or a git URL --- \
@@ -401,10 +398,8 @@ pub const ALL: &[HarnessSpec] = &[
         id: Harness::Qwen,
         name: "qwen",
         probe: &[".qwen/settings.json", ".qwen"],
-        sessions_dir: None,
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "qwen's session storage has not been surveyed",
-        },
+        sessions_dir: Some(".qwen/projects"),
+        transcript: TranscriptSupport::Reader(ReaderKind::Qwen),
         // Verified against Qwen Code's own bundled documentation
         // (`docs/features/skills.md`): personal skills live in
         // `~/.qwen/skills/<name>/SKILL.md`.
@@ -450,14 +445,8 @@ pub const ALL: &[HarnessSpec] = &[
         id: Harness::ZCode,
         name: "zcode",
         probe: &[".zcode/cli", ".zcode"],
-        sessions_dir: Some(".zcode/cli/db"),
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "z.ai's Z Code ships an Electron app and a CLI whose store is an opencode \
-                     fork — .zcode/cli/db/db.sqlite with the same session/message/part schema, \
-                     so one reader would serve both. The sibling rollout/model-io-*.jsonl is \
-                     an HTTP log that resends the whole conversation per line, not a \
-                     transcript; a reader is not written yet",
-        },
+        sessions_dir: Some(".zcode/cli/db/db.sqlite"),
+        transcript: TranscriptSupport::Reader(ReaderKind::Opencode),
         command_surface: CommandSurface::None {
             detail: "zcode's skills directory has not been surveyed for writability",
         },

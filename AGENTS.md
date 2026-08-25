@@ -251,7 +251,20 @@ Every tool's schema costs context on every turn of every conversation, which is 
 
 `src/harness.rs` + `src/transcript/{mod,claude_code,redact}.rs`. Reads the session file a harness already writes for itself and stores each message as an ordinary memory, so `recall`/`search`/`context`/`consolidate` see the real conversation.
 
-Two readers exist: `claude_code` and `codex`. Adding a third means adding a `ReaderKind` variant, which the two `match`es in `transcript/mod.rs` then force you to handle.
+Six readers exist — `claude_code`, `codex`, `opencode`, `goose`, `copilot`, `qwen` — serving **nine** harnesses. Adding another means adding a `ReaderKind` variant, which the two `match`es in `transcript/mod.rs` then force you to handle.
+
+**A store-backed reader has a different shape from a file-per-session one**, and three things follow from it:
+
+- **`read` takes the session id as well as the path**, because every session shares one file. The dispatcher in `read_session` already holds the `SessionRef`, so it just passes both.
+- **The store is opened `SQLITE_OPEN_READ_ONLY`.** It belongs to a program that may be running right now; a read-only handle makes "engram never writes to another tool's database" structural rather than a promise.
+- **`--max-bytes` measures the session, not the file.** For a file-per-session harness the two are identical, which is why the check reads as a file-size check in `claude_code` and `codex`. Opencode's store is 550 MB of *all* sessions, so measuring the file refused every session in it with `transcript is 550273024 bytes` — a transcript nobody asked for. The guard's real job is to stop one runaway conversation exhausting memory, so the store readers accumulate text and check against that. `SessionRef.bytes` is likewise the session's own size, summed from its rows.
+
+Reader-specific facts worth keeping:
+
+- **One reader serves Opencode and ZCode**, whose CLI is an Opencode fork with the same `session`/`message`/`part` schema — the `claude_code`/OpenClaude relationship again. Reconstructing a turn is a two-table join: `message` has the role and time, the text lives in `part` rows ordered by their own creation time. Parts are overwhelmingly *not* conversation (a real store: `tool` 9854, `step-start` 6439, `step-finish` 6335, `reasoning` 3945, `text` 3322, `patch` 461), so counting them rather than dropping them silently is the whole point.
+- **Copilot CLI's row is two turns.** The prompt and the reply share one row *and one timestamp* — the harness records no separate time for the reply. The halves need distinct `source_uuid` suffixes (`0:user`, `0:assistant`) or the second would collide with the first through `turn_id` and be dropped by `INSERT OR IGNORE`.
+- **Goose's `message_id` is nullable**, so identity falls back to the row's position — the same reasoning `codex` uses for records carrying no id of their own.
+- **Qwen shares the Claude Code reader.** Its records use Claude Code's envelope but put the body at `message.parts[]`, whose entries carry *no* `type` field. `collect_text` therefore treats an untyped block carrying text as text; without that it counted the entire conversation as `non_message` while reporting a healthy-looking histogram. Only session discovery differs (`projects/<mangled-cwd>/chats/`), which is why `qwen.rs` exists at all.
 
 - **Codex layout:** `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`. The tree encodes the **date, not the cwd**, so there is nothing to mangle — each rollout's first record is a `session_meta` carrying `cwd` verbatim, and listing reads exactly that one line per file.
 - **Codex has two channels, and `event_msg` wins.** `event_msg` is what the UI displayed (flat strings); `response_item` is the raw API traffic. `event_msg` is primary not merely because it parses more easily but because it is *less* noisy: on a real rollout it held 2 user messages where `response_item` held 3, and the extra one was an `<environment_context>` block the harness injects. `response_item` is a fallback used only when a rollout has no `event_msg` conversation at all, so retiring the display channel would degrade rather than silently yield nothing. When the display channel wins, the raw duplicates are counted as `non_message`.
