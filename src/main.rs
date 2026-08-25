@@ -11,6 +11,7 @@ mod error;
 mod facts;
 mod harness;
 mod http;
+mod import;
 mod install;
 mod managed_file;
 mod mcp;
@@ -677,6 +678,24 @@ fn run(
                 &store, mode, requested, &session, scope, cwd, opts, list, dry_run,
             )
         }
+
+        Command::Import {
+            paths,
+            scope,
+            input_format,
+            recursive,
+            max_bytes,
+            dry_run,
+        } => handle_import(
+            &store,
+            mode,
+            &paths,
+            scope,
+            input_format,
+            recursive,
+            max_bytes,
+            dry_run,
+        ),
 
         Command::Install {
             harness: requested,
@@ -1551,6 +1570,203 @@ fn scope_error(e: std::io::Error) -> AppError {
 fn fail(err: AppError, mode: OutputMode) -> i32 {
     emit_error(&err, mode);
     err.exit_code
+}
+
+/// One export that produced messages.
+#[derive(serde::Serialize)]
+struct ImportedFile {
+    path: String,
+    format: &'static str,
+    scope: String,
+    messages: usize,
+    inserted: usize,
+    skipped_existing: usize,
+    /// True when the export carried no per-message times and they were
+    /// synthesised in order. Surfaced per file so a reader can tell an
+    /// approximate history from a recorded one without opening it.
+    approximate_times: bool,
+}
+
+/// An export that produced nothing, and why.
+#[derive(serde::Serialize)]
+struct SkippedFile {
+    path: String,
+    reason: String,
+}
+
+/// `engram import` payload.
+#[derive(serde::Serialize)]
+struct ImportResult {
+    dry_run: bool,
+    files: Vec<ImportedFile>,
+    /// Never empty on a real corpus: a `chat/` directory accumulates whatever
+    /// was dropped in it. Reporting each skip with its reason is the
+    /// difference between "engram found nothing" and "engram found nine files
+    /// it could not read".
+    skipped: Vec<SkippedFile>,
+    scopes: Vec<String>,
+    inserted: usize,
+    skipped_existing: usize,
+    filtered: transcript::FilterStats,
+    redactions: transcript::redact::Redactions,
+}
+
+/// Collects the files an import should consider.
+///
+/// Walks with `std::fs` and therefore ignores `.gitignore` entirely, which is
+/// the only thing that makes this command useful: engram itself adds `chat/`
+/// to a project's `.gitignore` the first time `save-chat` runs, so every
+/// archive it has ever written is ignored by definition. A walker that
+/// honoured ignore rules — as `fd`, `rg` and `git ls-files` all do by default
+/// — would find precisely zero of them and report success.
+fn collect_exports(paths: &[std::path::PathBuf], recursive: bool) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = paths.to_vec();
+    while let Some(p) = stack.pop() {
+        if p.is_file() {
+            out.push(p);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive {
+                    stack.push(path);
+                }
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Imports exported transcripts into the store.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_import(
+    store: &std::sync::Mutex<store::Store>,
+    mode: OutputMode,
+    paths: &[std::path::PathBuf],
+    scope: Option<String>,
+    format: Option<import::Format>,
+    recursive: bool,
+    max_bytes: u64,
+    dry_run: bool,
+) -> i32 {
+    let files = collect_exports(paths, recursive);
+    let mut result = ImportResult {
+        dry_run,
+        files: Vec::new(),
+        skipped: Vec::new(),
+        scopes: Vec::new(),
+        inserted: 0,
+        skipped_existing: 0,
+        filtered: transcript::FilterStats::default(),
+        redactions: transcript::redact::Redactions::default(),
+    };
+
+    for path in files {
+        let display = path.display().to_string();
+        let (fmt, messages) = match import::read_file(&path, format, max_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                result.skipped.push(SkippedFile {
+                    path: display,
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+        if messages.is_empty() {
+            result.skipped.push(SkippedFile {
+                path: display,
+                reason: "recognised the format but found no messages".to_string(),
+            });
+            continue;
+        }
+
+        // Scope per file, resolved from the directory the export sits in, so
+        // one run over many projects files each into its own scope.
+        //
+        // Canonicalized first: `engram import ./chat` resolves its parent to
+        // `.`, whose basename is empty, and the scope silently became
+        // `default` — one relative path away from filing an entire corpus
+        // under the wrong name.
+        let base = path.parent().unwrap_or(&path);
+        let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+        let resolved = rules::resolve_scope_in(scope.as_deref(), &base);
+
+        let approximate = messages.iter().any(|m| m.approximate);
+        let mut rows: Vec<store::IngestTurn> = Vec::with_capacity(messages.len());
+        for m in &messages {
+            // The same normalization and redaction the live readers apply. An
+            // archive is not more trustworthy for being old — these files hold
+            // whatever was pasted into the session.
+            let Some(text) = transcript::normalize_text(
+                &m.text,
+                transcript::DEFAULT_MAX_CHARS_PER_TURN,
+                &mut result.filtered,
+            ) else {
+                continue;
+            };
+            let text = transcript::redact::scrub(&text, &mut result.redactions);
+            let scrubbed = import::Message { text, ..m.clone() };
+            rows.push(store::IngestTurn {
+                id: import::import_id(&resolved.name, &scrubbed),
+                agent: scrubbed.agent.clone(),
+                role: scrubbed.role.clone(),
+                content: scrubbed.text.clone(),
+                created_at: scrubbed.created_at.clone(),
+            });
+        }
+
+        let report = if dry_run {
+            store::IngestReport {
+                inserted: rows.len(),
+                skipped_existing: 0,
+            }
+        } else {
+            let mut guard = store.lock().expect("store lock poisoned");
+            match guard.ingest_turns(&resolved.name, &rows) {
+                Ok(r) => r,
+                Err(e) => return fail(AppError::from(e), mode),
+            }
+        };
+
+        result.inserted += report.inserted;
+        result.skipped_existing += report.skipped_existing;
+        if !result.scopes.contains(&resolved.name) {
+            result.scopes.push(resolved.name.clone());
+        }
+        result.files.push(ImportedFile {
+            path: display,
+            format: fmt.as_str(),
+            scope: resolved.name,
+            messages: rows.len(),
+            inserted: report.inserted,
+            skipped_existing: report.skipped_existing,
+            approximate_times: approximate,
+        });
+    }
+
+    result.scopes.sort();
+    let label = if dry_run {
+        "engram import --dry-run"
+    } else {
+        "engram import"
+    };
+    let response = Response::new(label, result);
+    let response = if dry_run {
+        response.with_dry_run()
+    } else {
+        response
+    };
+    emit_ok(response, mode);
+    0
 }
 
 // Rust guideline compliant 2026-05-18

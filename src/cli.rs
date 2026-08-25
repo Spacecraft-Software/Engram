@@ -347,6 +347,40 @@ EXAMPLES:
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import chat transcripts that were exported to files.
+    ///
+    /// Reads what a harness's own export command wrote, and what `save-chat`
+    /// archived, for the harnesses engram has no reader for.
+    Import {
+        /// Files or directories to import. A directory is scanned for exports.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<std::path::PathBuf>,
+
+        /// Scope to store into. Resolves from each file's own project when
+        /// omitted, so one run can fill many scopes correctly.
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Force a parser instead of detecting one from the file's content.
+        ///
+        /// Deliberately not `--format`: that is the global output-format flag,
+        /// and giving a subcommand the same name makes clap panic on the
+        /// duplicate argument id rather than shadow it.
+        #[arg(long, value_enum)]
+        input_format: Option<crate::import::Format>,
+
+        /// Descend into subdirectories.
+        #[arg(long)]
+        recursive: bool,
+
+        /// Refuse an export larger than this many bytes.
+        #[arg(long, default_value_t = crate::transcript::DEFAULT_MAX_BYTES)]
+        max_bytes: u64,
+
+        /// Parse and report what would be stored, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Write engram's slash commands into the harnesses on this machine.
     ///
     /// Engram is usually already registered as an MCP server everywhere; what
