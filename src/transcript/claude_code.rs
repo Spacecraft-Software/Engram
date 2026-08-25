@@ -205,7 +205,10 @@ pub(crate) fn parse_record(
         return Ok(None);
     }
 
-    let Some(content) = record.pointer("/message/content") else {
+    let Some(content) = record
+        .pointer("/message/content")
+        .or_else(|| record.pointer("/message/parts"))
+    else {
         stats.empty += 1;
         return Ok(None);
     };
@@ -293,6 +296,15 @@ fn collect_text(content: &Value, opts: &ReadOptions, stats: &mut FilterStats) ->
                         .map(|c| c.to_string().len())
                         .unwrap_or(0);
                     parts.push(format!("[tool_result: {bytes} bytes]"));
+                }
+            }
+            // An untyped block carrying text is text. Qwen writes its parts
+            // that way — `{"text": …}` with no `type` — and counting them as
+            // non-message would silently discard the entire conversation while
+            // reporting a healthy-looking filter histogram.
+            "" if block.get("text").and_then(Value::as_str).is_some() => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    parts.push(t.to_string());
                 }
             }
             _ => stats.non_message += 1,

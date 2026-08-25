@@ -1956,7 +1956,11 @@ fn ingest_from_a_readerless_harness_is_exit_2_with_a_fallback() {
     let db = tmp.path().join("test.db");
     let (home, project) = ingest_fixture(&tmp);
 
-    for harness in ["antigravity", "copilot-cli", "goose", "qwen"] {
+    // Harnesses that genuinely still have no reader. The list shrinks as
+    // readers land, which is the point — it must never be padded with a
+    // harness engram can now read, or the test would assert a refusal that
+    // should no longer happen.
+    for harness in ["antigravity", "cursor", "kimi", "vscode"] {
         let assert = ingest(&db, &home, &project, &["--harness", harness, "--list"])
             .assert()
             .failure()

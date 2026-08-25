@@ -36,6 +36,10 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod copilot;
+pub mod goose;
+pub mod opencode;
+pub mod qwen;
 pub mod redact;
 
 use crate::harness::{Harness, HarnessSpec, ReaderKind, TranscriptSupport};
@@ -406,6 +410,10 @@ pub fn sessions_for(spec: &HarnessSpec, cwd: &Path) -> Result<Vec<SessionRef>, T
     match spec.transcript {
         TranscriptSupport::Reader(ReaderKind::ClaudeCode) => claude_code::sessions(spec, cwd),
         TranscriptSupport::Reader(ReaderKind::Codex) => codex::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::Opencode) => opencode::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::Goose) => goose::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::CopilotCli) => copilot::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::Qwen) => qwen::sessions(spec, cwd),
         TranscriptSupport::NotImplemented { detail }
         | TranscriptSupport::Unsupported { detail } => Err(TranscriptError::NoReader(detail)),
     }
@@ -427,6 +435,22 @@ pub fn read_session(
             claude_code::read(Path::new(&session.path), opts)
         }
         TranscriptSupport::Reader(ReaderKind::Codex) => codex::read(Path::new(&session.path), opts),
+        // A store-backed harness keeps every session in one file, so the
+        // reader needs the id as well as the path.
+        TranscriptSupport::Reader(ReaderKind::Opencode) => {
+            opencode::read(Path::new(&session.path), &session.session_id, opts)
+        }
+        TranscriptSupport::Reader(ReaderKind::Goose) => {
+            goose::read(Path::new(&session.path), &session.session_id, opts)
+        }
+        TranscriptSupport::Reader(ReaderKind::CopilotCli) => {
+            copilot::read(Path::new(&session.path), &session.session_id, opts)
+        }
+        // Qwen writes Claude Code's records, so it shares that reader; only
+        // session discovery differs.
+        TranscriptSupport::Reader(ReaderKind::Qwen) => {
+            claude_code::read(Path::new(&session.path), opts)
+        }
         TranscriptSupport::NotImplemented { detail }
         | TranscriptSupport::Unsupported { detail } => Err(TranscriptError::NoReader(detail)),
     }
