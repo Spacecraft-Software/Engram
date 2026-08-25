@@ -255,16 +255,46 @@ pub fn turn_id(harness: &str, session_id: &str, source_uuid: &str) -> String {
 /// Maps a working directory to Claude Code's project-directory name.
 ///
 /// `/spacecraft-software/engram` becomes `-spacecraft-software-engram`: every
-/// `/` becomes `-`, which turns the leading slash into a leading dash, and
-/// **case is preserved** (`-spacecraft-software-Majestic` and
-/// `-spacecraft-software-majestic` are different directories on disk).
+/// Every character outside `[A-Za-z0-9_-]` becomes `-`, which turns the
+/// leading slash into a leading dash, and **case is preserved**
+/// (`-spacecraft-software-Majestic` and `-spacecraft-software-majestic` are
+/// different directories on disk). An empty result becomes `unknown`.
+///
+/// This mirrors the harness's own function, which is the authority — engram
+/// does not get to choose the spelling of a directory somebody else creates:
+///
+/// ```js
+/// function tl(e){ let t=e.replace(/[^a-zA-Z0-9\-_]/g,"-"); return t===""?"unknown":t }
+/// ```
+///
+/// Replacing only `/` was wrong for any path containing a dot, and silently
+/// so: `/spacecraft-software/construct/.claude/worktrees/x` mangles to
+/// `…construct--claude-worktrees-x`, engram looked for
+/// `…construct-.claude-worktrees-x`, and the session came back `NOT_FOUND` as
+/// though it did not exist. Claude Code puts every worktree it creates under
+/// `.claude/worktrees/`, so the blind spot grows with use.
 ///
 /// Forward-only by construction. A literal `-` in a directory name is
-/// indistinguishable from a separator in the result, so the inverse mapping
-/// does not exist and is deliberately not offered — callers always start from
-/// a working directory they already know.
+/// indistinguishable from a replaced character in the result, so the inverse
+/// mapping does not exist and is deliberately not offered — callers always
+/// start from a working directory they already know.
 pub fn mangle_cwd(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace('/', "-")
+    let mangled: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if mangled.is_empty() {
+        "unknown".to_owned()
+    } else {
+        mangled
+    }
 }
 
 /// Normalizes a transcript timestamp to ISO 8601 UTC with a `Z` suffix.
@@ -537,6 +567,42 @@ mod tests {
         // A literal dash survives, which is exactly why the inverse mapping
         // is not offered.
         assert_eq!(mangle_cwd(Path::new("/a-b/c")), "-a-b-c");
+    }
+
+    /// A dot is replaced too, and an underscore is not.
+    ///
+    /// Replacing only `/` made every worktree under `.claude/worktrees/`
+    /// unreadable — engram looked for a directory the harness never wrote and
+    /// reported `NOT_FOUND`, which reads as "no such session" rather than "I
+    /// mangled the name". The underscore case pins the other half of the
+    /// harness's character class: `_` is *kept*, so mapping it to `-` would
+    /// break paths that a naive "replace punctuation" rule would mangle.
+    #[test]
+    fn mangle_cwd_replaces_dots_and_keeps_underscores() {
+        assert_eq!(
+            mangle_cwd(Path::new(
+                "/spacecraft-software/construct/.claude/worktrees/peaceful-jones"
+            )),
+            "-spacecraft-software-construct--claude-worktrees-peaceful-jones"
+        );
+        assert_eq!(
+            mangle_cwd(Path::new("/home/mj/my_project")),
+            "-home-mj-my_project"
+        );
+        // Anything else outside the class collapses to a dash as well.
+        assert_eq!(mangle_cwd(Path::new("/a b/c.d")), "-a-b-c-d");
+        // One `char`, one dash — the mapping is per-`char`, not per-byte, so a
+        // multi-byte character does not become a run of dashes.
+        assert_eq!(mangle_cwd(Path::new("/v1.2/café")), "-v1-2-caf-");
+    }
+
+    /// An empty path is `unknown`, not the empty string.
+    ///
+    /// The harness names that directory `unknown`; a bare `""` would make
+    /// engram join the sessions root itself and list every project at once.
+    #[test]
+    fn mangle_cwd_of_an_empty_path_is_unknown() {
+        assert_eq!(mangle_cwd(Path::new("")), "unknown");
     }
 
     #[test]

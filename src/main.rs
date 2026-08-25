@@ -979,10 +979,10 @@ fn handle_ingest(
         );
     }
 
-    let resolved = match rules::resolve_scope(scope.as_deref()) {
-        Ok(r) => r,
-        Err(e) => return fail(scope_error(e), mode),
-    };
+    // Resolve the scope against the directory whose transcripts are being read,
+    // not the one the process was started in. `--cwd` names another project;
+    // filing its history under the caller's scope would be silent mis-filing.
+    let resolved = rules::resolve_scope_in(scope.as_deref(), &cwd);
 
     let capture = match transcript::capture(store, spec, &selected, &resolved.name, &opts, dry_run)
     {

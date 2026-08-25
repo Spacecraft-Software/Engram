@@ -97,41 +97,62 @@ pub struct ResolvedScope {
 /// Returns an error if the current working directory cannot be read.
 pub fn resolve_scope(explicit: Option<&str>) -> std::io::Result<ResolvedScope> {
     let cwd = std::env::current_dir()?;
+    Ok(resolve_scope_in(explicit, &cwd))
+}
+
+/// Resolves the scope as [`resolve_scope`] does, but relative to `cwd`.
+///
+/// Every step of the cascade below the explicit argument is a question about a
+/// *directory* — which git tree encloses it, what it is called — so a command
+/// that already knows which directory it is acting on must be able to say so.
+///
+/// `ingest --cwd` is the case that forced this. It reads another project's
+/// transcripts, and while it did that, scope still resolved from the process's
+/// own directory: importing thirty-three projects from one terminal filed all
+/// of them under whichever scope that terminal happened to be in, reporting
+/// `scope_origin: "git-root"` each time, which looked entirely correct. The
+/// mis-filing was invisible in the output and expensive to undo.
+///
+/// Infallible by construction — the caller has already produced the directory,
+/// so there is no `current_dir()` call left to fail.
+#[must_use]
+pub fn resolve_scope_in(explicit: Option<&str>, cwd: &Path) -> ResolvedScope {
+    let cwd = cwd.to_path_buf();
     let git_root = managed_file::find_git_root(&cwd);
     let root = git_root.clone().unwrap_or_else(|| cwd.clone());
 
     if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(ResolvedScope {
+        return ResolvedScope {
             name: name.to_string(),
             root,
             origin: ScopeOrigin::Explicit,
-        });
+        };
     }
     if let Some(name) = std::env::var("ENGRAM_SCOPE")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
-        return Ok(ResolvedScope {
+        return ResolvedScope {
             name,
             root,
             origin: ScopeOrigin::Env,
-        });
+        };
     }
     if let Some(dir) = git_root {
         let name = basename(&dir);
-        return Ok(ResolvedScope {
+        return ResolvedScope {
             name,
             root: dir,
             origin: ScopeOrigin::GitRoot,
-        });
+        };
     }
     let name = basename(&cwd);
-    Ok(ResolvedScope {
+    ResolvedScope {
         name,
         root,
         origin: ScopeOrigin::Cwd,
-    })
+    }
 }
 
 fn basename(path: &Path) -> String {
