@@ -13,6 +13,11 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **A skill description containing a colon silently broke the whole skill.**
+  `description: Save this conversation: capture ...` is invalid YAML, so
+  Antigravity loaded two of engram's three commands and reported nothing.
+  Descriptions are now emitted as quoted scalars.
+
 - **An unwritable target no longer aborts the whole install.** A read-only
   command or skills directory is now reported per file with its reason and the
   run continues; previously the `EROFS` propagated and every harness after the
@@ -31,6 +36,13 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
   and can be removed by hand.
 
 ### Added
+
+- **VS Code** and **Cursor** are supported harnesses (the tenth and eleventh).
+  VS Code gets `~/.config/Code/User/prompts/engram-<name>.prompt.md`; Cursor
+  gets `~/.cursor/skills/engram-<name>/SKILL.md`. VS Code's `mcp.json` keys its
+  servers under `servers`, which the MCP scanner now reads.
+- `install` warns when two harnesses share a command or skills directory, so a
+  duplicated slash command is explained rather than left to be noticed.
 
 - **Kimi** is a supported harness (the ninth). Skills go to
   `~/.kimi-code/skills/engram-<name>/SKILL.md`; the MCP registration is read

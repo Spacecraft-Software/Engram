@@ -269,7 +269,31 @@ Two readers exist: `claude_code` and `codex`. Adding a third means adding a `Rea
 
 - **`plugins/engram/` is the single source of truth.** `install.rs` embeds the command bodies with `include_str!`, so the plugin directory and the installed files cannot drift and the compiler enforces the files exist. Exactly two substitutions, via `str::replace`, no template engine: `{{DB}}` and `{{HARNESS}}`.
 - **`{{DB}}` is load-bearing.** The path is discovered from the harness's *own* MCP registration (`harness::registered_db`) — on a typical host all writable harnesses point at one shared store (here `~/.local/share/engram/engram.db`) — but see the drift note below: what they registered *yesterday* is not necessarily what a previously-generated command still pins. A generated command that omitted `--db` would fall back to clap's relative `engram.db` default and quietly write to a different store than the agents read. Config formats are scanned narrowly rather than deserialized: JSON (`mcpServers`, or Opencode's `mcp`), **JSONC** (comment-stripped by a string-aware pass — a `//` inside `"https://…"` must survive), and TOML (line-scanned, so engram needs no TOML dependency). Engram **reads** JSONC and never rewrites it; a serde round-trip would delete the user's comments.
-- **7 of 9 harnesses can host something; only 3 host a *command*.** Claude Code, **OpenClaude**, and Opencode have writable command dirs. **Codex 0.149 removed `~/.codex/prompts/`** — the binary contains no such string — and moved to skills at `~/.codex/skills/<name>/SKILL.md`, discovered automatically with nothing to register; engram writes there now. It wrote prompt files nobody read for a release, which is exactly what a harness table drifting from reality looks like. **Antigravity has no slash-command directory at all** — its extension surface is skills, packaged in plugins, and `agy plugin validate` reports a plugin's `commands/` as "2 processed (converted to skills)", so a command there is a skill either way. Engram writes it a plugin (`~/.gemini/config/plugins/engram/`: `plugin.json` + one `skills/engram-<name>/SKILL.md` per command). **Kimi** and **Qwen** take skills in their own config roots (`~/.kimi-code/skills`, `~/.qwen/skills`) — Qwen's was verified against its own bundled `docs/features/skills.md`, having previously been dismissed as "format unverified". Goose and Copilot CLI have nothing engram can write and each says so **in its own words** — one shared sentence described none of them accurately.
+- **9 of 11 harnesses can host something.** Claude Code, **OpenClaude**, and Opencode have writable command dirs. **Codex 0.149 removed `~/.codex/prompts/`** — the binary contains no such string — and moved to skills at `~/.codex/skills/<name>/SKILL.md`, discovered automatically with nothing to register; engram writes there now. It wrote prompt files nobody read for a release, which is exactly what a harness table drifting from reality looks like. **Antigravity has no slash-command directory at all** — its extension surface is skills, packaged in plugins, and `agy plugin validate` reports a plugin's `commands/` as "2 processed (converted to skills)", so a command there is a skill either way. Engram writes it a plugin (`~/.gemini/config/plugins/engram/`: `plugin.json` + one `skills/engram-<name>/SKILL.md` per command). **Kimi** and **Qwen** take skills in their own config roots (`~/.kimi-code/skills`, `~/.qwen/skills`) — Qwen's was verified against its own bundled `docs/features/skills.md`, having previously been dismissed as "format unverified". Goose and Copilot CLI have nothing engram can write and each says so **in its own words** — one shared sentence described none of them accurately.
+- **A skill description is YAML, so engram quotes it.** `description: Save this
+  conversation: capture the transcript ...` emitted bare is invalid YAML
+  (`mapping values are not allowed in this context`) and the **whole skill
+  silently fails to load** — Antigravity offered two of engram's three commands
+  for exactly this reason, with no error anywhere. `yaml_quote` emits a
+  double-quoted scalar, the form that survives colons, `#`, and the apostrophe
+  in "engram's" alike.
+- **VS Code and Cursor, both first-party-verified.** VS Code takes a reusable
+  prompt file, `~/.config/Code/User/prompts/engram-<name>.prompt.md` — Microsoft
+  documents the `.prompt.md` extension and VS Code itself creates the profile
+  folder — and its `mcp.json` keys servers under `servers`, not `mcpServers`,
+  which `json_engram_args` now accepts. Cursor takes a skill at
+  `~/.cursor/skills/<name>/SKILL.md`: both that path and `SKILL.md` appear
+  inside the cursor-agent binary. `~/.cursor/skills-cursor` is the vendor's own
+  bundle and is *not* a user surface — Grok's compatibility scanner filters
+  those same vendor defaults out.
+- **A shared skills directory duplicates commands, and engram says so.**
+  `also_scans` records the directories a harness *loads* from but engram never
+  writes. On a machine where `~/.claude/skills` and `~/.codex/skills` both
+  resolve to one library (a normal way to keep a single skill set), the
+  commands engram writes for Codex are also loaded by Claude Code, which then
+  offers every engram command twice. Engram cannot fix this by writing
+  differently — both targets are correct for their own harness — so `install`
+  reports the overlap and names the harness whose commands are being doubled.
 - **Grok needs no harness entry, and adding one would duplicate its commands.**
   Grok reads other vendors' directories on purpose: `[compat.claude]` in
   `~/.grok/config.toml` defaults every cell to `true`, so `~/.claude/commands/`
