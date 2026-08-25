@@ -38,6 +38,13 @@ pub enum Harness {
     Codex,
     Opencode,
     Kimi,
+    /// Renamed on both derives for the same reason as `OpenClaude`:
+    /// kebab-casing gives `vs-code`, but the editor is written `vscode` and
+    /// that is what [`HarnessSpec::name`] carries.
+    #[serde(rename = "vscode")]
+    #[clap(name = "vscode")]
+    VsCode,
+    Cursor,
     Antigravity,
     Goose,
     CopilotCli,
@@ -124,6 +131,16 @@ pub struct HarnessSpec {
     /// can host one, and claiming otherwise would make `install` look broken
     /// on the rest.
     pub command_surface: CommandSurface,
+    /// Extra home-relative directories this harness *loads* commands or skills
+    /// from, which engram never writes to.
+    ///
+    /// Engram writes one target per harness, but several harnesses read more
+    /// than one directory, and on a machine where those directories are
+    /// symlinked together a command engram wrote for harness A shows up a
+    /// second time in harness B. Recording what a harness reads is what lets
+    /// `install` say so instead of leaving the user to notice the duplicate in
+    /// their own slash-command list.
+    pub also_scans: &'static [&'static str],
     /// Where this harness registers MCP servers, when engram knows. Read to
     /// discover which database the user already shares between harnesses.
     pub mcp_config: Option<McpConfigSource>,
@@ -138,7 +155,8 @@ pub struct HarnessSpec {
 /// database the user actually shares between harnesses rather than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpConfigSource {
-    /// A JSON file with an `mcpServers` (or `mcp`) object at the top level.
+    /// A JSON file with an `mcpServers` (or `mcp`, or VS Code's `servers`)
+    /// object at the top level.
     Json(&'static str),
     /// The same, but JSON **with comments** — Opencode's `opencode.jsonc`.
     /// Comments are stripped before parsing; the file itself is never
@@ -162,11 +180,13 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[".claude", ".claude.json"],
         sessions_dir: Some(".claude/projects"),
         transcript: TranscriptSupport::Reader(ReaderKind::ClaudeCode),
+        // Claude Code loads skills as well as commands.
         command_surface: CommandSurface::Markdown {
             dir: ".claude/commands",
             file: "engram-{name}.md",
             frontmatter: true,
         },
+        also_scans: &[".claude/skills"],
         mcp_config: Some(McpConfigSource::Json(".claude.json")),
         hooks_config: Some(".claude/settings.json"),
     },
@@ -188,6 +208,7 @@ pub const ALL: &[HarnessSpec] = &[
             file: "engram-{name}.md",
             frontmatter: true,
         },
+        also_scans: &[".openclaude/skills"],
         mcp_config: Some(McpConfigSource::Json(".openclaude.json")),
         // The fork has a `hooks` key, but its shape is unverified against a
         // real run; `install --hooks` stays Claude-Code-only until it is.
@@ -205,6 +226,7 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".codex/skills",
         },
+        also_scans: &[],
         mcp_config: Some(McpConfigSource::Toml(".codex/config.toml")),
         hooks_config: None,
     },
@@ -221,6 +243,7 @@ pub const ALL: &[HarnessSpec] = &[
             file: "engram-{name}.md",
             frontmatter: true,
         },
+        also_scans: &[],
         mcp_config: Some(McpConfigSource::Jsonc(".config/opencode/opencode.jsonc")),
         hooks_config: None,
     },
@@ -241,7 +264,52 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".kimi-code/skills",
         },
+        also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".kimi-code/mcp.json")),
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::VsCode,
+        name: "vscode",
+        probe: &[".config/Code"],
+        // Chat history lives in workspaceStorage as editor state, not as a
+        // transcript engram can read turn by turn.
+        sessions_dir: None,
+        transcript: TranscriptSupport::Unsupported {
+            detail: "vs code keeps chat in workspaceStorage as editor state, not a \
+                     per-session transcript file",
+        },
+        // Reusable prompt files: `<name>.prompt.md` in the profile's `prompts`
+        // folder, invoked with `/<name>`. The extension and the `description`
+        // frontmatter field are Microsoft-documented; the directory is created
+        // by VS Code itself.
+        command_surface: CommandSurface::Markdown {
+            dir: ".config/Code/User/prompts",
+            file: "engram-{name}.prompt.md",
+            frontmatter: true,
+        },
+        also_scans: &[],
+        mcp_config: Some(McpConfigSource::Json(".config/Code/User/mcp.json")),
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Cursor,
+        name: "cursor",
+        probe: &[".cursor"],
+        sessions_dir: Some(".cursor/chats"),
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "cursor stores chats under ~/.cursor/chats in a format engram has not \
+                     surveyed",
+        },
+        // `.cursor/skills` and `SKILL.md` both appear in the cursor-agent
+        // binary. `.cursor/skills-cursor` is the vendor's own bundle and is
+        // not a user surface --- Grok's compatibility scanner filters those
+        // same vendor defaults out.
+        command_surface: CommandSurface::Skill {
+            dir: ".cursor/skills",
+        },
+        also_scans: &[".cursor/commands"],
+        mcp_config: Some(McpConfigSource::Json(".cursor/mcp.json")),
         hooks_config: None,
     },
     HarnessSpec {
@@ -255,6 +323,7 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Plugin {
             dir: ".gemini/config/plugins",
         },
+        also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".gemini/antigravity/mcp_config.json")),
         hooks_config: None,
     },
@@ -269,6 +338,7 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::None {
             detail: "goose has no user command directory engram has surveyed",
         },
+        also_scans: &[],
         mcp_config: None,
         hooks_config: None,
     },
@@ -285,6 +355,7 @@ pub const ALL: &[HarnessSpec] = &[
                      them from a marketplace, a GitHub repository, or a git URL --- \
                      there is no user-writable directory engram can drop a command into",
         },
+        also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".copilot/mcp-config.json")),
         hooks_config: None,
     },
@@ -302,6 +373,7 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".qwen/skills",
         },
+        also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".qwen/settings.json")),
         hooks_config: None,
     },
@@ -500,7 +572,9 @@ fn json_engram_args(text: &str) -> Option<Vec<String>> {
     // `mcpServers` is the common key; Opencode uses `mcp`.
     let servers = value
         .get("mcpServers")
-        .or_else(|| value.get("mcp"))?
+        .or_else(|| value.get("mcp"))
+        // VS Code's `~/.config/Code/User/mcp.json` uses `servers`.
+        .or_else(|| value.get("servers"))?
         .as_object()?;
     let entry = servers.get("engram")?;
     // `command` may be a bare string with `args` alongside, or (Opencode) an

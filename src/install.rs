@@ -227,7 +227,33 @@ fn render_skill(name: &str, template_body: &str, spec: &HarnessSpec, db: &str) -
     let body = strip_frontmatter(template_body)
         .replace("{{DB}}", db)
         .replace("{{HARNESS}}", spec.name);
-    format!("---\nname: engram-{name}\ndescription: {description}\n---\n{BANNER}\n{body}")
+    format!(
+        "---\nname: engram-{name}\ndescription: {}\n---\n{BANNER}\n{body}",
+        yaml_quote(&description)
+    )
+}
+
+/// Renders a string as a YAML double-quoted scalar.
+///
+/// A skill description is a sentence engram does not control, and one of them
+/// is "Save this conversation: capture the transcript ...". Emitted bare, the
+/// second colon makes the line `mapping values are not allowed in this
+/// context` and the *whole skill silently fails to load* — Antigravity showed
+/// two of engram's three commands for exactly this reason. Double quotes are
+/// the form that survives colons, `#`, leading `%`/`@`, and the apostrophe in
+/// "engram's" alike; only `\` and `"` need escaping inside them.
+fn yaml_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Reads one scalar field out of a leading YAML block. Deliberately not a YAML
@@ -288,6 +314,68 @@ fn is_nix_managed(path: &std::path::Path) -> bool {
         .any(|target| target.starts_with("/nix/store"))
 }
 
+/// The canonical form of a path whose leaf may not exist yet.
+///
+/// `canonicalize` fails on a missing leaf, so this walks up to the deepest
+/// existing ancestor, canonicalizes that, and re-appends the rest. Without it
+/// a target directory engram is about to create compares unequal to the very
+/// same directory reached through a symlink.
+fn canonical_key(path: &std::path::Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cursor) {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cursor.file_name(), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_owned());
+                cursor = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Warns when another harness's engram commands are visible from this one.
+///
+/// Engram writes one directory per harness, but a harness may *read* several,
+/// and those directories are routinely symlinked together — `~/.claude/skills`
+/// and `~/.codex/skills` both resolving to a shared `~/.agents/skills` is a
+/// normal way to keep one skill library. The consequence is that a command
+/// engram wrote for Codex is also loaded by Claude Code, which then lists every
+/// engram command twice. Engram cannot fix that by writing differently: both
+/// targets are correct for their own harness. It can say so.
+fn overlap_warning(spec: &HarnessSpec, targets: &[(&'static str, PathBuf)]) -> Option<String> {
+    let mine: Vec<PathBuf> = spec
+        .also_scans
+        .iter()
+        .filter_map(|d| harness::in_home(d))
+        .map(|d| canonical_key(&d))
+        .collect();
+    let clashes: Vec<&str> = targets
+        .iter()
+        .filter(|(name, dir)| *name != spec.name && mine.iter().any(|m| m == dir))
+        .map(|(name, _)| *name)
+        .collect();
+    if clashes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} also loads commands from a directory engram writes for {}, so every engram \
+         command will appear twice in {}. Both writes are correct for their own harness — \
+         the duplication comes from those directories being the same one. Point them at \
+         separate directories to remove it.",
+        spec.name,
+        clashes.join(", "),
+        spec.name
+    ))
+}
+
 /// True when this write failed only because the target is not writable.
 ///
 /// A read-only target is a fact about the user's machine, not an engram error:
@@ -320,6 +408,14 @@ pub fn install(
     let mut installed = 0usize;
     let mut skipped = 0usize;
 
+    // Every detected harness's canonical write directory, so a harness that
+    // *reads* one of them can say whose commands it is about to show twice.
+    let written_dirs: Vec<(&'static str, PathBuf)> = targets
+        .iter()
+        .filter(|spec| harness::describe(spec).present)
+        .filter_map(|spec| harness::commands_dir(spec).map(|d| (spec.name, canonical_key(&d))))
+        .collect();
+
     for spec in targets {
         let detected = harness::describe(spec);
         let Some(dir) = harness::commands_dir(spec) else {
@@ -349,6 +445,7 @@ pub fn install(
 
         let (db, db_origin) = resolve_db(spec, db_override);
 
+        let overlap = overlap_warning(spec, &written_dirs);
         let nix_warning = is_nix_managed(&dir).then(|| {
             format!(
                 "{} resolves into the Nix store; anything written here will be replaced by the \
@@ -448,6 +545,16 @@ pub fn install(
                 Some(w)
             }
             (None, nix) => nix,
+        };
+        // The overlap note is independent of both: a directory can be shared
+        // whether or not it is in the store or was re-pinned.
+        let warning = match (warning, overlap) {
+            (Some(mut w), Some(o)) => {
+                w.push(' ');
+                w.push_str(&o);
+                Some(w)
+            }
+            (w, o) => w.or(o),
         };
 
         // Hooks are opt-in twice over: this flag, and the fact that a hook

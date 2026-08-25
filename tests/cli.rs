@@ -2095,7 +2095,7 @@ fn install_list_reports_every_harness_and_writes_nothing() {
     let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
 
     let harnesses = data["harnesses"].as_array().expect("harnesses");
-    assert_eq!(harnesses.len(), 9, "every known harness must be reported");
+    assert_eq!(harnesses.len(), 11, "every known harness must be reported");
 
     let claude = harnesses
         .iter()
@@ -3379,4 +3379,118 @@ fn install_writes_kimi_and_qwen_skills() {
         assert!(text.contains("--db /shared/engram.db"), "{harness}");
         assert!(text.contains(&format!("--harness {harness}")), "{harness}");
     }
+}
+
+/// A skill description containing a colon must survive as valid YAML.
+///
+/// `Save this conversation: capture the transcript ...` emitted bare makes the
+/// frontmatter `mapping values are not allowed in this context`, and the whole
+/// skill silently fails to load — Antigravity offered two of engram's three
+/// commands for exactly this reason, with no error anywhere.
+#[test]
+fn install_quotes_skill_descriptions_containing_a_colon() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    pretend_installed(&home, ".qwen");
+
+    install(&db, &home, &["--db-path", "/shared/engram.db"])
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(home.join(".qwen/skills/engram-save-chat/SKILL.md"))
+        .expect("skill written");
+    let description = text
+        .lines()
+        .find(|l| l.starts_with("description:"))
+        .expect("a description line");
+    assert!(
+        description.starts_with("description: \"") && description.ends_with('"'),
+        "description must be a quoted scalar: {description}"
+    );
+    // The colon that broke it is still present — quoted, not stripped.
+    assert!(description.contains("conversation:"), "{description}");
+}
+
+/// VS Code takes a `.prompt.md` reusable prompt; Cursor takes a skill.
+///
+/// Both are first-party-verified: Microsoft documents the `.prompt.md`
+/// extension and VS Code itself creates the profile `prompts` folder, while
+/// `.cursor/skills` and `SKILL.md` both appear inside the cursor-agent binary.
+#[test]
+fn install_writes_vscode_prompts_and_cursor_skills() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    pretend_installed(&home, ".config/Code");
+    pretend_installed(&home, ".cursor");
+
+    install(&db, &home, &["--db-path", "/shared/engram.db"])
+        .assert()
+        .success();
+
+    let vscode =
+        std::fs::read_to_string(home.join(".config/Code/User/prompts/engram-save-chat.prompt.md"))
+            .expect("vscode prompt written");
+    assert!(vscode.contains("--db /shared/engram.db"), "{vscode}");
+    assert!(vscode.contains("--harness vscode"), "{vscode}");
+
+    let cursor = std::fs::read_to_string(home.join(".cursor/skills/engram-save-chat/SKILL.md"))
+        .expect("cursor skill written");
+    assert!(cursor.starts_with("---\n"), "{cursor}");
+    assert!(cursor.contains("name: engram-save-chat"), "{cursor}");
+    assert!(cursor.contains("--harness cursor"), "{cursor}");
+}
+
+/// A shared skills directory makes one harness list another's commands.
+///
+/// `~/.claude/skills` and `~/.codex/skills` both pointing at one library is a
+/// normal way to keep a single set of skills, and the consequence is that the
+/// commands engram writes for Codex are also loaded by Claude Code, which then
+/// offers every engram command twice. Engram cannot fix it by writing
+/// differently — both targets are right for their own harness — so it says so.
+#[test]
+fn install_warns_when_two_harnesses_share_a_skills_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    pretend_installed(&home, ".claude");
+    pretend_installed(&home, ".codex");
+
+    // One shared library, reached from both harnesses.
+    let shared = home.join(".agents/skills");
+    std::fs::create_dir_all(&shared).expect("shared skills dir");
+    std::os::unix::fs::symlink(&shared, home.join(".codex/skills")).expect("codex link");
+    std::os::unix::fs::symlink(&shared, home.join(".claude/skills")).expect("claude link");
+
+    let assert = install(&db, &home, &["--db-path", "/shared/engram.db"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+
+    let claude = data["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "claude-code")
+        .expect("claude-code reported")
+        .clone();
+    let warning = claude["warning"]
+        .as_str()
+        .expect("claude-code must warn about the shared directory");
+    assert!(warning.contains("codex"), "{warning}");
+    assert!(warning.contains("twice"), "{warning}");
+
+    // Codex itself has nothing to warn about: it reads only what it was given.
+    let codex = data["harnesses"]
+        .as_array()
+        .expect("harnesses")
+        .iter()
+        .find(|h| h["harness"] == "codex")
+        .expect("codex reported")
+        .clone();
+    assert!(codex["warning"].is_null(), "codex: {:?}", codex["warning"]);
 }
