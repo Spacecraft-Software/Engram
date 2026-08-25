@@ -827,6 +827,71 @@ Transcripts can be very large --- one rollout on a developer machine was
 @code{--max-bytes} (64@tie{}MiB by default) refuses an oversized
 transcript with an error naming the override rather than attempting it.
 
+@section engram import
+
+@cindex import command
+@cindex exported transcripts
+@cindex chat archives
+
+@example
+engram import @var{path}@dots{} [--scope @var{id}] [--input-format @var{fmt}]
+              [--recursive] [--max-bytes @var{n}] [--dry-run]
+@end example
+
+Reads chat transcripts that were @emph{exported} to files, rather than the
+session file a harness writes for itself.  @command{engram ingest} covers a
+harness engram has a reader for; this covers everything else.  Two cases
+motivate it.  A harness may keep its history in a form engram cannot parse
+--- protocol buffers, an editor's workspace state --- while still offering
+its own export command.  And an archive is not a live session at all:
+@command{engram save-chat} could write a @file{.texi} that engram had no way
+to read back, so engram's own output was the one format it could not ingest.
+
+Three formats are recognised, by @emph{content} rather than by extension:
+archives written by @command{save-chat} (both dialects, the current
+@code{@@chapter} form and the older @code{@@section} one), Opencode's
+Markdown export, and raw terminal scrollback.  A file that announces none of
+them is skipped with a reason rather than guessed at --- a real @file{chat/}
+directory held a standalone HTML palette editor alongside genuine archives,
+and source files in directories that merely happen to be named @file{chat}
+are skipped the same way.  @code{--input-format} forces a parser for a file
+that cannot be detected.  It is spelled that way because @code{--format} is
+the global output-format option.
+
+@cindex scope, on import
+Each file is filed into the scope of the project @emph{containing} it, so one
+run over many directories fills many scopes correctly.  The scope recorded
+inside an archive is deliberately ignored: in practice those strings are
+inconsistent --- bare names, relative paths, absolute paths and branch names
+all appear --- while the containing project is unambiguous.
+
+@cindex idempotence, of import
+A message's identity is a version@tie{}5 UUID over its scope, agent, role,
+timestamp and text, so every deduplication requirement falls out of
+@code{INSERT OR IGNORE} rather than a separate pass.  Re-importing an archive
+inserts nothing.  A file copied into four projects imports once per scope
+instead of four times.  An archive holding two concatenated copies of itself
+--- the residue of an earlier @command{save-chat} that appended rather than
+rewrote --- collapses back to one set of messages.
+
+@cindex roles, third
+Roles are not binary.  A real corpus of 7,163 archived messages held 6,395
+@code{assistant}, 632 @code{user} and 136 @code{note}; the third is carried
+through rather than coerced into one of the other two.
+
+@cindex timestamps, synthesised
+The Markdown and scrollback formats record no per-message time.  Rather than
+refuse them or stamp them from the clock --- which would collapse a whole
+conversation into one instant and destroy reading order, the failure
+@command{engram ingest} refuses a wall-clock fallback to avoid --- each
+message is offset one second from a file-level anchor: the session time the
+export records, else the file's own modification time.  Absolute values are
+approximate and the response says so per file, in
+@code{approximate_times}; the ordering is exact.
+
+Text is normalized and redacted on the way in, exactly as a live transcript
+is.  An archive is not more trustworthy for being old.
+
 @section engram install
 
 @cindex install command

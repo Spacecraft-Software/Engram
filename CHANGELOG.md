@@ -47,6 +47,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **`engram import`** — reads chat transcripts that were exported to files, for
+  the harnesses `ingest` has no reader for, and reads back `save-chat`'s own
+  `.texi` archives. Three formats, detected by content: engram Texinfo (both
+  dialects), Opencode Markdown, and Claude Code scrollback. Each file is filed
+  into the scope of the project containing it; identity is a v5 uuid over the
+  message's content, so re-importing inserts nothing and duplicate files
+  collapse. `--input-format` forces a parser, `--recursive` descends.
+
 - **VS Code** and **Cursor** are supported harnesses (the tenth and eleventh).
   VS Code gets `~/.config/Code/User/prompts/engram-<name>.prompt.md`; Cursor
   gets `~/.cursor/skills/engram-<name>/SKILL.md`. VS Code's `mcp.json` keys its
