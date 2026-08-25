@@ -49,6 +49,20 @@ pub enum Harness {
     Goose,
     CopilotCli,
     Qwen,
+    Grok,
+    /// Z.ai's Z Code. Renamed on both derives for the reason `OpenClaude` is:
+    /// kebab-casing gives `z-code`, and the vendor writes it `zcode`.
+    #[serde(rename = "zcode")]
+    #[clap(name = "zcode")]
+    ZCode,
+    Deepcode,
+    PoeCode,
+    Kilo,
+    Mimocode,
+    Warp,
+    Cline,
+    Aichat,
+    Bailian,
 }
 
 /// Which reader implementation handles a harness's transcripts.
@@ -131,6 +145,14 @@ pub struct HarnessSpec {
     /// can host one, and claiming otherwise would make `install` look broken
     /// on the rest.
     pub command_surface: CommandSurface,
+    /// The harness's own command for exporting a conversation to a file.
+    ///
+    /// Recorded because it is the *answer* to a missing reader, not trivia. A
+    /// harness engram cannot read is not a dead end when it can write its own
+    /// export and `engram import` can read that — but only if the user is told
+    /// which command to run, at the moment they hit the wall.
+    pub export_command: Option<&'static str>,
+
     /// Extra home-relative directories this harness *loads* commands or skills
     /// from, which engram never writes to.
     ///
@@ -186,6 +208,7 @@ pub const ALL: &[HarnessSpec] = &[
             file: "engram-{name}.md",
             frontmatter: true,
         },
+        export_command: Some("/export [file] (interactive slash command)"),
         also_scans: &[".claude/skills"],
         mcp_config: Some(McpConfigSource::Json(".claude.json")),
         hooks_config: Some(".claude/settings.json"),
@@ -208,6 +231,7 @@ pub const ALL: &[HarnessSpec] = &[
             file: "engram-{name}.md",
             frontmatter: true,
         },
+        export_command: Some("/export [file] (interactive slash command)"),
         also_scans: &[".openclaude/skills"],
         mcp_config: Some(McpConfigSource::Json(".openclaude.json")),
         // The fork has a `hooks` key, but its shape is unverified against a
@@ -226,6 +250,7 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".codex/skills",
         },
+        export_command: None,
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Toml(".codex/config.toml")),
         hooks_config: None,
@@ -243,6 +268,7 @@ pub const ALL: &[HarnessSpec] = &[
             file: "engram-{name}.md",
             frontmatter: true,
         },
+        export_command: Some("opencode export [session] --sanitize"),
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Jsonc(".config/opencode/opencode.jsonc")),
         hooks_config: None,
@@ -257,13 +283,18 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[".kimi-code", ".kimi"],
         sessions_dir: Some(".kimi/sessions"),
         transcript: TranscriptSupport::NotImplemented {
-            detail: "kimi writes sessions/<project>/<session>/context.jsonl, a line-oriented \
-                     conversation engram could read; the project directory is a hash with no \
-                     published mapping back to a working directory",
+            detail: "kimi writes a line-oriented conversation engram could read — \
+                     sessions/wd_<name>_<hash>/<session>/agents/main/wire.jsonl in the \
+                     kimi-code layout, or the legacy sessions/<md5>/<session>/context.jsonl. \
+                     The working directory is recoverable three ways: session_index.jsonl \
+                     maps session to workDir, each session's state.json carries workDir, and \
+                     the legacy hash is the MD5 of the absolute path. What is missing is a \
+                     per-message timestamp, so ordering is positional",
         },
         command_surface: CommandSurface::Skill {
             dir: ".kimi-code/skills",
         },
+        export_command: Some("kimi export [session] -o out.zip"),
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".kimi-code/mcp.json")),
         hooks_config: None,
@@ -288,6 +319,7 @@ pub const ALL: &[HarnessSpec] = &[
             file: "engram-{name}.prompt.md",
             frontmatter: true,
         },
+        export_command: None,
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".config/Code/User/mcp.json")),
         hooks_config: None,
@@ -308,6 +340,7 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".cursor/skills",
         },
+        export_command: None,
         also_scans: &[".cursor/commands"],
         mcp_config: Some(McpConfigSource::Json(".cursor/mcp.json")),
         hooks_config: None,
@@ -317,12 +350,13 @@ pub const ALL: &[HarnessSpec] = &[
         name: "antigravity",
         probe: &[".gemini/antigravity", ".antigravity"],
         sessions_dir: None,
-        transcript: TranscriptSupport::Unsupported {
-            detail: "antigravity stores conversations as protocol buffers plus a SQLite summaries database; there is no line-oriented transcript to read",
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "antigravity writes a plain JSONL transcript at antigravity-cli/brain/<conversation>/.system_generated/logs/transcript.jsonl (54 on this machine) alongside its protobuf stores; a reader is not written yet. Conversations without a brain transcript stay unreadable — the .pb files and the BLOB columns of conversations/<uuid>.db are protobuf",
         },
         command_surface: CommandSurface::Plugin {
             dir: ".gemini/config/plugins",
         },
+        export_command: None,
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".gemini/antigravity/mcp_config.json")),
         hooks_config: None,
@@ -333,11 +367,14 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[".config/goose/config.yaml", ".config/goose"],
         sessions_dir: None,
         transcript: TranscriptSupport::NotImplemented {
-            detail: "goose's session storage has not been surveyed",
+            detail: "goose stores sessions in .local/share/goose/sessions/sessions.db, \
+                     whose messages table carries role, content_json and created_timestamp \
+                     as first-class columns; a reader is not written yet",
         },
         command_surface: CommandSurface::None {
             detail: "goose has no user command directory engram has surveyed",
         },
+        export_command: Some("goose session export --format markdown -o FILE"),
         also_scans: &[],
         mcp_config: None,
         hooks_config: None,
@@ -347,14 +384,15 @@ pub const ALL: &[HarnessSpec] = &[
         name: "copilot-cli",
         probe: &[".copilot/mcp-config.json", ".copilot"],
         sessions_dir: None,
-        transcript: TranscriptSupport::Unsupported {
-            detail: "copilot cli stores sessions in session-store.db, a SQLite database with an undocumented schema",
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "copilot cli stores sessions in session-store.db, whose turns table is already a flat pre-paired transcript — turns(session_id, turn_index, user_message, assistant_response, timestamp) with UNIQUE(session_id, turn_index), joined to sessions(cwd, repository, branch); a reader is not written yet",
         },
         command_surface: CommandSurface::None {
             detail: "copilot cli takes plugins, not loose command files, and installs \
                      them from a marketplace, a GitHub repository, or a git URL --- \
                      there is no user-writable directory engram can drop a command into",
         },
+        export_command: Some("copilot --share=FILE"),
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".copilot/mcp-config.json")),
         hooks_config: None,
@@ -373,8 +411,200 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".qwen/skills",
         },
+        export_command: None,
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".qwen/settings.json")),
+        hooks_config: None,
+    },
+    // ---------------------------------------------------------------- survey
+    //
+    // Installed on real machines and recorded so the table stops being silent
+    // about them. Each entry states only what was actually probed: engram
+    // writes nothing to any of them and reads none of them yet. An absent
+    // entry is indistinguishable from an unexamined one, which is how three
+    // harnesses came to carry claims that turned out to be false.
+    HarnessSpec {
+        id: Harness::Grok,
+        name: "grok",
+        probe: &[".grok/config.toml", ".grok"],
+        sessions_dir: Some(".grok/sessions"),
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "grok keeps a directory per working directory under .grok/sessions, named \
+                     by percent-encoding the absolute path (%2Fspacecraft-software%2Fbravais). \
+                     Unlike Claude Code's mangling that mapping is reversible, so a reader \
+                     would not need the cwd supplied. 83 files on this machine; a reader is \
+                     not written yet",
+        },
+        command_surface: CommandSurface::None {
+            detail: "grok reads other vendors' directories on purpose — [compat.claude] in \
+                     ~/.grok/config.toml scans ~/.claude/commands and ~/.claude/skills — so \
+                     engram's Claude Code install already serves it, and a second copy would \
+                     be shadowed by name deduplication rather than useful",
+        },
+        export_command: None,
+        also_scans: &[".claude/commands", ".claude/skills", ".cursor/skills"],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::ZCode,
+        name: "zcode",
+        probe: &[".zcode/cli", ".zcode"],
+        sessions_dir: Some(".zcode/cli/db"),
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "z.ai's Z Code ships an Electron app and a CLI whose store is an opencode \
+                     fork — .zcode/cli/db/db.sqlite with the same session/message/part schema, \
+                     so one reader would serve both. The sibling rollout/model-io-*.jsonl is \
+                     an HTTP log that resends the whole conversation per line, not a \
+                     transcript; a reader is not written yet",
+        },
+        command_surface: CommandSurface::None {
+            detail: "zcode's skills directory has not been surveyed for writability",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Deepcode,
+        name: "deepcode",
+        probe: &[".deepcode/projects", ".deepcode"],
+        sessions_dir: Some(".deepcode/projects"),
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "deepcode lays its sessions out like Claude Code — \
+                     projects/<mangled-cwd>/<uuid>.jsonl — but the records do not carry \
+                     Claude Code's keys (no type, uuid or cwd), so the existing reader would \
+                     not serve it. One session on this machine; not surveyed further",
+        },
+        command_surface: CommandSurface::None {
+            detail: "deepcode has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::PoeCode,
+        name: "poe-code",
+        probe: &[".poe-code"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "poe-code wraps another agent rather than storing its own conversation — \
+                     `npx poe-code wrap goose` appears in captured output — and its .poe-code \
+                     holds credentials and logs. Its goose/ subdirectory is empty here",
+        },
+        command_surface: CommandSurface::None {
+            detail: "poe-code has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Kilo,
+        name: "kilo",
+        probe: &[".kilo"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "kilo's config root holds only its binary here — no conversation store \
+                     was found in it. Its Markdown export is one of the formats \
+                     `engram import` already reads",
+        },
+        command_surface: CommandSurface::None {
+            detail: "kilo has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Mimocode,
+        name: "mimocode",
+        probe: &[".mimocode"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "mimocode's config root holds only its binary here — no conversation \
+                     store was found in it",
+        },
+        command_surface: CommandSurface::None {
+            detail: "mimocode has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Warp,
+        name: "warp",
+        probe: &[".warp"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "warp is a terminal with an agent rather than a CLI harness; .warp holds \
+                     its TUI assets and no conversation store was found in it",
+        },
+        command_surface: CommandSurface::None {
+            detail: "warp has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Cline,
+        name: "cline",
+        probe: &[".cline"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "cline's config root holds a data directory and certificates here; no \
+                     conversation store was found in it. Cline is primarily an editor \
+                     extension, whose history lives in the host editor's storage",
+        },
+        command_surface: CommandSurface::None {
+            detail: "cline has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Aichat,
+        name: "aichat",
+        probe: &[".aichat"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "aichat's config root holds only a skills directory here; no conversation \
+                     store was found in it",
+        },
+        command_surface: CommandSurface::None {
+            detail: "aichat has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
+        hooks_config: None,
+    },
+    HarnessSpec {
+        id: Harness::Bailian,
+        name: "bailian",
+        probe: &[".bailian"],
+        sessions_dir: None,
+        transcript: TranscriptSupport::NotImplemented {
+            detail: "bailian's config root holds configuration and a telemetry log here; no \
+                     conversation store was found in it",
+        },
+        command_surface: CommandSurface::None {
+            detail: "bailian has no user command directory engram has surveyed",
+        },
+        export_command: None,
+        also_scans: &[],
+        mcp_config: None,
         hooks_config: None,
     },
 ];
@@ -644,6 +874,7 @@ pub fn from_env() -> Option<&'static HarnessSpec> {
         ("OPENCODE", Harness::Opencode),
         ("GEMINI_CLI", Harness::Antigravity),
     ];
+
     MARKERS
         .iter()
         .find(|(var, _)| std::env::var_os(var).is_some_and(|v| !v.is_empty()))

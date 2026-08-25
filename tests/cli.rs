@@ -1970,14 +1970,17 @@ fn ingest_from_a_readerless_harness_is_exit_2_with_a_fallback() {
         assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
         let message = err["error"]["message"].as_str().expect("message");
         assert!(message.contains(harness), "{harness}: {message}");
-        // The hint must name the way forward, not just the refusal.
+        // The hint must name the way forward, not just the refusal — and which
+        // way forward depends on the harness. One that exports its own
+        // conversation is told to export and `engram import` the file, which is
+        // a far better answer than re-running the work through `remember`; one
+        // that cannot is told the notes path. Asserting only the notes path
+        // would forbid the better hint.
         let hint = err["error"]["hint"].as_str().expect("hint");
+        let notes_path = hint.contains("remember") && hint.contains("save-chat");
+        let export_path = hint.contains("engram import");
         assert!(
-            hint.contains("remember"),
-            "{harness} hint lacks a fallback: {hint}"
-        );
-        assert!(
-            hint.contains("save-chat"),
+            notes_path || export_path,
             "{harness} hint lacks a fallback: {hint}"
         );
     }
@@ -2116,7 +2119,7 @@ fn install_list_reports_every_harness_and_writes_nothing() {
     let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
 
     let harnesses = data["harnesses"].as_array().expect("harnesses");
-    assert_eq!(harnesses.len(), 11, "every known harness must be reported");
+    assert_eq!(harnesses.len(), 21, "every known harness must be reported");
 
     let claude = harnesses
         .iter()
