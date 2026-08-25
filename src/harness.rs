@@ -281,7 +281,9 @@ pub const ALL: &[HarnessSpec] = &[
             detail: "copilot cli stores sessions in session-store.db, a SQLite database with an undocumented schema",
         },
         command_surface: CommandSurface::None {
-            detail: "copilot cli has no user-writable command or prompt directory",
+            detail: "copilot cli takes plugins, not loose command files, and installs \
+                     them from a marketplace, a GitHub repository, or a git URL --- \
+                     there is no user-writable directory engram can drop a command into",
         },
         mcp_config: Some(McpConfigSource::Json(".copilot/mcp-config.json")),
         hooks_config: None,
