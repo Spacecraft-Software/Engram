@@ -13,6 +13,13 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **Three harness entries claimed a thing was impossible when it was not.**
+  Antigravity writes a plain JSONL transcript alongside its protobuf stores;
+  Copilot CLI's `turns` table is a flat pre-paired transcript, not an
+  undocumented schema; and Kimi's project hash is reversible three ways. All
+  three are now `NotImplemented` ("readable, reader not written") rather than
+  `Unsupported`, with what was actually probed written down.
+
 - **A project under a dotted directory was unreachable.** `mangle_cwd` replaced
   only `/`, but the harness replaces every character outside `[A-Za-z0-9_-]`, so
   anything beneath `.claude/worktrees/` — every worktree Claude Code creates —
@@ -46,6 +53,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
   and can be removed by hand.
 
 ### Added
+
+- **Ten more harnesses in the table** — grok, zcode, deepcode, poe-code, kilo,
+  mimocode, warp, cline, aichat, bailian — recorded, not built for. An absent
+  entry is indistinguishable from an unexamined one.
+- **`export_command` per harness.** When `ingest` refuses a harness it cannot
+  read, the hint now names that harness's own export command and points at
+  `engram import`, instead of sending you to re-run the work through
+  `remember`.
 
 - **`engram import`** — reads chat transcripts that were exported to files, for
   the harnesses `ingest` has no reader for, and reads back `save-chat`'s own

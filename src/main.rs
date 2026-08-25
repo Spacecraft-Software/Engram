@@ -890,15 +890,31 @@ fn readable_names() -> String {
 /// this whole design exists to prevent.
 fn transcript_error(e: transcript::TranscriptError, harness_name: &str) -> AppError {
     match e {
-        transcript::TranscriptError::NoReader(detail) => AppError::new(
-            error::ErrorCode::InvalidArgument,
-            2,
-            format!("harness '{harness_name}' has no transcript reader"),
-            format!(
-                "{detail}. Use the notes path instead: call `remember` during the session, \
-                 then `engram save-chat --scope <id>`."
-            ),
-        ),
+        transcript::TranscriptError::NoReader(detail) => {
+            // A harness engram cannot read is not a dead end when the harness
+            // exports its own conversation and `engram import` reads that. The
+            // command is only useful at the moment the wall is hit, so it is
+            // named here rather than left in the manual.
+            let export = harness::ALL
+                .iter()
+                .find(|s| s.name == harness_name)
+                .and_then(|s| s.export_command);
+            let fallback = match export {
+                Some(cmd) => format!(
+                    "Export it from the harness and import the file: `{cmd}`, then \
+                     `engram import <file>`."
+                ),
+                None => "Use the notes path instead: call `remember` during the session, \
+                         then `engram save-chat --scope <id>`."
+                    .to_string(),
+            };
+            AppError::new(
+                error::ErrorCode::InvalidArgument,
+                2,
+                format!("harness '{harness_name}' has no transcript reader"),
+                format!("{detail}. {fallback}"),
+            )
+        }
         transcript::TranscriptError::NoHome => AppError::new(
             error::ErrorCode::InvalidArgument,
             2,
