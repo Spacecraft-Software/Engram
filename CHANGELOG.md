@@ -13,6 +13,12 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **Two Claude Code record types read as a format change.** `atis-latch` and
+  `cost-state` were absent from the non-message allowlist, so a real session
+  reported 189 `unknown_record` entries. Neither carries a `message`, so no
+  turn was lost — but a drift alarm that fires ~190 times every run is one that
+  stops being read. Both are now recognized and pinned by the fixture.
+
 - **Three harness entries claimed a thing was impossible when it was not.**
   Antigravity writes a plain JSONL transcript alongside its protobuf stores;
   Copilot CLI's `turns` table is a flat pre-paired transcript, not an

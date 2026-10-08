@@ -59,6 +59,15 @@ const NON_MESSAGE_TYPES: &[&str] = &[
     // A pull request opened from this session. Re-appended on every update, so
     // one PR yields several records.
     "pr-link",
+    // A per-session latch holding an `atis` string plus `sessionId`, and no
+    // `message` at all. The most frequent machinery record observed: ~180 in a
+    // single long session, which is enough on its own to dominate the
+    // `unknown_record` count and make the drift alarm read as noise.
+    "atis-latch",
+    // Cost and usage accounting for the session — `totalCostUSD`,
+    // `modelUsage`, line counts and several durations — with no `message`.
+    // Rewritten as the session proceeds, so one session yields many records.
+    "cost-state",
 ];
 
 /// Lists this working directory's transcripts, newest first.
