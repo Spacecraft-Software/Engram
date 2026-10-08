@@ -26,6 +26,7 @@ One synthetic Claude Code session covering:
 | Line | Exercises |
 |------|-----------|
 | `mode`, `permission-mode`, `file-history-snapshot`, `ai-title` | recognized non-message records |
+| `atis-latch`, `cost-state` | machinery the harness added later — the two types that made a real session report 189 unknown records |
 | `something-new-in-a-future-release` | an **unknown** record type, which must be counted rather than silently skipped |
 | `user` with `isMeta: true` | harness bookkeeping injected as a turn |
 | `user` with `<local-command-stdout>` | a synthetic slash-command echo |

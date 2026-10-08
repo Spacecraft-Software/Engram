@@ -14,3 +14,5 @@
 {"parentUuid":"u-2","type":"user","uuid":"u-side","timestamp":"2026-08-01T10:04:00.000Z","isSidechain":true,"cwd":"/tmp/project","message":{"role":"user","content":"subagent chatter that is a different conversation"}}
 {"parentUuid":"u-2","type":"assistant","uuid":"a-3","timestamp":"2026-08-01T10:05:00.000Z","cwd":"/tmp/project","message":{"role":"assistant","content":[{"type":"text","text":"Decided: stream the reader and cap it with --max-bytes."}]}}
 {"type":"last-prompt","leafUuid":"a-3","sessionId":"session-basic"}
+{"type":"atis-latch","atis":"","sessionId":"session-basic"}
+{"type":"cost-state","sessionId":"session-basic","totalCostUSD":0,"totalAPIDuration":0,"totalAPIDurationWithoutRetries":0,"totalToolDuration":0,"totalDuration":0,"totalLinesAdded":0,"totalLinesRemoved":0,"modelUsage":{},"hasUnknownModelCost":false,"startTime":"2026-02-01T00:00:00.000Z"}

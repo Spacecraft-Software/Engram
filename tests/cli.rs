@@ -1793,7 +1793,16 @@ fn ingest_dry_run_reports_the_filter_histogram_and_writes_nothing() {
     assert_eq!(filtered["meta"], 1);
     assert_eq!(filtered["sidechain"], 1);
     assert_eq!(filtered["command_synthetic"], 2);
-    // The early-warning signal for a transcript-format change.
+    // Recognized machinery, counted rather than mistaken for conversation.
+    // Pinned because the number is what distinguishes "engram knows this
+    // record and skipped it" from "engram has never seen it": a type that
+    // falls out of the allowlist moves from here into `unknown_record`, and
+    // only a count catches that.
+    assert_eq!(filtered["non_message"], 7);
+    // The early-warning signal for a transcript-format change. Exactly one —
+    // the fixture's deliberately-unknown record. `atis-latch` and `cost-state`
+    // are in the fixture too and must *not* land here; they did, 189 times, in
+    // a real session before they were allowlisted.
     assert_eq!(filtered["unknown_record"], 1);
 
     // Nothing was stored.
