@@ -896,6 +896,37 @@ mod tests {
         }
     }
 
+    /// A command that advertises a `[scope]` argument must pass it to every
+    /// invocation that stores or previews — not only interpolate it into the
+    /// prose describing the behavior.
+    ///
+    /// `/engram-ingest bravais` once ingested into the worktree-named scope
+    /// `lamprey`, reporting `scope_origin: "git-root"`: the template documented
+    /// `Scope: $1` and passed it nowhere. `/engram-save-chat` was split the
+    /// same way — archive under the argument, ingest under the cascade. An
+    /// empty `--scope ""` falls through to the cascade, so passing it
+    /// unconditionally is safe.
+    #[test]
+    fn a_scope_argument_reaches_every_ingest_that_writes() {
+        for command in COMMANDS {
+            if !command.body.contains("argument-hint: \"[scope]\"") {
+                continue;
+            }
+            for line in command
+                .body
+                .lines()
+                .filter(|l| l.trim_start().starts_with("!`"))
+                .filter(|l| l.contains(" ingest ") && !l.contains("--list"))
+            {
+                assert!(
+                    line.contains("--scope \"$1\""),
+                    "{}: ingest ignores the scope argument: {line}",
+                    command.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn frontmatter_is_stripped_for_harnesses_that_do_not_read_it() {
         let out = render_command(COMMANDS[0].body, codex(), "/shared/engram.db");

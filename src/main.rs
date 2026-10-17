@@ -588,7 +588,7 @@ fn run(
                 "rules": {
                     "description": "Durable project policy, stored once and rendered into the \
                                     markdown files agent harnesses auto-load.",
-                    "scope_resolution": ["--scope", "ENGRAM_SCOPE", "git-root-basename", "cwd-basename"],
+                    "scope_resolution": ["--scope", "ENGRAM_SCOPE", "git-worktree-repo-name", "git-root-basename", "cwd-basename"],
                     "sync_targets": rules::DEFAULT_TARGETS,
                     "surfaces": ["cli", "mcp-stdio", "http"],
                     "retire": "tombstones rather than deletes; re-adding the same id reinstates",
@@ -964,6 +964,15 @@ fn handle_ingest(
         Err(e) => return fail(*e, mode),
     };
 
+    // "latest" means *this* session when the harness names it — but only when
+    // reading our own directory. `--cwd` points at another project, whose
+    // latest session is not the one we are running in.
+    let own_session = if cwd.is_none() && session_selector == "latest" {
+        transcript::own_session_id(spec)
+    } else {
+        None
+    };
+
     let cwd = match cwd.map_or_else(std::env::current_dir, Ok) {
         Ok(c) => c,
         Err(e) => return fail(scope_error(e), mode),
@@ -990,26 +999,42 @@ fn handle_ingest(
         return 0;
     }
 
-    let selected: Vec<transcript::SessionRef> = match session_selector {
+    // The newest file in the directory is only a guess at "this session": it
+    // is wrong when the session was started elsewhere (its transcript lives
+    // under that directory) and when two sessions share a project. The
+    // harness's own id is exact, so it wins whenever it is available.
+    let wanted = own_session.as_deref().unwrap_or(session_selector);
+    let selected: Vec<transcript::SessionRef> = match wanted {
         "latest" => sessions.into_iter().take(1).collect(),
         "all" => sessions,
-        id => sessions
-            .into_iter()
-            .filter(|s| s.session_id == id)
-            .collect(),
+        id => match transcript::locate_session(spec, sessions, id) {
+            Ok(found) => found.into_iter().collect(),
+            Err(e) => return fail(transcript_error(e, spec.name), mode),
+        },
     };
     if selected.is_empty() {
-        return fail(
-            AppError::new(
-                error::ErrorCode::NotFound,
-                3,
-                format!(
-                    "no {} session matching '{session_selector}' for {}",
-                    spec.name,
-                    cwd.display()
-                ),
-                "run `engram ingest --list` to see the sessions engram can find",
+        let message = match &own_session {
+            Some(id) => format!(
+                "this {} session ({id}, from {}) has no transcript under any project directory yet",
+                spec.name,
+                transcript::CLAUDE_CODE_SESSION_ENV
             ),
+            None => format!(
+                "no {} session matching '{session_selector}' for {}",
+                spec.name,
+                cwd.display()
+            ),
+        };
+        // `--list` only covers this directory, so it cannot help find a
+        // session the harness filed somewhere else.
+        let hint = if own_session.is_some() {
+            "a transcript appears once the harness flushes its first record; to read a \
+             different session, pass `--session <id>` or `--cwd <dir>`"
+        } else {
+            "run `engram ingest --list` to see the sessions engram can find"
+        };
+        return fail(
+            AppError::new(error::ErrorCode::NotFound, 3, message, hint),
             mode,
         );
     }
@@ -1623,6 +1648,10 @@ struct ImportResult {
     scopes: Vec<String>,
     inserted: usize,
     skipped_existing: usize,
+    /// Skipped messages already stored under another scope; see
+    /// `store::IngestReport::existing_in_other_scopes`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    existing_in_other_scopes: std::collections::BTreeMap<String, usize>,
     filtered: transcript::FilterStats,
     redactions: transcript::redact::Redactions,
 }
@@ -1674,6 +1703,9 @@ fn handle_import(
     dry_run: bool,
 ) -> i32 {
     let files = collect_exports(paths, recursive);
+    // Ids a dry run has already counted as new, across files; see
+    // `Store::preview_turns`.
+    let mut pending = std::collections::HashSet::new();
     let mut result = ImportResult {
         dry_run,
         files: Vec::new(),
@@ -1681,6 +1713,7 @@ fn handle_import(
         scopes: Vec::new(),
         inserted: 0,
         skipped_existing: 0,
+        existing_in_other_scopes: std::collections::BTreeMap::new(),
         filtered: transcript::FilterStats::default(),
         redactions: transcript::redact::Redactions::default(),
     };
@@ -1740,14 +1773,14 @@ fn handle_import(
             });
         }
 
-        let report = if dry_run {
-            store::IngestReport {
-                inserted: rows.len(),
-                skipped_existing: 0,
-            }
-        } else {
+        let report = {
             let mut guard = store.lock().expect("store lock poisoned");
-            match guard.ingest_turns(&resolved.name, &rows) {
+            let outcome = if dry_run {
+                guard.preview_turns(&resolved.name, &rows, &mut pending)
+            } else {
+                guard.ingest_turns(&resolved.name, &rows)
+            };
+            match outcome {
                 Ok(r) => r,
                 Err(e) => return fail(AppError::from(e), mode),
             }
@@ -1755,6 +1788,12 @@ fn handle_import(
 
         result.inserted += report.inserted;
         result.skipped_existing += report.skipped_existing;
+        for (other, n) in &report.existing_in_other_scopes {
+            *result
+                .existing_in_other_scopes
+                .entry(other.clone())
+                .or_default() += n;
+        }
         if !result.scopes.contains(&resolved.name) {
             result.scopes.push(resolved.name.clone());
         }

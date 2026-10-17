@@ -186,6 +186,42 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Name of the repository a *linked worktree* belongs to, when `root` is one.
+///
+/// `root` must be a working-tree root as [`find_git_root`] returns it. A linked
+/// worktree stores `.git` as a `gitdir: <repo>/.git/worktrees/<name>` file, so
+/// naming it after its own directory files its history under a throwaway name
+/// — every Claude Code worktree is `.claude/worktrees/<random-slug>`, and one
+/// project's memory ended up split across `bravais` and `lamprey` that way.
+///
+/// The test is the `commondir` file inside the gitdir, which git writes for
+/// linked worktrees only. A submodule also uses a `.git` file, but its gitdir
+/// (`<super>/.git/modules/<name>`) has no `commondir`, and naming a submodule
+/// after its superproject would be wrong — so it returns `None` and keeps its
+/// own basename.
+///
+/// Returns `None` for an ordinary checkout, a submodule, or anything that
+/// cannot be read; callers fall back to the root's basename.
+pub fn linked_worktree_repo_name(root: &Path) -> Option<String> {
+    let pointer = std::fs::read_to_string(root.join(".git")).ok()?;
+    let gitdir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let gitdir = root.join(gitdir);
+    let commondir = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = gitdir.join(commondir.trim());
+    let common = common.canonicalize().unwrap_or(common);
+
+    // `<repo>/.git` for a normal repository; `<repo>.git` (or any name) for a
+    // bare one, where the directory itself carries the repository's name.
+    let named = if common.file_name()? == ".git" {
+        common.parent()?.file_name()?
+    } else {
+        common.file_name()?
+    };
+    let name = named.to_string_lossy();
+    let name = name.strip_suffix(".git").unwrap_or(&name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// True when `dir` is the root of a real working tree.
 ///
 /// Existence of `.git` alone is not enough. An empty `.git` directory is not a
@@ -240,6 +276,90 @@ mod tests {
         assert_eq!(
             find_git_root(&linked_nested).as_deref(),
             Some(linked.as_path())
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Lays out what `git worktree add` and `git submodule add` produce,
+    /// without needing `git`: a main repository `repo/`, a linked worktree
+    /// whose gitdir carries `commondir`, and a submodule whose gitdir does not.
+    fn plant_repo_with_worktree_and_submodule(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = tmp.join("repo");
+        let git = main.join(".git");
+        std::fs::create_dir_all(&git).expect("create .git");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+
+        // A relative `commondir`, exactly as git writes it.
+        let wt_gitdir = git.join("worktrees").join("lamprey");
+        std::fs::create_dir_all(&wt_gitdir).expect("create worktree gitdir");
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").expect("write commondir");
+        let worktree = main.join(".claude").join("worktrees").join("lamprey");
+        std::fs::create_dir_all(&worktree).expect("create worktree");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .expect("write worktree pointer");
+
+        // A submodule's pointer is relative, and its gitdir has no commondir.
+        let sm_gitdir = git.join("modules").join("vendored");
+        std::fs::create_dir_all(&sm_gitdir).expect("create module gitdir");
+        std::fs::write(sm_gitdir.join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        let submodule = main.join("vendored");
+        std::fs::create_dir_all(&submodule).expect("create submodule");
+        std::fs::write(submodule.join(".git"), "gitdir: ../.git/modules/vendored\n")
+            .expect("write submodule pointer");
+
+        (main, worktree, submodule)
+    }
+
+    /// A linked worktree is named after the repository it belongs to; a
+    /// submodule and an ordinary checkout are not renamed.
+    #[test]
+    fn only_a_linked_worktree_takes_its_repository_name() {
+        let tmp = std::env::temp_dir().join(format!("engram-worktree-{}", std::process::id()));
+        let (main, worktree, submodule) = plant_repo_with_worktree_and_submodule(&tmp);
+
+        assert_eq!(
+            linked_worktree_repo_name(&worktree).as_deref(),
+            Some("repo"),
+            "a worktree must be named after its main repository, not its slug"
+        );
+        assert_eq!(
+            linked_worktree_repo_name(&submodule),
+            None,
+            "a submodule is its own project and keeps its own name"
+        );
+        assert_eq!(linked_worktree_repo_name(&main), None);
+
+        // `find_git_root` still stops at the worktree: `rule sync` writes there.
+        let nested = worktree.join("src");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        assert_eq!(find_git_root(&nested).as_deref(), Some(worktree.as_path()));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A bare repository's directory carries the name, minus `.git`.
+    #[test]
+    fn a_worktree_of_a_bare_repository_drops_the_git_suffix() {
+        let tmp = std::env::temp_dir().join(format!("engram-bare-{}", std::process::id()));
+        let bare = tmp.join("bravais.git");
+        let gitdir = bare.join("worktrees").join("main");
+        std::fs::create_dir_all(&gitdir).expect("create bare gitdir");
+        std::fs::write(gitdir.join("commondir"), "../..\n").expect("write commondir");
+        let worktree = tmp.join("main");
+        std::fs::create_dir_all(&worktree).expect("create worktree");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("write pointer");
+
+        assert_eq!(
+            linked_worktree_repo_name(&worktree).as_deref(),
+            Some("bravais")
         );
 
         std::fs::remove_dir_all(&tmp).ok();

@@ -13,6 +13,34 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **`--dry-run` claimed every turn was new.** `ingest --dry-run` and
+  `import --dry-run` never consulted the store, so a preview reported
+  `inserted: 403, skipped_existing: 0` seconds before the real run inserted 5.
+  Previews now apply the same rule as the insert, including duplicates across
+  files. Both previews and real runs report `existing_in_other_scopes` when
+  skipped turns already live under a different scope — a re-capture under a
+  new scope moves nothing, and used to look like it had worked.
+
+- **`ingest` could not find a session started in another directory.** Claude
+  Code files a transcript under the directory a session started in, so
+  `latest` was `NOT_FOUND` after a `cd` into a sub-project or when resuming a
+  worktree session from its parent. When `CLAUDE_CODE_SESSION_ID` is set,
+  `ingest` and MCP `save_chat` now look that exact session up in every project
+  directory — which also stops `latest` picking a different concurrent
+  session. `--session <id>` searches the same way.
+
+- **The `[scope]` argument of `/engram-ingest` and `/engram-save-chat` was
+  ignored by `ingest`.** The templates documented `Scope: $1` but passed it
+  only to `save-chat`, so one command could archive under one scope and
+  ingest under another. Re-run `engram install` to pick this up.
+
+- **A git worktree filed its memories under its own directory name.** Scope
+  now resolves to the main repository's name inside a linked worktree
+  (`scope_origin: "git-worktree"`); `rule sync` still writes into the
+  worktree, and submodules keep their own names. **Behavior change:** work in
+  worktrees that previously landed in worktree-named scopes now lands in the
+  repository's scope.
+
 - **Two Claude Code record types read as a format change.** `atis-latch` and
   `cost-state` were absent from the non-message allowlist, so a real session
   reported 189 `unknown_record` entries. Neither carries a `message`, so no

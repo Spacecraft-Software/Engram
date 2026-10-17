@@ -6,6 +6,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub struct Store {
     conn: Connection,
@@ -71,6 +72,31 @@ pub struct IngestReport {
     /// Turns already present from an earlier ingest of the same session —
     /// the number that proves the operation is idempotent.
     pub skipped_existing: usize,
+    /// The subset of `skipped_existing` stored under a *different* scope,
+    /// counted per scope.
+    ///
+    /// A turn's id does not include its scope, so re-capturing a session
+    /// under a new scope moves nothing: every turn is skipped and stays where
+    /// it was. Without this field that looks exactly like a successful
+    /// re-capture; one project's history sat in a worktree-named scope for
+    /// weeks that way.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub existing_in_other_scopes: BTreeMap<String, usize>,
+}
+
+impl IngestReport {
+    fn note_existing(&mut self, target: &str, found_in: Option<String>) {
+        self.skipped_existing += 1;
+        if let Some(found) = found_in.filter(|s| s != target) {
+            *self.existing_in_other_scopes.entry(found).or_default() += 1;
+        }
+    }
+}
+
+/// Scope an existing memory id is stored under, if the id exists.
+fn scope_of(stmt: &mut rusqlite::Statement<'_>, id: &str) -> rusqlite::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    stmt.query_row([id], |r| r.get(0)).optional()
 }
 
 /// Which slice of the bi-temporal history a read should see.
@@ -728,15 +754,16 @@ impl Store {
         turns: &[IngestTurn],
     ) -> rusqlite::Result<IngestReport> {
         let tx = self.conn.transaction()?;
-        let mut inserted = 0usize;
+        let mut report = IngestReport::default();
         {
-            let mut stmt = tx.prepare(
+            let mut insert = tx.prepare(
                 "INSERT OR IGNORE INTO memories
                  (id, agent, scope, role, content, created_at, valid_from)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             )?;
+            let mut lookup = tx.prepare("SELECT scope FROM memories WHERE id = ?1")?;
             for turn in turns {
-                inserted += stmt.execute(params![
+                let landed = insert.execute(params![
                     turn.id,
                     turn.agent,
                     scope,
@@ -744,13 +771,61 @@ impl Store {
                     turn.content,
                     turn.created_at,
                 ])?;
+                if landed > 0 {
+                    report.inserted += landed;
+                } else {
+                    report.note_existing(scope, scope_of(&mut lookup, &turn.id)?);
+                }
             }
         }
         tx.commit()?;
-        Ok(IngestReport {
-            inserted,
-            skipped_existing: turns.len() - inserted,
-        })
+        Ok(report)
+    }
+
+    /// What [`Store::ingest_turns`] would report for `turns`, without writing.
+    ///
+    /// A dry run that skips the store can only claim every turn is new, and
+    /// that was the old behavior: one preview reported `inserted: 403,
+    /// skipped_existing: 0` seconds before the real run returned `inserted:
+    /// 5, skipped_existing: 400`. A preview exists to be trusted, so this
+    /// reads the store and applies the same rule `INSERT OR IGNORE` does —
+    /// including that a repeated id is skipped in favor of its first copy.
+    ///
+    /// `pending` carries the ids earlier previews in the same run would have
+    /// inserted, and is extended with this batch's. It is what makes a
+    /// multi-file preview honest: `import` over a corpus holding one export
+    /// thirteen times inserts it once, and a preview that forgot the first
+    /// file by the second would claim thirteen.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if a lookup fails.
+    pub fn preview_turns(
+        &self,
+        scope: &str,
+        turns: &[IngestTurn],
+        pending: &mut std::collections::HashSet<String>,
+    ) -> rusqlite::Result<IngestReport> {
+        let mut report = IngestReport::default();
+        let mut lookup = self
+            .conn
+            .prepare("SELECT scope FROM memories WHERE id = ?1")?;
+        for turn in turns {
+            if pending.contains(&turn.id) {
+                // The run already counted this id as new; the real insert
+                // would ignore every later copy.
+                report.note_existing(scope, None);
+                continue;
+            }
+            match scope_of(&mut lookup, &turn.id)? {
+                Some(found) => report.note_existing(scope, Some(found)),
+                None => {
+                    report.inserted += 1;
+                    pending.insert(turn.id.clone());
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Every message in a scope, chronological, for archival export.
@@ -1640,7 +1715,7 @@ impl Store {
         vector: Option<HybridQuery<'_>>,
     ) -> rusqlite::Result<ContextResult> {
         use crate::retrieval::{estimate_tokens, greedy_pack, BudgetReport, ESTIMATOR, RRF_K};
-        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::collections::{HashMap, HashSet};
 
         let rules = self.rules(scope)?;
         let rules_tokens: u32 = rules.iter().map(|r| estimate_tokens(&r.text)).sum();

@@ -14,7 +14,7 @@ Run these in order and report what happened:
 
 1. Preview the capture. This writes nothing:
 
-   !`engram --db {{DB}} ingest --harness {{HARNESS}} --dry-run`
+   !`engram --db {{DB}} ingest --harness {{HARNESS}} --scope "$1" --dry-run`
 
 2. Read the `filtered` counts in that output. Most of a transcript is tool
    traffic, so a large `tool_result` count is normal, not a problem.
@@ -35,7 +35,7 @@ Run these in order and report what happened:
 
 3. If step 1 reports turns to insert, run it for real:
 
-   !`engram --db {{DB}} ingest --harness {{HARNESS}}`
+   !`engram --db {{DB}} ingest --harness {{HARNESS}} --scope "$1"`
 
 4. Archive the scope:
 

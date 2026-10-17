@@ -654,8 +654,18 @@ impl EngramMcp {
             )
         })?;
         // `latest` only: an MCP caller is archiving the conversation it is
-        // having, not backfilling a directory's history.
-        let selected: Vec<_> = sessions.into_iter().take(1).collect();
+        // having, not backfilling a directory's history. When the harness
+        // names that conversation, use the name rather than the newest file —
+        // see `engram ingest` for why the newest file can be the wrong one.
+        let selected: Vec<_> = match crate::transcript::own_session_id(spec) {
+            Some(id) => crate::transcript::locate_session(spec, sessions, &id)
+                .map_err(|e| {
+                    McpError::internal_error(format!("cannot find the session: {e}"), None)
+                })?
+                .into_iter()
+                .collect(),
+            None => sessions.into_iter().take(1).collect(),
+        };
         if selected.is_empty() {
             return Err(McpError::invalid_params(
                 format!(

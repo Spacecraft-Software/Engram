@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 /// Env vars that would leak the host's agent/CI context into the mode
 /// cascade, scope resolution, agent defaults, or `metadata.tool_agent`.
-const HERMETIC_VARS: [&str; 15] = [
+const HERMETIC_VARS: [&str; 16] = [
     "AI_AGENT",
     "AGENT",
     "CI",
@@ -35,6 +35,10 @@ const HERMETIC_VARS: [&str; 15] = [
     "ENGRAM_AGENT",
     "ENGRAM_MODEL",
     "CLAUDECODE",
+    // `ingest` resolves "latest" to this exact session when set; a test run
+    // from inside Claude Code would otherwise go looking for the developer's
+    // own session in the fake home.
+    "CLAUDE_CODE_SESSION_ID",
     "CURSOR_AGENT",
     "GEMINI_CLI",
 ];
@@ -3821,4 +3825,286 @@ fn import_synthesises_ordered_times_for_a_markdown_export() {
         .collect();
     assert!(times[0] < times[1], "{times:?}");
     assert!(times[0].starts_with("2026-07-07T21:39:41"), "{times:?}");
+}
+
+/// A dry run must report what the real run will, which means consulting the
+/// store. It used to claim every turn was new: one preview said `inserted:
+/// 403, skipped_existing: 0` seconds before the real run inserted 5.
+#[test]
+fn ingest_dry_run_counts_turns_already_stored() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_claude_transcript(&home, &project, "session-basic");
+
+    let args = ["--harness", "claude-code", "--scope", "ing"];
+    ingest(&db, &home, &project, &args).assert().success();
+
+    let assert = ingest(&db, &home, &project, &[&args[..], &["--dry-run"]].concat())
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["inserted"], 0, "a stored session is not new: {data}");
+    assert_eq!(data["skipped_existing"], 4);
+    assert!(
+        data.get("existing_in_other_scopes").is_none(),
+        "same scope is not 'elsewhere': {data}"
+    );
+}
+
+/// Re-capturing under a new scope moves nothing, because a turn's id does not
+/// include its scope. Both the preview and the real run must say where the
+/// turns actually are, or a re-scope attempt reads as a success.
+#[test]
+fn ingest_reports_turns_stored_under_another_scope() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_claude_transcript(&home, &project, "session-basic");
+
+    ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--scope", "lamprey"],
+    )
+    .assert()
+    .success();
+
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let args = [
+            &["--harness", "claude-code", "--scope", "bravais"][..],
+            extra,
+        ]
+        .concat();
+        let assert = ingest(&db, &home, &project, &args).assert().success();
+        let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+        assert_eq!(data["inserted"], 0, "{extra:?}: {data}");
+        assert_eq!(data["skipped_existing"], 4);
+        assert_eq!(data["existing_in_other_scopes"]["lamprey"], 4, "{data}");
+    }
+    assert!(recall_data(&db, "bravais").is_empty());
+}
+
+/// `import --dry-run` previews duplicates across files the way the real run
+/// stores them: once.
+#[test]
+fn import_dry_run_counts_stored_and_repeated_messages() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let project = pinned_project(&tmp);
+    plant_archive(&project, "a.texi", ARCHIVE);
+    plant_archive(&project, "b.texi", ARCHIVE);
+
+    let assert = import(&db, &project, &["chat", "--dry-run"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["inserted"], 3, "two copies of one archive: {data}");
+    assert_eq!(data["skipped_existing"], 3);
+
+    import(&db, &project, &["chat"]).assert().success();
+    let assert = import(&db, &project, &["chat", "--dry-run"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["inserted"], 0, "{data}");
+    assert_eq!(data["skipped_existing"], 6);
+}
+
+/// Claude Code files a session under the directory it *started* in. A
+/// session launched at the umbrella and then working in a sub-project could
+/// not be found from the sub-project: `NOT_FOUND` for `latest`. The harness
+/// names its own session, so engram looks it up by id, anywhere.
+#[test]
+fn ingest_finds_its_own_session_filed_under_another_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let launched_at = tmp.path().join("umbrella");
+    std::fs::create_dir_all(&launched_at).expect("create launch dir");
+    let planted = plant_claude_transcript(&home, &launched_at, "sess-mine");
+
+    // Without the id, the project directory genuinely has nothing.
+    ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--dry-run"],
+    )
+    .assert()
+    .code(3);
+
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--dry-run"],
+    )
+    .env("CLAUDE_CODE_SESSION_ID", "sess-mine")
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["sessions"][0]["session_id"], "sess-mine");
+    assert_eq!(
+        data["sessions"][0]["path"],
+        planted.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        data["scope"], "project",
+        "scope still follows where the work is happening"
+    );
+
+    // An explicit id is found the same way, with or without the variable.
+    ingest(
+        &db,
+        &home,
+        &project,
+        &[
+            "--harness",
+            "claude-code",
+            "--session",
+            "sess-mine",
+            "--dry-run",
+        ],
+    )
+    .assert()
+    .success();
+}
+
+/// The newest transcript in a directory is not necessarily this session's —
+/// two sessions can share a project. The id wins over recency.
+#[test]
+fn ingest_prefers_its_own_session_over_the_newest() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let mine = plant_claude_transcript(&home, &project, "sess-mine");
+    let other = plant_claude_transcript(&home, &project, "sess-other");
+    // Make the other session unambiguously the newest file.
+    let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&mine)
+        .and_then(|f| f.set_modified(older))
+        .expect("age my transcript");
+    drop(other);
+
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--dry-run"],
+    )
+    .env("CLAUDE_CODE_SESSION_ID", "sess-mine")
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["sessions"][0]["session_id"], "sess-mine", "{data}");
+}
+
+/// A named session with no transcript is an error naming the session — never
+/// a silent fall back to some other session's transcript.
+#[test]
+fn ingest_with_an_unknown_own_session_fails_without_guessing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_claude_transcript(&home, &project, "sess-other");
+
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--json"],
+    )
+    .env("CLAUDE_CODE_SESSION_ID", "sess-gone")
+    .assert()
+    .code(3);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains("sess-gone"), "{stderr}");
+    assert!(recall_data(&db, "project").is_empty(), "nothing guessed");
+
+    // A traversal-shaped id finds nothing rather than escaping the tree.
+    ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--dry-run"],
+    )
+    .env("CLAUDE_CODE_SESSION_ID", "../../etc/passwd")
+    .assert()
+    .code(3);
+}
+
+/// `--cwd` reads another project, whose latest session is not ours.
+#[test]
+fn ingest_cwd_ignores_the_own_session_variable() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let elsewhere = tmp.path().join("other-project");
+    std::fs::create_dir_all(&elsewhere).expect("create other project");
+    plant_claude_transcript(&home, &elsewhere, "sess-elsewhere");
+    let cwd = elsewhere.to_string_lossy().into_owned();
+
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--cwd", &cwd, "--dry-run"],
+    )
+    .env("CLAUDE_CODE_SESSION_ID", "sess-mine")
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["sessions"][0]["session_id"], "sess-elsewhere");
+}
+
+/// A linked worktree files under its repository's name, not its own
+/// throwaway directory name; `rule sync` still writes into the worktree.
+#[test]
+fn a_linked_worktree_takes_its_repository_scope() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let main = tmp.path().join("bravais");
+    std::fs::create_dir_all(main.join(".git")).expect("create .git");
+    std::fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    let gitdir = main.join(".git/worktrees/lamprey");
+    std::fs::create_dir_all(&gitdir).expect("create worktree gitdir");
+    std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
+    let worktree = main.join(".claude/worktrees/lamprey");
+    std::fs::create_dir_all(&worktree).expect("create worktree");
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", gitdir.display()),
+    )
+    .expect("pointer");
+
+    engram(&db)
+        .current_dir(&worktree)
+        .args([
+            "rule",
+            "add",
+            "--id",
+            "wt-rule",
+            "--agent",
+            "t",
+            "Always test.",
+        ])
+        .assert()
+        .success();
+    let assert = engram(&db)
+        .current_dir(&worktree)
+        .args(["rule", "sync", "--json"])
+        .assert()
+        .success();
+    let out = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(out["data"]["scope"], "bravais", "{out}");
+    assert_eq!(out["data"]["scope_origin"], "git-worktree");
+    assert!(
+        worktree.join("AGENTS.md").exists(),
+        "sync writes into the worktree, not the main checkout"
+    );
+    assert!(!main.join("AGENTS.md").exists());
 }

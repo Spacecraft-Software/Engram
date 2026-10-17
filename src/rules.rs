@@ -72,6 +72,9 @@ pub enum ScopeOrigin {
     Env,
     /// Basename of the enclosing git working tree.
     GitRoot,
+    /// Name of the repository a linked git worktree belongs to — not the
+    /// worktree directory's own, usually throwaway, name.
+    GitWorktree,
     /// Basename of the current working directory (no git tree found).
     Cwd,
 }
@@ -87,7 +90,8 @@ pub struct ResolvedScope {
 /// Resolves the scope to operate on.
 ///
 /// First match wins: explicit argument, then `ENGRAM_SCOPE`, then the git
-/// working-tree basename, then the current directory's basename. The returned
+/// working-tree basename (for a linked worktree, the name of the repository
+/// it belongs to), then the current directory's basename. The returned
 /// `root` is the git working tree when one encloses the current directory, so
 /// `sync` writes to the repository root rather than wherever the process
 /// happens to have been started.
@@ -140,6 +144,15 @@ pub fn resolve_scope_in(explicit: Option<&str>, cwd: &Path) -> ResolvedScope {
         };
     }
     if let Some(dir) = git_root {
+        // Only the *name* moves to the main repository; `root` stays the
+        // worktree, because that is where `rule sync` must write `AGENTS.md`.
+        if let Some(name) = managed_file::linked_worktree_repo_name(&dir) {
+            return ResolvedScope {
+                name,
+                root: dir,
+                origin: ScopeOrigin::GitWorktree,
+            };
+        }
         let name = basename(&dir);
         return ResolvedScope {
             name,
