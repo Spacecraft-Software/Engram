@@ -1887,19 +1887,31 @@ const CHAT_DIR_NAMES: [&str; 2] = ["chat", "chats"];
 ///
 /// Only the cwd fallback is corrected. Inside a git tree the cascade already
 /// names the repository, and a repository that is itself called `chat` keeps
-/// that name.
+/// that name. The nearest chat-named *ancestor* counts, not only `dir`
+/// itself: `import --recursive` reaches `<project>/chat/2026/x.texi`, whose
+/// directory is `2026`, and filing that under `2026` would be the same
+/// misfiling one level down.
 fn import_scope(explicit: Option<&str>, dir: &std::path::Path) -> rules::ResolvedScope {
     let resolved = rules::resolve_scope_in(explicit, dir);
-    let in_chat_dir = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| CHAT_DIR_NAMES.contains(&n));
-    match (resolved.origin, dir.parent()) {
-        (rules::ScopeOrigin::Cwd, Some(project)) if in_chat_dir => {
-            rules::resolve_scope_in(explicit, project)
-        }
+    match (resolved.origin, chat_container_parent(dir)) {
+        (rules::ScopeOrigin::Cwd, Some(project)) => rules::resolve_scope_in(explicit, project),
         _ => resolved,
     }
+}
+
+/// The parent of the nearest ancestor of `dir` (or `dir` itself) named like a
+/// chat directory — the project that container belongs to.
+///
+/// Pure path arithmetic, no filesystem access, so it is testable without
+/// depending on what the host's temp directory sits inside.
+fn chat_container_parent(dir: &std::path::Path) -> Option<&std::path::Path> {
+    dir.ancestors()
+        .find(|a| {
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| CHAT_DIR_NAMES.contains(&n))
+        })
+        .and_then(std::path::Path::parent)
 }
 
 /// Collects the files an import should consider.
@@ -2187,5 +2199,39 @@ fn emit_error(err: &AppError, mode: OutputMode) {
         err.emit_to_stderr();
     } else {
         err.emit_human(mode == OutputMode::HumanWithColor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_container_parent;
+    use std::path::Path;
+
+    #[test]
+    fn a_chat_container_names_its_parent_at_any_depth() {
+        fn p(s: &str) -> Option<&Path> {
+            Some(Path::new(s))
+        }
+        assert_eq!(
+            chat_container_parent(Path::new("/w/alpha/chat")),
+            p("/w/alpha")
+        );
+        assert_eq!(
+            chat_container_parent(Path::new("/w/beta/chats")),
+            p("/w/beta")
+        );
+        // `import --recursive` reaches archives filed into subdirectories.
+        assert_eq!(
+            chat_container_parent(Path::new("/w/alpha/chat/2026/10")),
+            p("/w/alpha")
+        );
+        // The nearest container wins.
+        assert_eq!(
+            chat_container_parent(Path::new("/w/chat/proj/chat")),
+            p("/w/chat/proj")
+        );
+        assert_eq!(chat_container_parent(Path::new("/w/alpha/notes")), None);
+        // A name merely containing "chat" is not a container.
+        assert_eq!(chat_container_parent(Path::new("/w/chatbot/src")), None);
     }
 }

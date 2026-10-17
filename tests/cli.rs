@@ -4420,7 +4420,21 @@ fn import_files_a_non_git_chat_dir_under_its_parent() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");
     // Deliberately no `pinned_project`: the case under test is the absence of
-    // any git tree, which the system temp dir provides.
+    // any git tree. That depends on the host — a `/tmp/.git` with a `HEAD`
+    // puts the temp dir inside a working tree, where the cascade correctly
+    // names that repository instead. The path logic itself is unit-tested
+    // host-independently in `main.rs`; here, skip loudly rather than fail on
+    // host state.
+    if let Some(repo) = tmp.path().ancestors().find(|a| {
+        let git = a.join(".git");
+        git.is_file() || git.join("HEAD").exists()
+    }) {
+        eprintln!(
+            "skipping: temp dir is inside the git tree at {}",
+            repo.display()
+        );
+        return;
+    }
     let alpha = tmp.path().join("alpha");
     let beta = tmp.path().join("beta");
     plant_archive(&alpha, "a.texi", ARCHIVE);
@@ -4442,4 +4456,18 @@ fn import_files_a_non_git_chat_dir_under_its_parent() {
         "{data}"
     );
     assert_eq!(data["files"][0]["scope"], "alpha");
+
+    // Archives organized into subdirectories still name the project.
+    let nested = alpha.join("chat").join("2026");
+    std::fs::create_dir_all(&nested).expect("create nested dir");
+    std::fs::write(
+        nested.join("c.texi"),
+        ARCHIVE.replace("please fix", "please ship"),
+    )
+    .expect("write nested archive");
+    let assert = import(&db, tmp.path(), &["--recursive", &a])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["scopes"], serde_json::json!(["alpha"]), "{data}");
 }
