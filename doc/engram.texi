@@ -539,6 +539,44 @@ operator's batch jobs; agents receive facts automatically through the
 dedup/contradiction findings only through the ordinary memory
 commands.
 
+@section engram rescope
+
+@cindex rescope command
+@cindex scope, moving memories between
+
+@example
+engram rescope --from @var{scope} --to @var{scope}
+               [--session @var{id} [--harness @var{name}] [--cwd @var{dir}]
+                [--max-bytes @var{n}]]
+               [--dry-run] [--yes]
+@end example
+
+Moves memories filed under the wrong scope --- a worktree's throwaway
+name, or the directory a session happened to start in --- into the
+scope they belong to.  Without @code{--session} the whole scope moves:
+its memories, its rules, and the facts extracted from them.  With
+@code{--session} only that captured session's turns move, and rules
+never do.  No column records which session a memory came from; engram
+re-reads the transcript and re-derives the turn ids exactly as
+@command{engram ingest} derived them, so the session must still be on
+disk.  A Claude Code session is found by its id in any project
+directory, wherever it started; for other harnesses, @code{--cwd} names
+the directory whose transcripts hold it.
+
+The command reports and writes nothing unless @code{--yes} is given;
+@code{--dry-run} overrides @code{--yes}.  Everything happens in one
+transaction.  Three outcomes are errors rather than empty successes:
+an unknown or empty source scope (exit code 3, since that is almost
+always a typo), identical or blank scopes (exit code 2), and a rule id
+present in both scopes (exit code 5, nothing moved --- rule ids are
+unique per scope, and moving everything but the rules would split one
+scope's policy across two).
+
+The full-text index and the vector table record no scope, so they need
+no change; supersession history and access counters move with each
+row.  When rules move, run @command{engram rule sync} in both projects
+afterwards.  Like @command{consolidate}, the command is CLI-only.
+
 @section engram rule
 
 @cindex rule command

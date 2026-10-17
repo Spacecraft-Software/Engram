@@ -54,6 +54,25 @@ pub struct Memory {
     pub superseded_by: Option<String>,
 }
 
+/// What [`Store::rescope`] moved, or would move.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RescopeReport {
+    /// Non-rule memories selected for the move.
+    pub memories: usize,
+    /// Rule rows selected for the move. Always 0 for a session-limited move:
+    /// rules are not conversation turns.
+    pub rules: usize,
+    /// Extracted facts whose parent memory is selected. They follow their
+    /// parent, so `context`'s fact channel keeps finding them.
+    pub facts: usize,
+    /// Rule ids present in both scopes. Rule ids are unique per scope, so any
+    /// conflict refuses the whole move — moving the rest and leaving the
+    /// rules behind would split one scope's policy across two.
+    pub conflicts: Vec<String>,
+    /// Whether the rows were actually moved.
+    pub applied: bool,
+}
+
 /// One transcript turn on its way into the store, with a caller-supplied
 /// deterministic id (see [`Store::ingest_turns`]).
 #[derive(Debug, Clone)]
@@ -720,6 +739,103 @@ impl Store {
         let mut out: Vec<Memory> = rows.collect::<Result<_, _>>()?;
         out.reverse(); // chronological for reading back into a prompt
         Ok(out)
+    }
+
+    /// Moves memories from scope `from` to scope `to`, with the facts
+    /// extracted from them.
+    ///
+    /// `only` limits the move to those memory ids (a session's turn ids);
+    /// `None` moves the whole scope, rules included. With `apply` false
+    /// nothing is written and the report says what would move. Everything
+    /// happens in one transaction, so a refused or failed move leaves both
+    /// scopes as they were.
+    ///
+    /// What does *not* need to follow: the FTS index covers `content` only,
+    /// and `memory_vectors` is keyed by memory id — neither records a scope.
+    /// Supersession and access-tracking columns are untouched, so a moved
+    /// memory keeps its history and its decay signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `rusqlite` error if a statement fails.
+    pub fn rescope(
+        &mut self,
+        from: &str,
+        to: &str,
+        only: Option<&[String]>,
+        apply: bool,
+    ) -> rusqlite::Result<RescopeReport> {
+        let tx = self.conn.transaction()?;
+        // One selection table serves both shapes of the move, so the counts,
+        // the conflict check, and the updates cannot disagree about what was
+        // selected. TEMP lives in the connection's temp database: building it
+        // writes nothing to the store, which keeps a preview read-only.
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS rescope_selection (id TEXT PRIMARY KEY);
+             DELETE FROM rescope_selection;",
+        )?;
+        match only {
+            None => {
+                tx.execute(
+                    "INSERT INTO rescope_selection SELECT id FROM memories WHERE scope = ?1",
+                    [from],
+                )?;
+            }
+            Some(ids) => {
+                let mut select = tx.prepare(
+                    "INSERT OR IGNORE INTO rescope_selection
+                     SELECT id FROM memories WHERE id = ?1 AND scope = ?2 AND rule_id IS NULL",
+                )?;
+                for id in ids {
+                    select.execute(params![id, from])?;
+                }
+            }
+        }
+
+        let count = |sql: &str| -> rusqlite::Result<usize> {
+            tx.query_row(sql, [], |r| r.get::<_, i64>(0))
+                .map(|n| usize::try_from(n).unwrap_or(0))
+        };
+        let mut report = RescopeReport {
+            memories: count(
+                "SELECT COUNT(*) FROM memories
+                 WHERE id IN (SELECT id FROM rescope_selection) AND rule_id IS NULL",
+            )?,
+            rules: count(
+                "SELECT COUNT(*) FROM memories
+                 WHERE id IN (SELECT id FROM rescope_selection) AND rule_id IS NOT NULL",
+            )?,
+            facts: count(
+                "SELECT COUNT(*) FROM facts WHERE memory_id IN (SELECT id FROM rescope_selection)",
+            )?,
+            ..RescopeReport::default()
+        };
+        {
+            let mut stmt = tx.prepare(
+                "SELECT a.rule_id FROM memories a
+                 JOIN memories b ON b.scope = ?1 AND b.rule_id = a.rule_id
+                 WHERE a.id IN (SELECT id FROM rescope_selection)
+                 ORDER BY a.rule_id",
+            )?;
+            report.conflicts = stmt
+                .query_map([to], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+
+        if apply && report.conflicts.is_empty() {
+            tx.execute(
+                "UPDATE facts SET scope = ?1 WHERE memory_id IN (SELECT id FROM rescope_selection)",
+                [to],
+            )?;
+            tx.execute(
+                "UPDATE memories SET scope = ?1 WHERE id IN (SELECT id FROM rescope_selection)",
+                [to],
+            )?;
+            report.applied = true;
+        }
+        tx.execute_batch("DELETE FROM rescope_selection;")?;
+        tx.commit()?;
+        Ok(report)
     }
 
     /// One transcript turn on its way into the store.

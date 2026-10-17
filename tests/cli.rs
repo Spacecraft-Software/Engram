@@ -4108,3 +4108,305 @@ fn a_linked_worktree_takes_its_repository_scope() {
     );
     assert!(!main.join("AGENTS.md").exists());
 }
+
+fn remember_in(db: &Path, scope: &str, text: &str) {
+    engram(db)
+        .args(["remember", "--agent", "t", "--scope", scope, text])
+        .assert()
+        .success();
+}
+
+fn rule_in(db: &Path, scope: &str, id: &str, text: &str) {
+    engram(db)
+        .args([
+            "rule", "add", "--id", id, "--scope", scope, "--agent", "t", text,
+        ])
+        .assert()
+        .success();
+}
+
+fn rule_count(db: &Path, scope: &str) -> u64 {
+    let assert = engram(db)
+        .args(["rule", "list", "--scope", scope])
+        .assert()
+        .success();
+    parse_single_line_json(&assert.get_output().stdout)["data"]["count"]
+        .as_u64()
+        .expect("count")
+}
+
+fn notes(db: &Path, scope: &str) -> usize {
+    recall_data(db, scope)
+        .iter()
+        .filter(|m| m["role"] != "rule")
+        .count()
+}
+
+fn rescope(db: &Path, args: &[&str]) -> Command {
+    let mut cmd = engram(db);
+    cmd.arg("rescope");
+    cmd.args(args);
+    cmd
+}
+
+/// The whole scope moves — memories, rules, and the facts extracted from
+/// them — but only with `--yes`. Until this existed the only way to fix a
+/// mis-filed scope was a hand-written `UPDATE`.
+#[test]
+fn rescope_moves_a_scope_only_with_consent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    remember_in(&db, "lamprey", "Decided: the sync stays synchronous.");
+    remember_in(&db, "lamprey", "an ordinary note");
+    rule_in(&db, "lamprey", "no-unwrap", "Never unwrap in library code.");
+    engram(&db)
+        .args(["consolidate", "--extract", "--scope", "lamprey"])
+        .assert()
+        .success();
+
+    let assert = rescope(&db, &["--from", "lamprey", "--to", "bravais"])
+        .assert()
+        .success();
+    let out = parse_single_line_json(&assert.get_output().stdout);
+    let data = &out["data"];
+    assert_eq!(data["memories"], 2, "{out}");
+    assert_eq!(data["rules"], 1);
+    assert_eq!(data["facts"], 1);
+    assert_eq!(data["applied"], false);
+    assert_eq!(notes(&db, "lamprey"), 2, "a report must not move anything");
+
+    // --dry-run wins over --yes.
+    rescope(
+        &db,
+        &["--from", "lamprey", "--to", "bravais", "--yes", "--dry-run"],
+    )
+    .assert()
+    .success();
+    assert_eq!(notes(&db, "lamprey"), 2);
+
+    let assert = rescope(&db, &["--from", "lamprey", "--to", "bravais", "--yes"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["applied"], true);
+    assert!(
+        data["next_step"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rule sync"),
+        "moved rules need a sync: {data}"
+    );
+    assert_eq!(notes(&db, "lamprey"), 0);
+    assert_eq!(notes(&db, "bravais"), 2);
+    assert_eq!(rule_count(&db, "bravais"), 1);
+
+    // The facts followed their parents: a preview of the reverse move sees them.
+    let assert = rescope(&db, &["--from", "bravais", "--to", "elsewhere"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["facts"], 1, "{data}");
+
+    // And search still finds the moved text under its new scope.
+    let assert = engram(&db)
+        .args(["search", "synchronous", "--scope", "bravais"])
+        .assert()
+        .success();
+    let hits = parse_single_line_json(&assert.get_output().stdout)["data"]
+        .as_array()
+        .expect("hits")
+        .len();
+    assert_eq!(hits, 1);
+}
+
+/// Rule ids are unique per scope. A clash refuses the whole move — moving
+/// the memories and leaving the rules behind would split one scope's policy.
+#[test]
+fn rescope_refuses_a_rule_id_present_in_both_scopes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    remember_in(&db, "lamprey", "a note");
+    rule_in(&db, "lamprey", "shared-id", "One version.");
+    rule_in(&db, "bravais", "shared-id", "Another version.");
+
+    let assert = rescope(&db, &["--from", "lamprey", "--to", "bravais"])
+        .assert()
+        .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(
+        data["conflicts"][0], "shared-id",
+        "the report names it: {data}"
+    );
+
+    let assert = rescope(
+        &db,
+        &["--from", "lamprey", "--to", "bravais", "--yes", "--json"],
+    )
+    .assert()
+    .code(5);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains("shared-id"), "{stderr}");
+    assert_eq!(notes(&db, "lamprey"), 1, "nothing moved");
+    assert_eq!(rule_count(&db, "lamprey"), 1);
+}
+
+/// A mistyped scope is an error, not a successful move of nothing.
+#[test]
+fn rescope_rejects_an_empty_or_identical_scope() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    remember_in(&db, "lamprey", "a note");
+
+    rescope(&db, &["--from", "lampery", "--to", "bravais", "--yes"])
+        .assert()
+        .code(3);
+    rescope(&db, &["--from", "lamprey", "--to", "lamprey"])
+        .assert()
+        .code(2);
+    rescope(&db, &["--from", "lamprey", "--to", "  "])
+        .assert()
+        .code(2);
+}
+
+/// `--session` moves one captured conversation and nothing else in the scope.
+/// No column records a memory's session; the turn ids are re-derived from the
+/// transcript, exactly as `ingest` derived them.
+#[test]
+fn rescope_session_moves_only_that_sessions_turns() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_claude_transcript(&home, &project, "sess-a");
+    ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "claude-code", "--scope", "lamprey"],
+    )
+    .assert()
+    .success();
+    remember_in(&db, "lamprey", "a note that belongs here");
+    rule_in(
+        &db,
+        "lamprey",
+        "stays-put",
+        "Rules never move with a session.",
+    );
+
+    let assert = rescope(
+        &db,
+        &[
+            "--from",
+            "lamprey",
+            "--to",
+            "bravais",
+            "--session",
+            "sess-a",
+            "--harness",
+            "claude-code",
+            "--yes",
+        ],
+    )
+    .env("HOME", &home)
+    .current_dir(&project)
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["memories"], 4, "{data}");
+    assert_eq!(data["rules"], 0);
+    assert_eq!(data["session"]["id"], "sess-a");
+    assert_eq!(notes(&db, "bravais"), 4);
+    assert_eq!(notes(&db, "lamprey"), 1, "the unrelated note stays");
+    assert_eq!(rule_count(&db, "lamprey"), 1, "the rule stays");
+
+    // A session that cannot be found names where to look.
+    let assert = rescope(
+        &db,
+        &[
+            "--from",
+            "lamprey",
+            "--to",
+            "bravais",
+            "--session",
+            "sess-missing",
+            "--harness",
+            "claude-code",
+            "--json",
+        ],
+    )
+    .env("HOME", &home)
+    .current_dir(&project)
+    .assert()
+    .code(3);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains("--cwd"), "{stderr}");
+}
+
+/// Session-only flags are refused without `--session`, rather than silently
+/// ignored — a caller that passed `--cwd` believed it was doing something.
+#[test]
+fn rescope_session_flags_require_a_session() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    remember_in(&db, "lamprey", "a note");
+    rescope(
+        &db,
+        &["--from", "lamprey", "--to", "bravais", "--cwd", "/tmp"],
+    )
+    .assert()
+    .code(2);
+    assert_eq!(notes(&db, "lamprey"), 1);
+}
+
+/// A Claude Code session is filed under the directory it *started* in. Since
+/// `rescope --session` uses the same id lookup as `ingest`, it finds such a
+/// session from anywhere — the pathfinder case — without `--cwd`.
+#[test]
+fn rescope_session_finds_a_session_filed_under_another_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let launched_at = tmp.path().join("umbrella");
+    std::fs::create_dir_all(&launched_at).expect("create launch dir");
+    plant_claude_transcript(&home, &launched_at, "sess-moved");
+    let cwd = launched_at.to_string_lossy().into_owned();
+    ingest(
+        &db,
+        &home,
+        &project,
+        &[
+            "--harness",
+            "claude-code",
+            "--cwd",
+            &cwd,
+            "--session",
+            "sess-moved",
+            "--scope",
+            "umbrella",
+        ],
+    )
+    .assert()
+    .success();
+
+    let assert = rescope(
+        &db,
+        &[
+            "--from",
+            "umbrella",
+            "--to",
+            "project",
+            "--session",
+            "sess-moved",
+            "--harness",
+            "claude-code",
+            "--yes",
+        ],
+    )
+    .env("HOME", &home)
+    .current_dir(&project)
+    .assert()
+    .success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(data["memories"], 4, "{data}");
+    assert_eq!(notes(&db, "project"), 4);
+}

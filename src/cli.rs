@@ -217,6 +217,63 @@ EXAMPLES:
         #[arg(long)]
         yes: bool,
     },
+    /// Move memories from one scope to another.
+    ///
+    /// For history that landed under the wrong scope — a worktree's slug, or
+    /// the directory a session happened to start in. Moves the scope's
+    /// memories, its rules, and the facts extracted from them, in one
+    /// transaction. Report-only unless --yes is passed; a rule id present in
+    /// both scopes refuses the whole move. With --session, moves only that
+    /// ingested session's turns (never rules), found by re-deriving their ids
+    /// from the transcript. Deliberately CLI-only: a bulk move is an
+    /// operator's job, and the MCP tool surface is at its ceiling.
+    #[command(after_help = "\
+EXAMPLES:
+  # See what would move, then move it.
+  engram rescope --from lamprey --to bravais
+  engram rescope --from lamprey --to bravais --yes
+
+  # Move one captured session (a Claude Code session is found from anywhere).
+  engram rescope --from umbrella --to my-project --session <session-id> --yes
+
+Run `engram rule sync` in the destination project afterwards when rules moved.
+")]
+    Rescope {
+        /// Scope to move memories out of.
+        #[arg(long)]
+        from: String,
+        /// Scope to move them into.
+        #[arg(long)]
+        to: String,
+        /// Move only this ingested session's turns. Rules never move with
+        /// a session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Harness the session was captured from (with --session). Detected
+        /// from the environment, then the filesystem, when omitted.
+        #[arg(long, value_enum, requires = "session")]
+        harness: Option<crate::harness::Harness>,
+        /// Directory whose transcripts hold the session (with --session).
+        /// Defaults to the current directory. Claude Code sessions are also
+        /// searched for by id in every project directory, so this matters
+        /// only for other harnesses.
+        #[arg(long, requires = "session")]
+        cwd: Option<std::path::PathBuf>,
+        /// Refuse a transcript larger than this many bytes (with --session).
+        #[arg(
+            long,
+            requires = "session",
+            default_value_t = crate::transcript::DEFAULT_MAX_BYTES
+        )]
+        max_bytes: u64,
+        /// Report what would move without writing, even with --yes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually move the rows. Consent must be a flag: this process may
+        /// not have a TTY to ask on.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Durable project rules — policy that outlives a session.
     ///
     /// A rule is stored once and rendered into the markdown files agent
