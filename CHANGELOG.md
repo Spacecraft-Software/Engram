@@ -11,6 +11,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Added
+
+- **`engram rescope`** moves mis-filed memories to the scope they belong
+  to: a whole scope (memories, rules, and their extracted facts), or with
+  `--session` only one captured session's turns. Report-only unless
+  `--yes`; a rule id present in both scopes refuses the move. Previously the
+  only fix was a hand-written SQL `UPDATE`. CLI-only.
+
 ### Fixed
 
 - **`--dry-run` claimed every turn was new.** `ingest --dry-run` and

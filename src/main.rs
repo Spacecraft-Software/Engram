@@ -488,12 +488,12 @@ fn run(
                     "note": "every tool's schema costs context on every turn, so the surface is \
                              capped at ten; an eleventh must displace an existing one. save_chat \
                              takes no file argument: the destination is derived server-side.",
-                    "cli_only": ["install", "ingest", "consolidate", "index", "rule purge"]
+                    "cli_only": ["install", "ingest", "consolidate", "index", "rescope", "rule purge"]
                 },
                 "commands": [
                     "remember", "recall", "search", "context", "index", "consolidate",
                     "rule add", "rule list", "rule retire", "rule sync", "rule purge",
-                    "save-chat", "ingest", "mcp", "serve", "schema", "describe"
+                    "save-chat", "ingest", "rescope", "mcp", "serve", "schema", "describe"
                 ],
                 "ingest": {
                     "purpose": "capture a harness's own session transcript into a scope as \
@@ -517,6 +517,16 @@ fn run(
                                    conversation's reading order",
                     "unreadable_harness": "a structured exit-2 error naming the fallback, never \
                                            an empty success",
+                    "cli_only": true
+                },
+                "rescope": {
+                    "purpose": "move a scope's memories, rules and facts into another scope, or \
+                                only one ingested session's turns with --session",
+                    "consent": "report-only unless --yes; --dry-run wins over --yes",
+                    "conflicts": "a rule id present in both scopes refuses the whole move \
+                                  (exit 5), because rule ids are unique per scope",
+                    "untouched": "FTS and vectors record no scope; supersession and access \
+                                  tracking columns are preserved",
                     "cli_only": true
                 },
                 "consolidate": {
@@ -678,6 +688,27 @@ fn run(
                 &store, mode, requested, &session, scope, cwd, opts, list, dry_run,
             )
         }
+
+        Command::Rescope {
+            from,
+            to,
+            session,
+            harness: requested,
+            cwd,
+            max_bytes,
+            dry_run,
+            yes,
+        } => handle_rescope(
+            &store,
+            mode,
+            &from,
+            &to,
+            session.as_deref(),
+            requested,
+            cwd,
+            max_bytes,
+            yes && !dry_run,
+        ),
 
         Command::Import {
             paths,
@@ -881,6 +912,190 @@ fn readable_names() -> String {
         .map(|s| s.name)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `engram rescope` payload.
+#[derive(serde::Serialize)]
+struct RescopeResult {
+    from: String,
+    to: String,
+    /// The session the move was limited to, with how many turns its
+    /// transcript yields — more than `memories` when some were never
+    /// ingested or already live elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<RescopeSession>,
+    #[serde(flatten)]
+    report: store::RescopeReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_step: Option<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct RescopeSession {
+    id: String,
+    path: String,
+    turns: usize,
+}
+
+/// The ids `ingest` gave session `id`'s turns, re-derived from its transcript.
+///
+/// No column records which session a memory came from; the id *is* that
+/// record, because `turn_id` is a pure function of (harness, session,
+/// record). Every optional channel is switched on so turns captured with
+/// `--include-tools` or `--include-thinking` are found too — the options
+/// change which turns exist, never what a turn's id is.
+fn session_turn_ids(
+    requested: Option<harness::Harness>,
+    cwd: Option<std::path::PathBuf>,
+    id: &str,
+    max_bytes: u64,
+) -> Result<(RescopeSession, Vec<String>), Box<AppError>> {
+    let spec = resolve_harness(requested)?;
+    let cwd = cwd
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|e| Box::new(scope_error(e)))?;
+    // The working directory's own sessions first, then — for Claude Code,
+    // which files a session under the directory it *started* in — every
+    // project directory, so a session that moved is still found by its id.
+    let listed = transcript::sessions_for(spec, &cwd)
+        .map_err(|e| Box::new(transcript_error(e, spec.name)))?;
+    let found = transcript::locate_session(spec, listed, id)
+        .map_err(|e| Box::new(transcript_error(e, spec.name)))?
+        .ok_or_else(|| {
+            Box::new(AppError::new(
+                error::ErrorCode::NotFound,
+                3,
+                format!("no {} session '{id}' for {}", spec.name, cwd.display()),
+                "check the id with `engram ingest --list`; for a harness other than Claude \
+                 Code, pass the directory the session started in as --cwd",
+            ))
+        })?;
+    let opts = transcript::ReadOptions {
+        include_thinking: true,
+        include_tools: true,
+        include_sidechains: true,
+        max_bytes,
+        ..transcript::ReadOptions::default()
+    };
+    let read = transcript::read_session(spec, &found, &opts)
+        .map_err(|e| Box::new(transcript_error(e, spec.name)))?;
+    let ids: Vec<String> = read
+        .turns
+        .iter()
+        .map(|t| transcript::turn_id(spec.name, &found.session_id, &t.source_uuid))
+        .collect();
+    Ok((
+        RescopeSession {
+            id: found.session_id,
+            path: found.path,
+            turns: ids.len(),
+        },
+        ids,
+    ))
+}
+
+/// Handles `engram rescope`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the flat CLI surface; bundling into a struct only renames the arguments"
+)]
+fn handle_rescope(
+    store: &Arc<Mutex<Store>>,
+    mode: OutputMode,
+    from: &str,
+    to: &str,
+    session: Option<&str>,
+    requested: Option<harness::Harness>,
+    cwd: Option<std::path::PathBuf>,
+    max_bytes: u64,
+    apply: bool,
+) -> i32 {
+    let (from, to) = (from.trim(), to.trim());
+    if from.is_empty() || to.is_empty() || from == to {
+        return fail(
+            AppError::new(
+                error::ErrorCode::InvalidArgument,
+                2,
+                "rescope needs two different, non-empty scopes",
+                "pass --from <scope it is in now> --to <scope it belongs in>",
+            ),
+            mode,
+        );
+    }
+
+    let (session_info, ids) = match session {
+        Some(id) => match session_turn_ids(requested, cwd, id, max_bytes) {
+            Ok((info, ids)) => (Some(info), Some(ids)),
+            Err(e) => return fail(*e, mode),
+        },
+        None => (None, None),
+    };
+
+    let report = {
+        let mut guard = store.lock().expect("store lock poisoned");
+        match guard.rescope(from, to, ids.as_deref(), apply) {
+            Ok(r) => r,
+            Err(e) => return fail(AppError::from(e), mode),
+        }
+    };
+
+    // Nothing selected is almost always a mistyped scope; succeeding with
+    // zeros would read as "done".
+    if report.memories + report.rules == 0 {
+        let message = match &session_info {
+            Some(s) => format!(
+                "none of session {}'s {} turns are in scope '{from}'",
+                s.id, s.turns
+            ),
+            None => format!("scope '{from}' holds no memories"),
+        };
+        return fail(
+            AppError::new(
+                error::ErrorCode::NotFound,
+                3,
+                message,
+                "`engram search <words> --json` shows which scope a memory is in",
+            ),
+            mode,
+        );
+    }
+    if apply && !report.conflicts.is_empty() {
+        return fail(
+            AppError::new(
+                error::ErrorCode::Conflict,
+                5,
+                format!(
+                    "both scopes hold rule(s) {}; nothing was moved",
+                    report.conflicts.join(", ")
+                ),
+                "keep one copy: retire the other (`engram rule retire --id <id> --scope \
+                 <scope>`) and purge it (`engram rule purge`), in either scope, then re-run — \
+                 a retired rule still holds its id until it is purged",
+            ),
+            mode,
+        );
+    }
+
+    let next_step = if !report.applied {
+        Some("nothing was moved; pass --yes to move these rows")
+    } else if report.rules > 0 {
+        Some("rules moved: run `engram rule sync` in both projects so their AGENTS.md agree")
+    } else {
+        None
+    };
+    let applied = report.applied;
+    let resp = Response::new(
+        "engram rescope",
+        RescopeResult {
+            from: from.to_string(),
+            to: to.to_string(),
+            session: session_info,
+            report,
+            next_step,
+        },
+    );
+    emit_ok(if applied { resp } else { resp.with_dry_run() }, mode);
+    0
 }
 
 /// Turns a [`transcript::TranscriptError`] into a structured CLI error.
