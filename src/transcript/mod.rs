@@ -400,6 +400,50 @@ pub fn normalize_text(raw: &str, max_chars: usize, stats: &mut FilterStats) -> O
     Some(trimmed.to_string())
 }
 
+/// Environment variable Claude Code sets, in every process it spawns, to the
+/// id of the session doing the spawning.
+pub const CLAUDE_CODE_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+
+/// The id of the session this process is running inside, when the harness
+/// says so.
+///
+/// Only Claude Code is consulted: the variable is its own, and a fork such as
+/// OpenClaude may share the reader without sharing the variable.
+#[must_use]
+pub fn own_session_id(spec: &HarnessSpec) -> Option<String> {
+    if spec.id != Harness::ClaudeCode {
+        return None;
+    }
+    std::env::var(CLAUDE_CODE_SESSION_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Finds session `id`: first among `listed` (the working directory's own
+/// sessions), then anywhere the harness keeps transcripts.
+///
+/// The second step exists for Claude Code only (see
+/// [`claude_code::find_by_id`]); other harnesses either have no such split or
+/// key their stores differently, and get the listing alone.
+///
+/// # Errors
+///
+/// Propagates a [`TranscriptError`] from the wider search.
+pub fn locate_session(
+    spec: &HarnessSpec,
+    listed: Vec<SessionRef>,
+    id: &str,
+) -> Result<Option<SessionRef>, TranscriptError> {
+    if let Some(found) = listed.into_iter().find(|s| s.session_id == id) {
+        return Ok(Some(found));
+    }
+    match spec.transcript {
+        TranscriptSupport::Reader(ReaderKind::ClaudeCode) => claude_code::find_by_id(spec, id),
+        _ => Ok(None),
+    }
+}
+
 /// Lists the transcripts a harness holds for a working directory.
 ///
 /// # Errors
@@ -465,6 +509,11 @@ pub struct CaptureSummary {
     pub sessions: Vec<CapturedSession>,
     pub inserted: usize,
     pub skipped_existing: usize,
+    /// Skipped turns already stored under another scope. Non-empty means a
+    /// re-capture under a new scope moved nothing — see
+    /// [`crate::store::IngestReport::existing_in_other_scopes`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub existing_in_other_scopes: std::collections::BTreeMap<String, usize>,
     pub filtered: FilterStats,
     /// Credential-shaped substrings replaced before storage, by kind.
     #[serde(skip_serializing_if = "redact::Redactions::is_empty")]
@@ -483,9 +532,9 @@ pub struct CapturedSession {
 /// Reads the given sessions and stores their turns in `scope`.
 ///
 /// The single write path for transcript capture. A `dry_run` still performs
-/// the whole read, filter, redaction, and id derivation — only the
-/// transaction is skipped — so a preview exercises the same code as the real
-/// thing rather than a parallel approximation of it.
+/// the whole read, filter, redaction, and id derivation, and consults the
+/// store for which turns already exist — only the transaction is skipped — so
+/// a preview reports the figures the real run will.
 ///
 /// # Errors
 ///
@@ -500,6 +549,7 @@ pub fn capture(
     dry_run: bool,
 ) -> Result<CaptureSummary, CaptureError> {
     let mut summary = CaptureSummary::default();
+    let mut pending = std::collections::HashSet::new();
 
     for session in sessions {
         let result = read_session(spec, session, opts).map_err(CaptureError::Transcript)?;
@@ -518,20 +568,24 @@ pub fn capture(
             })
             .collect();
 
-        let report = if dry_run {
-            crate::store::IngestReport {
-                inserted: rows.len(),
-                skipped_existing: 0,
-            }
-        } else {
+        let report = {
             let mut guard = store.lock().expect("store lock poisoned");
-            guard
-                .ingest_turns(scope, &rows)
-                .map_err(CaptureError::Storage)?
+            if dry_run {
+                guard.preview_turns(scope, &rows, &mut pending)
+            } else {
+                guard.ingest_turns(scope, &rows)
+            }
+            .map_err(CaptureError::Storage)?
         };
 
         summary.inserted += report.inserted;
         summary.skipped_existing += report.skipped_existing;
+        for (other, n) in &report.existing_in_other_scopes {
+            *summary
+                .existing_in_other_scopes
+                .entry(other.clone())
+                .or_default() += n;
+        }
         summary.sessions.push(CapturedSession {
             session_id: session.session_id.clone(),
             path: session.path.clone(),

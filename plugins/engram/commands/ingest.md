@@ -15,11 +15,11 @@ working-tree name, or the current directory name.
 
 2. Preview the capture:
 
-   !`engram --db {{DB}} ingest --harness {{HARNESS}} --dry-run`
+   !`engram --db {{DB}} ingest --harness {{HARNESS}} --scope "$1" --dry-run`
 
 3. If the user is happy with the preview, capture for real:
 
-   !`engram --db {{DB}} ingest --harness {{HARNESS}}`
+   !`engram --db {{DB}} ingest --harness {{HARNESS}} --scope "$1"`
 
 Report the number inserted and skipped. `skipped_existing` counting most of
 the turns means this session was already captured — that is the expected

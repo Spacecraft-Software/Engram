@@ -1297,7 +1297,12 @@ The explicit @code{--scope} argument.
 @item
 The @env{ENGRAM_SCOPE} environment variable.
 @item
-The git working-tree basename.
+The git working-tree basename (@code{git-root}) --- or, in a linked
+worktree, the name of the repository it belongs to
+(@code{git-worktree}).  A worktree's own directory name is usually a
+throwaway slug, and naming a scope after it splits one project's history
+across scopes.  Only the name changes: @command{rule sync} still writes
+into the worktree.  A submodule keeps its own name.
 @item
 The current directory basename.
 @end enumerate

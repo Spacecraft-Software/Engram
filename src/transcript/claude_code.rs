@@ -117,6 +117,60 @@ pub fn sessions(spec: &HarnessSpec, cwd: &Path) -> Result<Vec<SessionRef>, Trans
     Ok(found.into_iter().map(|(s, _)| s).collect())
 }
 
+/// Finds the transcript for session `id` under *any* project directory.
+///
+/// Claude Code files a session under the directory it was **started** in and
+/// never moves it, while `engram ingest` runs wherever the shell is now. The
+/// two part company whenever a session changes directory: one launched at
+/// `/spacecraft-software` and then working in `pathfinder` keeps writing
+/// `-spacecraft-software/<id>.jsonl`, and a lookup by the current directory
+/// reports `NOT_FOUND`. The same happens to a session whose worktree is later
+/// resumed from the parent checkout. A session id is unique across
+/// directories, so searching every one by id is both safe and exact.
+///
+/// `id` must look like a file stem — ASCII alphanumerics, `-` and `_` only —
+/// because it is joined into a path; anything else finds nothing rather than
+/// becoming a traversal.
+///
+/// # Errors
+///
+/// Returns [`TranscriptError::NoHome`] when `$HOME` cannot be resolved, or an
+/// I/O error other than a missing projects directory.
+pub fn find_by_id(spec: &HarnessSpec, id: &str) -> Result<Option<SessionRef>, TranscriptError> {
+    let plausible = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !plausible {
+        return Ok(None);
+    }
+    let base = harness::sessions_dir(spec).ok_or(TranscriptError::NoHome)?;
+    let projects = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(TranscriptError::Io(e)),
+    };
+    let file = format!("{id}.jsonl");
+    for project in projects {
+        let path = project.map_err(TranscriptError::Io)?.path().join(&file);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_file() {
+            return Ok(Some(SessionRef {
+                harness: spec.id,
+                session_id: id.to_string(),
+                path: path_string(&path),
+                // The directory name is a lossy mangling with no inverse, so
+                // the session's cwd is genuinely unknown here.
+                cwd: None,
+                bytes: meta.len(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Reads one transcript file into turns.
 ///
 /// # Errors
