@@ -4410,3 +4410,36 @@ fn rescope_session_finds_a_session_filed_under_another_directory() {
     assert_eq!(data["memories"], 4, "{data}");
     assert_eq!(notes(&db, "project"), 4);
 }
+
+/// Outside a git tree a project's archives sit in `<project>/chat/`, and the
+/// scope cascade's last step names the directory — so every such project was
+/// filed under one scope called `chat`. The chat directory's parent is the
+/// project. `chats/` is the same container under another name.
+#[test]
+fn import_files_a_non_git_chat_dir_under_its_parent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    // Deliberately no `pinned_project`: the case under test is the absence of
+    // any git tree, which the system temp dir provides.
+    let alpha = tmp.path().join("alpha");
+    let beta = tmp.path().join("beta");
+    plant_archive(&alpha, "a.texi", ARCHIVE);
+    let chats = beta.join("chats");
+    std::fs::create_dir_all(&chats).expect("create chats dir");
+    std::fs::write(
+        chats.join("b.texi"),
+        ARCHIVE.replace("please fix", "please test"),
+    )
+    .expect("write archive");
+
+    let a = alpha.join("chat").to_string_lossy().into_owned();
+    let b = chats.to_string_lossy().into_owned();
+    let assert = import(&db, tmp.path(), &[&a, &b]).assert().success();
+    let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
+    assert_eq!(
+        data["scopes"],
+        serde_json::json!(["alpha", "beta"]),
+        "{data}"
+    );
+    assert_eq!(data["files"][0]["scope"], "alpha");
+}

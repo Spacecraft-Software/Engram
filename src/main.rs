@@ -1871,6 +1871,37 @@ struct ImportResult {
     redactions: transcript::redact::Redactions,
 }
 
+/// Directory names that hold saved conversations rather than name a project.
+///
+/// `save-chat` writes `chat/`; hand-saved exports turn up in `chats/` too.
+const CHAT_DIR_NAMES: [&str; 2] = ["chat", "chats"];
+
+/// The scope an export in `dir` belongs to.
+///
+/// The ordinary cascade, with one correction. Outside a git working tree the
+/// cascade falls back to the directory's own name, and for an export that
+/// directory is almost always `chat/` — so every non-git project's archives
+/// collapsed into one scope literally named `chat` (three projects at once
+/// on the author's machine). A chat directory is a container, not a project:
+/// its parent is.
+///
+/// Only the cwd fallback is corrected. Inside a git tree the cascade already
+/// names the repository, and a repository that is itself called `chat` keeps
+/// that name.
+fn import_scope(explicit: Option<&str>, dir: &std::path::Path) -> rules::ResolvedScope {
+    let resolved = rules::resolve_scope_in(explicit, dir);
+    let in_chat_dir = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| CHAT_DIR_NAMES.contains(&n));
+    match (resolved.origin, dir.parent()) {
+        (rules::ScopeOrigin::Cwd, Some(project)) if in_chat_dir => {
+            rules::resolve_scope_in(explicit, project)
+        }
+        _ => resolved,
+    }
+}
+
 /// Collects the files an import should consider.
 ///
 /// Walks with `std::fs` and therefore ignores `.gitignore` entirely, which is
@@ -1962,7 +1993,7 @@ fn handle_import(
         // under the wrong name.
         let base = path.parent().unwrap_or(&path);
         let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-        let resolved = rules::resolve_scope_in(scope.as_deref(), &base);
+        let resolved = import_scope(scope.as_deref(), &base);
 
         let approximate = messages.iter().any(|m| m.approximate);
         let mut rows: Vec<store::IngestTurn> = Vec::with_capacity(messages.len());
