@@ -21,6 +21,11 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Fixed
 
+- **`import` filed non-git projects under a scope named `chat`.** Outside a
+  git tree, scope fell back to the export's own directory, which is
+  `chat/` (or `chats/`) — so several projects' archives merged into one
+  scope. The chat directory's parent now names the project.
+
 - **`--dry-run` claimed every turn was new.** `ingest --dry-run` and
   `import --dry-run` never consulted the store, so a preview reported
   `inserted: 403, skipped_existing: 0` seconds before the real run inserted 5.
