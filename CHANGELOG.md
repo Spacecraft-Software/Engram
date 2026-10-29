@@ -13,6 +13,15 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **Antigravity transcripts.** `engram ingest --harness antigravity` reads
+  the JSON Lines log each conversation keeps under the CLI, legacy and IDE
+  brain roots, instead of exiting 2 with "has no transcript reader".
+  Sessions match the working directory exactly through Antigravity's own
+  summaries database. A conversation with no recorded workspace is
+  reachable with `--session <id>`. Subagent conversations are side chains,
+  and IDE replays are stored once. A new `filtered.pending` counter reports
+  records the harness was still writing.
+
 - **`engram rescope`** moves mis-filed memories to the scope they belong
   to: a whole scope (memories, rules, and their extracted facts), or with
   `--session` only one captured session's turns. Report-only unless
@@ -20,6 +29,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
   only fix was a hand-written SQL `UPDATE`. CLI-only.
 
 ### Fixed
+
+- **Nine new Claude Code record types read as a format change.**
+  `api-request`, `api-request-blob`, `api-request-shape`,
+  `history-suppression` (written when `/login` switches organizations),
+  `frame-link`, `tools-used`, `artifact-autoreact-ledger`,
+  `artifact-comment-monitor` and `continued-in` were counted as
+  `unknown_record`, so every ingest reported thousands of false alarms. They
+  are non-messages now. None was conversation, so no turn was lost.
 
 - **`import` filed non-git projects under a scope named `chat`.** Outside a
   git tree, scope fell back to the export's own directory, which is
