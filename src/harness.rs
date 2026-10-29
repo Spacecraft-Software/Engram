@@ -70,6 +70,7 @@ pub enum Harness {
 pub enum ReaderKind {
     ClaudeCode,
     Codex,
+    Antigravity,
     /// Serves Opencode and Z.ai's Z Code, which share one schema.
     Opencode,
     Goose,
@@ -195,8 +196,8 @@ pub enum McpConfigSource {
 
 /// Every harness engram recognizes, in a stable order.
 ///
-/// The three entries with no transcript reader are listed deliberately rather
-/// than omitted: `--list` reporting "antigravity: present, no reader, here is
+/// Entries with no transcript reader are listed deliberately rather
+/// than omitted: `--list` reporting "cursor: present, no reader, here is
 /// why" is honest, whereas silently not mentioning it reads as a bug.
 pub const ALL: &[HarnessSpec] = &[
     HarnessSpec {
@@ -351,11 +352,13 @@ pub const ALL: &[HarnessSpec] = &[
     HarnessSpec {
         id: Harness::Antigravity,
         name: "antigravity",
-        probe: &[".gemini/antigravity", ".antigravity"],
-        sessions_dir: None,
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "antigravity writes a plain JSONL transcript at antigravity-cli/brain/<conversation>/.system_generated/logs/transcript.jsonl (54 on this machine) alongside its protobuf stores; a reader is not written yet. Conversations without a brain transcript stay unreadable — the .pb files and the BLOB columns of conversations/<uuid>.db are protobuf",
-        },
+        probe: &[
+            ".gemini/antigravity-cli",
+            ".gemini/antigravity",
+            ".antigravity",
+        ],
+        sessions_dir: Some(".gemini/antigravity-cli/brain"),
+        transcript: TranscriptSupport::Reader(ReaderKind::Antigravity),
         command_surface: CommandSurface::Plugin {
             dir: ".gemini/config/plugins",
         },

@@ -1973,7 +1973,7 @@ fn ingest_from_a_readerless_harness_is_exit_2_with_a_fallback() {
     // readers land, which is the point — it must never be padded with a
     // harness engram can now read, or the test would assert a refusal that
     // should no longer happen.
-    for harness in ["antigravity", "cursor", "kimi", "vscode"] {
+    for harness in ["cursor", "kimi", "vscode"] {
         let assert = ingest(&db, &home, &project, &["--harness", harness, "--list"])
             .assert()
             .failure()
@@ -2001,6 +2001,359 @@ fn ingest_from_a_readerless_harness_is_exit_2_with_a_fallback() {
             "{harness} hint lacks a fallback: {hint}"
         );
     }
+}
+
+/// Synthetic brain logs only: no developer transcript or summaries DB is copied.
+fn plant_antigravity(home: &Path, root: &str, id: &str, text: &str) -> std::path::PathBuf {
+    let path = home
+        .join(".gemini")
+        .join(root)
+        .join("brain")
+        .join(id)
+        .join(".system_generated/logs/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("logs");
+    std::fs::write(&path, text).expect("transcript");
+    path
+}
+
+fn antigravity_summary(home: &Path, root: &str, id: &str, uris: &str, parent: &str, depth: i64) {
+    let path = home
+        .join(".gemini")
+        .join(root)
+        .join("conversation_summaries.db");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("root");
+    let conn = rusqlite::Connection::open(path).expect("summaries");
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS conversation_summaries (
+        conversation_id TEXT PRIMARY KEY, workspace_uris TEXT, parent_conversation_id TEXT, nesting_depth INTEGER);")
+        .expect("schema");
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![id, uris, parent, depth],
+    )
+    .expect("summary row");
+}
+
+fn antigravity_line(step: i64, status: &str, text: &str) -> String {
+    serde_json::json!({"step_index": step, "type": "PLANNER_RESPONSE", "source": "synthetic",
+        "status": status, "created_at": "2026-10-01T12:00:00Z", "content": text})
+    .to_string()
+}
+
+#[test]
+fn antigravity_lists_exact_workspaces_and_finds_unattributed_sessions_by_id() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let line = antigravity_line(0, "DONE", "synthetic reply");
+    let uri = format!("file://{}", project.display());
+    for (root, id, uris) in [
+        (
+            "antigravity-cli",
+            "cli-id",
+            serde_json::json!([uri]).to_string(),
+        ),
+        (
+            "antigravity",
+            "legacy-id",
+            serde_json::json!([format!("{uri}/project.code-workspace")]).to_string(),
+        ),
+        ("antigravity-cli", "empty-id", "[]".to_string()),
+        ("antigravity-cli", "blank-id", "".to_string()),
+        ("antigravity-cli", "invalid-id", "not JSON".to_string()),
+    ] {
+        plant_antigravity(&home, root, id, &line);
+        antigravity_summary(&home, root, id, &uris, "", 0);
+    }
+    plant_antigravity(&home, "antigravity-ide", "ide-id", &line);
+    plant_antigravity(&home, "antigravity-cli", "no-row-id", &line);
+    plant_antigravity(&home, "antigravity-cli-backup", "backup-id", &line);
+    antigravity_summary(
+        &home,
+        "antigravity-cli-backup",
+        "backup-id",
+        &serde_json::json!([uri]).to_string(),
+        "",
+        0,
+    );
+    antigravity_summary(
+        &home,
+        "antigravity-cli",
+        "no-file-id",
+        &serde_json::json!([uri]).to_string(),
+        "",
+        0,
+    );
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "antigravity", "--list"],
+    )
+    .assert()
+    .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let sessions = json["data"]["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 2, "{json}");
+    for id in ["cli-id", "legacy-id"] {
+        assert!(sessions.iter().any(|s| s["session_id"] == id), "{json}");
+    }
+    let child = project.join("child");
+    std::fs::create_dir_all(&child).expect("child");
+    let assert = ingest(&db, &home, &child, &["--harness", "antigravity", "--list"])
+        .assert()
+        .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["sessions"], serde_json::json!([]));
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &[
+            "--harness",
+            "antigravity",
+            "--session",
+            "ide-id",
+            "--scope",
+            "ag",
+        ],
+    )
+    .assert()
+    .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["inserted"], 1, "{json}");
+    for invalid in ["../ide-id", "id/other", ".."] {
+        ingest(
+            &db,
+            &home,
+            &project,
+            &["--harness", "antigravity", "--session", invalid],
+        )
+        .assert()
+        .code(3);
+    }
+}
+
+#[test]
+fn antigravity_pending_then_done_ingestion_is_idempotent_and_keeps_source_order() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let pending = antigravity_line(8, "RUNNING", "first");
+    let done = antigravity_line(8, "DONE", "first");
+    let path = plant_antigravity(&home, "antigravity-cli", "live-id", &pending);
+    antigravity_summary(
+        &home,
+        "antigravity-cli",
+        "live-id",
+        &serde_json::json!([format!("file://{}", project.display())]).to_string(),
+        "",
+        0,
+    );
+    let args = [
+        "--harness",
+        "antigravity",
+        "--session",
+        "live-id",
+        "--scope",
+        "ag",
+    ];
+    let assert = ingest(&db, &home, &project, &args).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["inserted"], 0);
+    assert_eq!(json["data"]["filtered"]["pending"], 1);
+    let second = antigravity_line(9, "DONE", "second");
+    let restarted = antigravity_line(0, "DONE", "third");
+    std::fs::write(
+        &path,
+        format!("{done}\n{second}\n{done}\n{restarted}\n{{torn\n"),
+    )
+    .expect("complete");
+    let assert = ingest(&db, &home, &project, &args).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["inserted"], 3, "{json}");
+    assert_eq!(json["data"]["filtered"]["non_message"], 1);
+    assert_eq!(json["data"]["filtered"]["torn_line"], 1);
+    let assert = ingest(&db, &home, &project, &args).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["inserted"], 0, "{json}");
+    let assert = engram(&db)
+        .args(["recall", "--scope", "ag"])
+        .assert()
+        .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let rows = json["data"].as_array().expect("memories");
+    for (index, text) in ["first", "second", "third"].iter().enumerate() {
+        assert_eq!(rows[index]["content"], *text);
+        assert_eq!(
+            rows[index]["created_at"],
+            format!("2026-10-01T12:00:00.{index:03}Z")
+        );
+    }
+}
+
+#[test]
+fn antigravity_nested_sessions_are_filtered_unless_requested() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let line = antigravity_line(0, "DONE", "nested reply");
+    let uri = serde_json::json!([format!("file://{}", project.display())]).to_string();
+    for (id, parent, depth) in [("parent-id", "outer", 0), ("depth-id", "", 1)] {
+        plant_antigravity(&home, "antigravity-cli", id, &line);
+        antigravity_summary(&home, "antigravity-cli", id, &uri, parent, depth);
+    }
+    let args = [
+        "--harness",
+        "antigravity",
+        "--session",
+        "all",
+        "--scope",
+        "ag",
+    ];
+    let assert = ingest(&db, &home, &project, &args).assert().success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["inserted"], 0, "{json}");
+    assert_eq!(json["data"]["filtered"]["sidechain"], 2, "{json}");
+    let assert = ingest(&db, &home, &project, &args)
+        .arg("--include-sidechains")
+        .assert()
+        .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    assert_eq!(json["data"]["inserted"], 2, "{json}");
+}
+
+#[test]
+fn antigravity_broken_summaries_db_errors_name_the_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_antigravity(
+        &home,
+        "antigravity-cli",
+        "id",
+        &antigravity_line(0, "DONE", "reply"),
+    );
+    let path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    let conn = rusqlite::Connection::open(&path).expect("DB");
+    conn.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY)")
+        .expect("bad schema");
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "antigravity", "--list"],
+    )
+    .assert()
+    .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains(path.to_str().expect("path")), "{stderr}");
+    assert!(stderr.contains("workspace_uris"), "{stderr}");
+    assert!(assert.get_output().stdout.is_empty());
+}
+
+#[test]
+fn antigravity_cli_flags_keep_only_safe_prose_and_tool_summaries() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    let mut planner: Value =
+        serde_json::from_str(&antigravity_line(1, "DONE", "reply")).expect("JSON");
+    planner["thinking"] = serde_json::json!("optional reasoning");
+    planner["tool_calls"] =
+        serde_json::json!([{"name": "read_file", "arguments": "private arguments"}]);
+    let user = serde_json::json!({"type": "USER_INPUT", "status": "DONE", "step_index": 0,
+        "created_at": "2026-10-01T12:00:00Z", "source": "user",
+        "content": "<USER_REQUEST>hello ghp_abcdefghijklmnopqrstuvwxyz1234567890</USER_REQUEST><USER_SETTINGS_CHANGE>private settings</USER_SETTINGS_CHANGE>"});
+    let tool = serde_json::json!({"type": "RUN_COMMAND", "status": "ERROR", "step_index": 2,
+        "created_at": "2026-10-01T12:00:00Z", "source": "tool", "content": "private tool payload"});
+    let path = plant_antigravity(
+        &home,
+        "antigravity-ide",
+        "safe-id",
+        &format!("{user}\n{planner}\n{tool}\n"),
+    );
+    let base = [
+        "--harness",
+        "antigravity",
+        "--session",
+        "safe-id",
+        "--scope",
+        "ag",
+    ];
+    ingest(&db, &home, &project, &base)
+        .args(["--include-tools", "--include-thinking"])
+        .assert()
+        .success();
+    let assert = engram(&db)
+        .args(["recall", "--scope", "ag"])
+        .assert()
+        .success();
+    let json = parse_single_line_json(&assert.get_output().stdout);
+    let rows = json["data"].as_array().expect("rows");
+    assert_eq!(rows.len(), 3);
+    let output = json.to_string();
+    for excluded in [
+        "private arguments",
+        "private tool payload",
+        "private settings",
+        "ghp_",
+    ] {
+        assert!(!output.contains(excluded), "{output}");
+    }
+    assert_eq!(
+        rows[1]["content"],
+        "optional reasoning\nreply\n[tool_use: read_file]"
+    );
+    assert_eq!(rows[2]["content"], "[RUN_COMMAND: 20 bytes]");
+    // Invalid source time is an error at the command surface as well.
+    planner["created_at"] = serde_json::json!("bad time");
+    std::fs::write(path, planner.to_string()).expect("write");
+    let assert = ingest(&db, &home, &project, &base).assert().failure();
+    assert!(String::from_utf8_lossy(&assert.get_output().stderr).contains("bad time"));
+}
+
+#[test]
+fn antigravity_locked_or_unopenable_summaries_are_errors() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_antigravity(
+        &home,
+        "antigravity-cli",
+        "id",
+        &antigravity_line(0, "DONE", "reply"),
+    );
+    let path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    let conn = rusqlite::Connection::open(&path).expect("DB");
+    conn.execute_batch(
+        "CREATE TABLE conversation_summaries (conversation_id TEXT, workspace_uris TEXT,
+        parent_conversation_id TEXT, nesting_depth INTEGER); BEGIN EXCLUSIVE;",
+    )
+    .expect("lock DB");
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "antigravity", "--list"],
+    )
+    .assert()
+    .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains(path.to_str().expect("path")), "{stderr}");
+    assert!(stderr.contains("locked"), "{stderr}");
+    drop(conn);
+    std::fs::remove_file(&path).expect("remove temporary DB");
+    std::fs::create_dir(&path).expect("unopenable DB path");
+    let assert = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "antigravity", "--list"],
+    )
+    .assert()
+    .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains(path.to_str().expect("path")), "{stderr}");
 }
 
 #[test]
