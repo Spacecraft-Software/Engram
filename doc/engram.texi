@@ -832,8 +832,10 @@ Losing messages quietly is the one behaviour this command must not have.
 
 @cindex Claude Code transcripts
 @cindex Codex transcripts
-Readers exist for Claude Code and Codex.  They locate a session quite
-differently, and neither approach generalizes to the other:
+@cindex Antigravity transcripts
+Readers exist for Claude Code, Codex, and Antigravity, among others.
+They locate a session quite differently, and no approach generalizes to
+the others:
 
 @table @asis
 @item Claude Code
@@ -847,6 +849,31 @@ The directory tree records the date rather than the working directory, so
 there is nothing to reverse.  Each rollout opens with a record stating its
 working directory verbatim, and listing reads exactly that one line from
 each file.
+
+@item Antigravity
+Each conversation keeps a JSON Lines log at
+@file{brain/@var{conversation}/.system_generated/logs/transcript.jsonl},
+under three roots: @file{~/.gemini/antigravity-cli},
+@file{~/.gemini/antigravity}, and @file{~/.gemini/antigravity-ide}.  The
+log does not name its working directory; the root's
+@file{conversation_summaries.db} does, and engram opens it read-only.  A
+session is listed only when its workspace @emph{equals} the working
+directory --- a session run in a parent directory is not offered to every
+project below it.  A conversation with no recorded workspace (the IDE root
+has no summaries database at all) is never picked by @code{latest} or
+@code{all}, but @code{--session @var{id}} still reaches it.  Subagent
+conversations are side chains, excluded unless @code{--include-sidechains}
+is given.
+
+Only the body of a user request and the planner's prose become turns.
+Records still being generated are counted as @code{pending} and skipped;
+the finished record is captured on a later run.  The IDE sometimes replays
+earlier records and restarts its step numbering, so a turn's identity is a
+fingerprint of the record's content, not its position, and a replay is
+stored once.  The log records whole seconds and several records often share
+one, so engram appends a millisecond fraction in file order
+(@code{.000}, @code{.001}, @dots{}).  The fraction exists only to keep
+reading order; it is not the harness's precision.
 @end table
 
 A rollout carries the conversation twice: once as the events the interface
@@ -861,7 +888,7 @@ silently producing nothing.
 
 @cindex transcript size
 Transcripts can be very large --- one rollout on a developer machine was
-114@tie{}MB.  Both readers stream line by line, and
+114@tie{}MB.  Every reader streams line by line, and
 @code{--max-bytes} (64@tie{}MiB by default) refuses an oversized
 transcript with an error naming the override rather than attempting it.
 
@@ -1379,7 +1406,7 @@ otherwise:
 @item openclaude @tab read @tab written @tab ---
 @item codex @tab read @tab written @tab ---
 @item opencode @tab --- @tab written @tab ---
-@item antigravity @tab --- @tab plugin (skills) @tab ---
+@item antigravity @tab read @tab plugin (skills) @tab ---
 @item qwen @tab --- @tab --- @tab ---
 @item goose @tab --- @tab --- @tab ---
 @item copilot-cli @tab --- @tab --- @tab ---

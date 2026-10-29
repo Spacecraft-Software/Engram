@@ -68,6 +68,28 @@ const NON_MESSAGE_TYPES: &[&str] = &[
     // `modelUsage`, line counts and several durations — with no `message`.
     // Rewritten as the session proceeds, so one session yields many records.
     "cost-state",
+    // Request-cache bookkeeping: digests, cache-control and shape hashes of
+    // what was sent to the API. `api-request-blob` carries a `message` key,
+    // but it is a fragment of the outgoing request (a `system` role, an empty
+    // content list, `output_config`), not a conversation turn. Together the
+    // three were ~6,500 records across 22 sessions in two weeks.
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
+    // Written when Claude Code sets aside thinking that another organization
+    // signed after `/login` switches accounts (`cause` such as
+    // `restored_owner_mismatch`). The user-facing "Claude can't use thinking
+    // from another organization" notice is a separate `system` record.
+    "history-suppression",
+    // Links from the session to a published artifact page.
+    "frame-link",
+    // The set of tools the session has used so far.
+    "tools-used",
+    // Artifact comment-watch and auto-reaction state.
+    "artifact-autoreact-ledger",
+    "artifact-comment-monitor",
+    // A pointer to the session that resumed this one.
+    "continued-in",
 ];
 
 /// Lists this working directory's transcripts, newest first.
@@ -529,6 +551,31 @@ mod tests {
         for record in [
             r#"{"type":"bridge-session","sessionId":"s1","bridgeSessionId":"cse_1","lastSequenceNum":0}"#,
             r#"{"type":"pr-link","sessionId":"s1","prNumber":25,"prUrl":"https://example.invalid/pull/25","prRepository":"owner/repo","timestamp":"2026-08-06T21:12:33.853Z"}"#,
+        ] {
+            let (turn, stats) = parse(record, &ReadOptions::default());
+            assert!(turn.is_none(), "{record} must not become a turn");
+            assert_eq!(stats.non_message, 1, "{record} must count as non_message");
+            assert_eq!(stats.unknown_record, 0, "{record} must not be unknown");
+        }
+    }
+
+    /// Nine record types that arrived after `atis-latch` and `cost-state`,
+    /// measured over 22 sessions in two weeks: thousands of `unknown_record`
+    /// per run, none of them conversation. `api-request-blob` is the one that
+    /// matters most, because it carries a `message` key: it must stay a
+    /// non-message, never a turn.
+    #[test]
+    fn request_cache_and_account_records_are_non_messages() {
+        for record in [
+            r#"{"type":"api-request","sessionId":"s1","id":"r1","timestamp":"2026-10-29T20:12:06.633Z"}"#,
+            r#"{"type":"api-request-blob","sessionId":"s1","hash":"h1","message":{"role":"system","content":[],"output_config":{"effort":"high"}}}"#,
+            r#"{"type":"api-request-shape","sessionId":"s1","shapeHash":"h1","shape":{}}"#,
+            r#"{"type":"history-suppression","sessionId":"s1","cause":"restored_owner_mismatch","vetoedAgainstAccountUuid":"00000000-0000-0000-0000-000000000000","ts":1}"#,
+            r#"{"type":"frame-link","sessionId":"s1","frameUrl":"https://example.invalid/a","path":"a.html","title":"A"}"#,
+            r#"{"type":"tools-used","sessionId":"s1","tools":["Bash"]}"#,
+            r#"{"type":"artifact-autoreact-ledger","sessionId":"s1","v":1,"artifacts":{}}"#,
+            r#"{"type":"artifact-comment-monitor","sessionId":"s1","v":1,"artifacts":{}}"#,
+            r#"{"type":"continued-in","sessionId":"s1","continuedInSessionId":"s2"}"#,
         ] {
             let (turn, stats) = parse(record, &ReadOptions::default());
             assert!(turn.is_none(), "{record} must not become a turn");
