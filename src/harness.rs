@@ -355,6 +355,7 @@ pub const ALL: &[HarnessSpec] = &[
         probe: &[
             ".gemini/antigravity-cli",
             ".gemini/antigravity",
+            ".gemini/antigravity-ide",
             ".antigravity",
         ],
         sessions_dir: Some(".gemini/antigravity-cli/brain"),

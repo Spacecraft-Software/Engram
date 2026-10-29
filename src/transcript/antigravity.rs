@@ -642,6 +642,20 @@ mod tests {
         );
     }
 
+    /// A root the reader scans but detection does not probe is a supported
+    /// layout that `ingest` without `--harness` reports as not installed.
+    #[test]
+    fn every_scanned_root_is_a_detection_probe() {
+        let spec = harness::ALL
+            .iter()
+            .find(|spec| spec.id == harness::Harness::Antigravity)
+            .expect("antigravity spec");
+        for root in ROOTS {
+            let parent = root.strip_suffix("/brain").expect("brain root");
+            assert!(spec.probe.contains(&parent), "{parent} is not probed");
+        }
+    }
+
     #[test]
     fn workspace_uri_decoding_and_workspace_file_parent() {
         assert_eq!(
