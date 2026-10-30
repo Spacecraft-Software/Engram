@@ -3,33 +3,26 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Arch Linux PKGBUILD for engram (Steelbore Standard §5.5).
-# 0.6.0 is unreleased, so this builds from the main branch.
+# Builds the tagged v0.6.0 release tarball.
 
 pkgname=engram
-# PKGBUILD forbids hyphens in pkgver; a -dev suffix would be spelled .dev.
-# Left as the plain release number so vercmp still orders it below the real
-# 0.6.0 tag when that lands.
 pkgver=0.6.0
 pkgrel=1
 pkgdesc="Shared verbatim chat memory for multi-model LLM pipelines (SQLite FTS5; CLI, MCP, HTTP)"
 arch=('x86_64' 'aarch64')
 url="https://Engram.SpacecraftSoftware.org/"
 license=('GPL-3.0-or-later')
-makedepends=('cargo' 'git')
-source=("$pkgname::git+https://github.com/Spacecraft-Software/Engram#branch=main")
-# At release, switch to the tagged tarball and pin its real checksum:
-#   source=("$pkgname-0.2.0.tar.gz::https://github.com/Spacecraft-Software/Engram/archive/refs/tags/v0.2.0.tar.gz")
-#   sha256sums=('<real sha256 of the tagged tarball>')
-# 'SKIP' is acceptable only for the VCS source below.
-sha256sums=('SKIP')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Spacecraft-Software/Engram/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('fdc75576d846985a1d54609cbcfc2297b3b5c2a9e312ec7e6d17074bd3a04915')
 
 build() {
-  cd "$pkgname"
+  cd "Engram-$pkgver"
   cargo build --release --locked
 }
 
 package() {
-  cd "$pkgname"
+  cd "Engram-$pkgver"
   install -Dm755 "target/release/engram" "$pkgdir/usr/bin/engram"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
