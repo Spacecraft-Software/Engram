@@ -5,9 +5,16 @@
 ;;
 ;; Build:  guix build -f packaging/guix.scm
 ;;
-;; Builds the tagged v0.6.0 release tarball.  Bump `version' and the
-;; sha256 together at each release; `guix download <tarball-url>' prints
-;; the new hash.
+;; Fetches the tagged v0.6.0 release tarball, and that source hash is
+;; real.  Bump `version' and the sha256 together at each release;
+;; `guix download <tarball-url>' prints the new hash.
+;;
+;; THIS DEFINITION STILL DOES NOT BUILD.  Guix's cargo-build-system
+;; discards Cargo.lock and takes every crate as a package input, and no
+;; inputs are declared here yet.  Generating them (`guix import crate
+;; --lockfile=Cargo.lock engram' on a recent Guix) and verifying the
+;; build needs a Guix host.  Use packaging/default.nix (Nix) or the flake
+;; for a build that works today.
 
 (use-modules (guix packages)
              (guix download)
