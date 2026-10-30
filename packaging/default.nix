@@ -9,11 +9,14 @@
 #   nix-build packaging/default.nix    # release build from the tagged tarball
 #
 # The flake passes `srcOverride = self`, skipping the fetchFromGitHub path.
-# That is what makes a from-checkout build work before a release is tagged --
-# and 0.6.0 is not tagged, so today the fetch path cannot resolve at all.
+# That is what makes a from-checkout build work between releases; without
+# it, the tagged v${version} tarball is fetched and checked against `hash`.
 #
-# Dependencies are taken from the committed Cargo.lock rather than a vendor
-# hash, so there is no `cargoHash` to regenerate on every dependency bump.
+# Dependencies: a checkout build vendors from the committed Cargo.lock, so
+# there is no hash to regenerate on every dependency bump. A release build
+# vendors from the *tarball's* lockfile through `cargoHash` instead -- the
+# working tree's Cargo.lock names a different engram version once main has
+# moved on, and buildRustPackage refuses a lockfile that differs from src's.
 
 { lib
 , rustPlatform
@@ -31,7 +34,7 @@
 , version ? "0.6.0"
 }:
 
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage ({
   pname = "engram";
   inherit version;
 
@@ -48,16 +51,10 @@ rustPlatform.buildRustPackage {
         owner = "Spacecraft-Software";
         repo = "Engram";
         rev = "v${version}";
-        # TODO at release: build once and paste the reported sha256-... here.
-        # Unreachable until a v-tag exists; the flake never takes this branch.
-        hash = lib.fakeHash;
+        # NAR hash of the unpacked v0.6.0 tag. Bump it together with the
+        # `version` default above; the flake never takes this branch.
+        hash = "sha256-MmwflLDJvej2f12Kvl5DBpcytvdN+Sxx7zz7EtLjnMo=";
       };
-
-  # The lockfile is committed, so Nix can vendor from it directly. `outputHashes`
-  # stays empty because every dependency comes from crates.io -- no git deps.
-  cargoLock = {
-    lockFile = ../Cargo.lock;
-  };
 
   # rusqlite is built with its `bundled` feature, which compiles vendored
   # SQLite from C. buildRustPackage's stdenv already provides the toolchain --
@@ -85,4 +82,13 @@ rustPlatform.buildRustPackage {
     mainProgram = "engram";
     platforms = lib.platforms.unix;
   };
-}
+} // (
+  if srcOverride != null then {
+    # The lockfile is committed, so Nix can vendor from it directly.
+    # `outputHashes` stays empty: every dependency comes from crates.io.
+    cargoLock.lockFile = ../Cargo.lock;
+  } else {
+    # Vendor hash of the v0.6.0 tarball's Cargo.lock. Bump with `hash`.
+    cargoHash = "sha256-JRe7vvZOp/w9h8Buj7YLNYZlCCooDE0TKA1mQ7RMHdo=";
+  }
+))

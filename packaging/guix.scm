@@ -5,18 +5,12 @@
 ;;
 ;; Build:  guix build -f packaging/guix.scm
 ;;
-;; 0.6.0 is unreleased, so the buildable path below fetches the git tree.
-;;
-;; THIS DEFINITION DOES NOT BUILD AS IT STANDS.  The source hash is a
-;; placeholder of zeros and MUST be replaced first — Guix refuses a wrong
-;; hash, it never ignores one.  The version string below is kept in step
-;; with Cargo.toml so the file is not also *stale*, but that is the only
-;; thing correct about it; use packaging/default.nix (Nix) or the flake for
-;; a build that works today.
+;; Builds the tagged v0.6.0 release tarball.  Bump `version' and the
+;; sha256 together at each release; `guix download <tarball-url>' prints
+;; the new hash.
 
 (use-modules (guix packages)
              (guix download)
-             (guix git-download)
              (guix build-system cargo)
              ((guix licenses) #:prefix license:))
 
@@ -24,35 +18,16 @@
   (package
     (name "engram")
     (version "0.6.0")
-    ;; Release stanza — swap in at the first tagged release:
-    ;;
-    ;; (source
-    ;;  (origin
-    ;;    (method url-fetch)
-    ;;    (uri (string-append
-    ;;          "https://github.com/Spacecraft-Software/Engram"
-    ;;          "/archive/refs/tags/v" version ".tar.gz"))
-    ;;    (sha256
-    ;;     (base32
-    ;;      ;; TODO at release tag: set real hash
-    ;;      ;; (guix download <tarball-url> prints it)
-    ;;      "0000000000000000000000000000000000000000000000000000"))))
-    ;;
-    ;; Buildable path while 0.2.0-dev is unreleased: git checkout of main.
     (source
      (origin
-       (method git-fetch)
-       (uri (git-reference
-             (url "https://github.com/Spacecraft-Software/Engram")
-             ;; TODO: pin a commit hash; "main" is a moving target and is
-             ;; only acceptable while the project is pre-release.
-             (commit "main")))
-       (file-name (git-file-name name version))
+       (method url-fetch)
+       (uri (string-append
+             "https://github.com/Spacecraft-Software/Engram"
+             "/archive/refs/tags/v" version ".tar.gz"))
+       (file-name (string-append name "-" version ".tar.gz"))
        (sha256
         (base32
-         ;; PLACEHOLDER — not a real hash.  Compute with:
-         ;;   guix hash --serializer=nar -x <checkout>
-         "0000000000000000000000000000000000000000000000000000"))))
+         "05a9l39ln1qpdmzfq4p3m71bbcwp4bybr730ahfmm626v1v5bizx"))))
     (build-system cargo-build-system)
     (arguments
      (list #:install-source? #f))
