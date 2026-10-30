@@ -38,9 +38,9 @@
 
         engram = pkgs.callPackage ./packaging/default.nix {
           srcOverride = self;
-          # Not a release: mark it so `engram --version` never claims to be a
-          # tagged 0.6.0 when it is really whatever is checked out.
-          version = "0.6.0-dev";
+          # Tracks Cargo.toml. Between releases main carries a -dev suffix so
+          # `engram --version` never claims to be a tag it is not.
+          version = "0.6.0";
         };
 
         common = with pkgs; [
