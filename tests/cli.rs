@@ -4955,12 +4955,11 @@ fn kimi_reads_timed_sessions_and_refuses_untimed_ones() {
     let err = parse_single_line_json(&refused.get_output().stderr);
     let message = err["error"]["message"].as_str().expect("message");
     assert!(message.contains("cannot be read"), "{message}");
-    assert!(
-        err["error"]["hint"]
-            .as_str()
-            .is_some_and(|hint| hint.contains("engram import")),
-        "{err}"
-    );
+    // `kimi export` writes a zip that `engram import` cannot read, so the
+    // hint must not send the user there.
+    let hint = err["error"]["hint"].as_str().expect("hint");
+    assert!(!hint.contains("kimi export"), "{hint}");
+    assert!(hint.contains("remember"), "{hint}");
 }
 
 /// Synthetic Deep Code project: an index naming its path, and one session.

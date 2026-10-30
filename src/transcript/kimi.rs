@@ -29,10 +29,15 @@
 //! person; skill activations and background-task notifications arrive through
 //! the same records and are counted as `meta`.
 //!
-//! A `prompt.accepted` record can carry the prompt's text too. Usually that
-//! text reappears as a `turn.prompt`; when it never does — a prompt queued
-//! while a turn failed — it is the only record of what the user typed, so it
-//! is kept, and dropped as a duplicate otherwise.
+//! A submission can appear twice, joined by its `promptId`: `prompt.accepted`
+//! and then `turn.prompt`. When the accepted record carries text, that text is
+//! what the user typed (`Continue with goal and use /skill:x`), while the
+//! `turn.prompt` holds what the harness expanded it into (`User activated the
+//! skill "x"…`). So a submission is **one** turn, identified as
+//! `prompt:<promptId>`, with the typed text when there is any. The identity is
+//! the same whichever of the two records a read sees, so a live session read
+//! between them is not stored twice, and nothing is matched by text — a
+//! repeated `Continue` is a different submission with a different id.
 //!
 //! # Protocol versions
 //!
@@ -40,9 +45,10 @@
 //! logs — on the surveyed machine, sessions migrated from the legacy `~/.kimi`
 //! layout — hold only the untimed context channel. Inventing times would
 //! destroy reading order, so those sessions are not listed, and asking for one
-//! by id is an error that names `kimi export` and `engram import` instead.
+//! by id is an error saying why. `kimi export` is not offered as a way round:
+//! it writes a zip, which `engram import` does not read.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -63,7 +69,8 @@ const FIRST_TIMED_PROTOCOL: (u32, u32) = (1, 3);
 
 /// The refusal for a log with no timed channel.
 const UNTIMED: &str = "its wire log records no message times (protocol older than 1.3, \
-    typically a session migrated from ~/.kimi), and engram will not invent them";
+    typically a session migrated from ~/.kimi), and engram will not invent them. The \
+    timed original may still be under ~/.kimi/sessions, which engram does not read yet";
 
 /// Record types that are harness machinery rather than conversation.
 const NON_MESSAGE: &[&str] = &[
@@ -285,6 +292,20 @@ struct Raw {
     created_at: String,
 }
 
+impl Raw {
+    /// Placeholder for an injected prompt, which becomes a turn only when
+    /// the user's typed text for the same `promptId` exists. An empty
+    /// `source_uuid` marks it.
+    fn meta() -> Self {
+        Self {
+            role: TurnRole::User,
+            text: String::new(),
+            source_uuid: String::new(),
+            created_at: String::new(),
+        }
+    }
+}
+
 /// Reads one session's main wire log into turns.
 ///
 /// # Errors
@@ -307,10 +328,12 @@ pub fn read(path: &Path, opts: &ReadOptions) -> Result<ReadResult, TranscriptErr
 
     let mut stats = FilterStats::default();
     let mut raws: Vec<Raw> = Vec::new();
-    // Prompt text known from `turn.prompt`, and `prompt.accepted` texts held
-    // until the end to see whether a `turn.prompt` repeats them.
-    let mut prompted = HashSet::new();
-    let mut accepted: Vec<Raw> = Vec::new();
+    // Typed text by `promptId`, from `prompt.accepted`; it supersedes the
+    // expanded `turn.prompt` of the same submission, which may come later.
+    let mut typed: HashMap<String, Raw> = HashMap::new();
+    // User prompts that carry a `promptId`, held until every `prompt.accepted`
+    // has been seen.
+    let mut prompts: Vec<(String, Raw)> = Vec::new();
 
     for (line_index, line) in std::io::BufReader::new(std::fs::File::open(path)?)
         .lines()
@@ -327,35 +350,51 @@ pub fn read(path: &Path, opts: &ReadOptions) -> Result<ReadResult, TranscriptErr
         let kind = record["type"].as_str().unwrap_or("");
         match kind {
             "turn.prompt" | "turn.steer" => {
+                let prompt_id = record["promptId"].as_str().map(str::to_owned);
                 if record["origin"]["kind"] != "user" {
-                    stats.meta += 1;
+                    // Injected (a skill activation, a task notification) —
+                    // unless the user typed it, which `typed` resolves below.
+                    match prompt_id {
+                        Some(id) => prompts.push((id, Raw::meta())),
+                        None => stats.meta += 1,
+                    }
                     continue;
                 }
                 let text = text_blocks(&record["input"]);
-                prompted.insert(text.trim().to_string());
-                raws.push(Raw {
+                let raw = Raw {
                     role: TurnRole::User,
-                    source_uuid: positional_id(line_index, &text),
+                    source_uuid: match &prompt_id {
+                        Some(id) => format!("prompt:{id}"),
+                        None => positional_id(line_index, &text),
+                    },
                     text,
                     created_at: millis(&record, line_index)?,
-                });
+                };
+                match prompt_id {
+                    Some(id) => prompts.push((id, raw)),
+                    None => raws.push(raw),
+                }
             }
             "prompt.accepted" => {
                 let text = text_blocks(&record["content"]);
+                let Some(id) = record["promptId"].as_str() else {
+                    stats.unknown_record += 1;
+                    continue;
+                };
                 if text.trim().is_empty() {
+                    // Bookkeeping: the submission's text is its turn.prompt.
                     stats.non_message += 1;
                     continue;
                 }
-                let source_uuid = match record["promptId"].as_str() {
-                    Some(id) => format!("prompt:{id}"),
-                    None => positional_id(line_index, &text),
-                };
-                accepted.push(Raw {
-                    role: TurnRole::User,
-                    source_uuid,
-                    text,
-                    created_at: millis(&record, line_index)?,
-                });
+                typed.insert(
+                    id.to_string(),
+                    Raw {
+                        role: TurnRole::User,
+                        source_uuid: format!("prompt:{id}"),
+                        text,
+                        created_at: millis(&record, line_index)?,
+                    },
+                );
             }
             "context.append_loop_event" => {
                 let event = &record["event"];
@@ -426,15 +465,20 @@ pub fn read(path: &Path, opts: &ReadOptions) -> Result<ReadResult, TranscriptErr
         }
     }
 
-    for raw in accepted {
-        if prompted.contains(raw.text.trim()) {
+    // One turn per submission: the typed text when there is any, else the
+    // user's turn.prompt. The expanded duplicate is counted, not stored.
+    for (id, raw) in prompts {
+        if typed.contains_key(&id) {
             stats.non_message += 1;
+        } else if raw.source_uuid.is_empty() {
+            stats.meta += 1;
         } else {
             raws.push(raw);
         }
     }
-    // Accepted-only prompts were held back; restore file order. The sort is
-    // stable, so records sharing a millisecond keep their read order.
+    raws.extend(typed.into_values());
+    // Prompts were held back; restore file order. The sort is stable, so
+    // records sharing a millisecond keep their read order.
     raws.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
     let mut redactions = redact::Redactions::default();
@@ -532,26 +576,103 @@ mod tests {
         assert_eq!(result.filtered.unknown_record, 0);
     }
 
+    fn accepted(ms: i64, id: &str, text: &str) -> String {
+        json!({"type": "prompt.accepted", "promptId": id, "time": ms,
+            "content": [{"type": "text", "text": text}]})
+        .to_string()
+    }
+
+    fn prompt_with_id(ms: i64, origin: &str, id: &str, text: &str) -> String {
+        json!({"type": "turn.prompt", "promptId": id, "origin": {"kind": origin},
+            "time": ms, "input": [{"type": "text", "text": text}]})
+        .to_string()
+    }
+
+    /// The typed text wins over the skill expansion, and the pair is one turn.
     #[test]
-    fn an_accepted_prompt_is_kept_only_when_no_turn_prompt_repeats_it() {
-        let accepted = |ms: i64, id: &str, text: &str| {
-            json!({"type": "prompt.accepted", "promptId": id, "time": ms,
-                "content": [{"type": "text", "text": text}]})
-            .to_string()
-        };
+    fn a_submission_is_one_turn_with_the_typed_text() {
         let result = read_lines(
             &[
                 META.to_string(),
+                accepted(1_000, "m1", "Continue with goal and use /skill:gnu"),
+                prompt_with_id(1_001, "user", "m1", "User activated the skill \"gnu\"..."),
+                // A content-less accepted is bookkeeping; its prompt is the turn.
+                json!({"type": "prompt.accepted", "promptId": "m2", "time": 2_000}).to_string(),
+                prompt_with_id(2_001, "user", "m2", "Proceed"),
+            ],
+            ReadOptions::default(),
+        )
+        .expect("read");
+        let turns: Vec<_> = result
+            .turns
+            .iter()
+            .map(|t| (t.text.as_str(), t.source_uuid.as_str()))
+            .collect();
+        assert_eq!(
+            turns,
+            [
+                ("Continue with goal and use /skill:gnu", "prompt:m1"),
+                ("Proceed", "prompt:m2")
+            ]
+        );
+    }
+
+    /// Reading a live session between the two records must not change the
+    /// turn's identity, or the next read would store the submission again.
+    #[test]
+    fn identity_is_stable_across_the_live_gap() {
+        let before = read_lines(
+            &[META.to_string(), accepted(1_000, "m1", "Continue")],
+            ReadOptions::default(),
+        )
+        .expect("read");
+        let after = read_lines(
+            &[
+                META.to_string(),
                 accepted(1_000, "m1", "Continue"),
-                prompt(1_001, "turn.prompt", "user", "Continue"),
-                accepted(2_000, "m2", "Queued while the turn failed"),
+                prompt_with_id(1_001, "user", "m1", "Continue"),
+            ],
+            ReadOptions::default(),
+        )
+        .expect("read");
+        assert_eq!(before.turns.len(), 1);
+        assert_eq!(after.turns.len(), 1);
+        assert_eq!(before.turns[0].source_uuid, after.turns[0].source_uuid);
+        assert_eq!(before.turns[0].created_at, after.turns[0].created_at);
+    }
+
+    /// No text matching: the same words submitted twice are two turns.
+    #[test]
+    fn a_repeated_prompt_is_a_separate_submission() {
+        let result = read_lines(
+            &[
+                META.to_string(),
+                prompt_with_id(1_000, "user", "m1", "Continue"),
+                accepted(2_000, "m2", "Continue"),
+            ],
+            ReadOptions::default(),
+        )
+        .expect("read");
+        assert_eq!(result.turns.len(), 2);
+    }
+
+    /// Typed text survives even when the harness filed the expansion under a
+    /// non-user origin; without typed text an injection stays meta.
+    #[test]
+    fn typed_text_beats_an_injected_origin() {
+        let result = read_lines(
+            &[
+                META.to_string(),
+                accepted(1_000, "m1", "/skill:write-goal"),
+                prompt_with_id(1_001, "skill_activation", "m1", "expanded"),
+                prompt_with_id(2_000, "skill_activation", "m2", "injected"),
             ],
             ReadOptions::default(),
         )
         .expect("read");
         let texts: Vec<_> = result.turns.iter().map(|t| t.text.as_str()).collect();
-        assert_eq!(texts, ["Continue", "Queued while the turn failed"]);
-        assert_eq!(result.turns[1].source_uuid, "prompt:m2");
+        assert_eq!(texts, ["/skill:write-goal"]);
+        assert_eq!(result.filtered.meta, 1);
     }
 
     #[test]

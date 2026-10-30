@@ -29,10 +29,10 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 ### Fixed
 
 - **A Kimi session engram cannot read says so.** An untimed (pre-1.3) wire
-  log is refused with "this kimi session cannot be read" and the
-  `kimi export` → `engram import` route. It used to share a message with
-  harnesses that have no reader at all. A new `TranscriptError::Unreadable`
-  separates "this session" from "this harness".
+  log is refused with "this kimi session cannot be read" and the reason. A
+  new `TranscriptError::Unreadable` separates "this session" from "this
+  harness". The refusal no longer suggests `kimi export`, because that
+  writes a zip `engram import` cannot read.
 - **The manual's harness table** showed no transcript reader for Opencode,
   Qwen, Goose and Copilot CLI, all of which have one.
 

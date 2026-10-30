@@ -295,7 +295,9 @@ pub const ALL: &[HarnessSpec] = &[
         command_surface: CommandSurface::Skill {
             dir: ".kimi-code/skills",
         },
-        export_command: Some("kimi export [session] -o out.zip"),
+        // `kimi export [session] -o out.zip` exists, but `engram import` does
+        // not read a zip, so naming it would only lead to a second failure.
+        export_command: None,
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".kimi-code/mcp.json")),
         hooks_config: None,
