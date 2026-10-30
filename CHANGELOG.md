@@ -11,6 +11,8 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-30
+
 ### Added
 
 - **Grok, Kimi and Deep Code transcripts.** `engram ingest` now reads all
