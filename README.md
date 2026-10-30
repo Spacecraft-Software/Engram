@@ -224,9 +224,9 @@ storage failure. New routes should keep following that pattern.
   (no TUI yet). `json`, `jsonl`, and `csv` exist.
 - Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
   writes files.
-- Transcript readers for Kimi, Grok, Cursor, VS Code and DeepCode. Their
-  formats are surveyed, and `engram ingest --list` names each one and why it
-  has no reader yet. Until one exists, `remember` during the session and
+- Transcript readers for Cursor and VS Code, which keep chat as editor state
+  rather than a per-session log. `engram ingest --list` names every harness
+  without a reader and why. For those, `remember` during the session and
   `save-chat`, or export and `engram import`, are the fallbacks.
 
 Already shipped, despite earlier versions of this list: the MCP `context` tool,
