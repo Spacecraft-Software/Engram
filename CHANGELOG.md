@@ -11,6 +11,31 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Added
+
+- **Grok, Kimi and Deep Code transcripts.** `engram ingest` now reads all
+  three, so ten readers serve twelve harnesses.
+  - **Grok:** reads `updates.jsonl` from the session directory named by the
+    percent-encoded working directory.
+  - **Kimi:** reads the main agent's `wire.jsonl` from protocol 1.3 on,
+    attributed through `state.json` or `session_index.jsonl`.
+  - **Deep Code:** reads each project's sessions, matched by the
+    `originalPath` its index records.
+
+  Each reader lists only sessions whose recorded working directory equals
+  the current one. Tool payloads are never stored, and re-runs insert
+  nothing.
+
+### Fixed
+
+- **A Kimi session engram cannot read says so.** An untimed (pre-1.3) wire
+  log is refused with "this kimi session cannot be read" and the
+  `kimi export` → `engram import` route. It used to share a message with
+  harnesses that have no reader at all. A new `TranscriptError::Unreadable`
+  separates "this session" from "this harness".
+- **The manual's harness table** showed no transcript reader for Opencode,
+  Qwen, Goose and Copilot CLI, all of which have one.
+
 ## [0.6.0] — 2026-10-30
 
 ### Added

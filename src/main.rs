@@ -1098,6 +1098,28 @@ fn handle_rescope(
     0
 }
 
+/// The way forward when engram cannot read a session itself.
+///
+/// A harness engram cannot read is not a dead end when the harness exports
+/// its own conversation and `engram import` reads that. The command is only
+/// useful at the moment the wall is hit, so it is named here rather than left
+/// in the manual.
+fn export_fallback(harness_name: &str) -> String {
+    let export = harness::ALL
+        .iter()
+        .find(|s| s.name == harness_name)
+        .and_then(|s| s.export_command);
+    match export {
+        Some(cmd) => format!(
+            "Export it from the harness and import the file: `{cmd}`, then \
+             `engram import <file>`."
+        ),
+        None => "Use the notes path instead: call `remember` during the session, \
+                 then `engram save-chat --scope <id>`."
+            .to_string(),
+    }
+}
+
 /// Turns a [`transcript::TranscriptError`] into a structured CLI error.
 ///
 /// The no-reader case names the fallback explicitly. Reporting "0 sessions"
@@ -1105,31 +1127,18 @@ fn handle_rescope(
 /// this whole design exists to prevent.
 fn transcript_error(e: transcript::TranscriptError, harness_name: &str) -> AppError {
     match e {
-        transcript::TranscriptError::NoReader(detail) => {
-            // A harness engram cannot read is not a dead end when the harness
-            // exports its own conversation and `engram import` reads that. The
-            // command is only useful at the moment the wall is hit, so it is
-            // named here rather than left in the manual.
-            let export = harness::ALL
-                .iter()
-                .find(|s| s.name == harness_name)
-                .and_then(|s| s.export_command);
-            let fallback = match export {
-                Some(cmd) => format!(
-                    "Export it from the harness and import the file: `{cmd}`, then \
-                     `engram import <file>`."
-                ),
-                None => "Use the notes path instead: call `remember` during the session, \
-                         then `engram save-chat --scope <id>`."
-                    .to_string(),
-            };
-            AppError::new(
-                error::ErrorCode::InvalidArgument,
-                2,
-                format!("harness '{harness_name}' has no transcript reader"),
-                format!("{detail}. {fallback}"),
-            )
-        }
+        transcript::TranscriptError::NoReader(detail) => AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            format!("harness '{harness_name}' has no transcript reader"),
+            format!("{detail}. {}", export_fallback(harness_name)),
+        ),
+        transcript::TranscriptError::Unreadable(detail) => AppError::new(
+            error::ErrorCode::InvalidArgument,
+            2,
+            format!("this {harness_name} session cannot be read: {detail}"),
+            export_fallback(harness_name),
+        ),
         transcript::TranscriptError::NoHome => AppError::new(
             error::ErrorCode::InvalidArgument,
             2,

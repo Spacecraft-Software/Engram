@@ -30,8 +30,9 @@ use rusqlite::OpenFlags;
 use serde_json::Value;
 
 use super::{
-    normalize_text, path_string, redact, sort_newest_first, FilterStats, ReadOptions, ReadResult,
-    SessionRef, TranscriptError, Turn, TurnRole,
+    is_path_safe_id, normalize_text, ordered_in_second, path_string, percent_decode, redact,
+    sort_newest_first, FilterStats, ReadOptions, ReadResult, SessionRef, TranscriptError, Turn,
+    TurnRole,
 };
 use crate::harness::{self, HarnessSpec};
 
@@ -75,19 +76,7 @@ fn roots() -> Result<Vec<PathBuf>, TranscriptError> {
 
 /// Decodes local file URIs; malformed escapes and nonlocal paths give no attribution.
 fn workspace(uri: &str) -> Option<PathBuf> {
-    let encoded = uri.strip_prefix("file://")?;
-    let mut bytes = Vec::new();
-    let mut iter = encoded.bytes();
-    while let Some(byte) = iter.next() {
-        if byte == b'%' {
-            let high = char::from(iter.next()?).to_digit(16)?;
-            let low = char::from(iter.next()?).to_digit(16)?;
-            bytes.push((high * 16 + low) as u8);
-        } else {
-            bytes.push(byte);
-        }
-    }
-    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
+    let path = PathBuf::from(percent_decode(uri.strip_prefix("file://")?)?);
     if !path.is_absolute() {
         return None;
     }
@@ -204,11 +193,7 @@ pub fn sessions(spec: &HarnessSpec, cwd: &Path) -> Result<Vec<SessionRef>, Trans
 /// # Errors
 /// Returns home or filesystem errors; rejects path syntax by returning no match.
 pub fn find_by_id(spec: &HarnessSpec, id: &str) -> Result<Option<SessionRef>, TranscriptError> {
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-    {
+    if !is_path_safe_id(id) {
         return Ok(None);
     }
     for root in roots()? {
@@ -280,33 +265,21 @@ fn fingerprint(record: &Value) -> String {
     .to_string()
 }
 
-/// Adds ordering-only milliseconds, not a claim of harness clock precision.
-///
-/// Recall orders by (created_at, id), and id is a UUID: source seconds alone
-/// would reorder same-second turns randomly. All distinct parsed fingerprints
-/// consume a position, including filtered records; exact replays consume none.
+/// The source second plus an ordering-only fraction (see
+/// [`ordered_in_second`]). All distinct parsed fingerprints consume a
+/// position, including filtered records; exact replays consume none.
 fn ordered_timestamp(
     record: &Value,
     id: &str,
-    seconds: &mut HashMap<i64, usize>,
+    seconds: &mut HashMap<i64, i64>,
 ) -> Result<String, TranscriptError> {
     let raw = record["created_at"].as_str().unwrap_or("");
-    let ts = raw
-        .parse::<jiff::Timestamp>()
-        .map_err(|_| TranscriptError::BadTimestamp {
-            record: id.to_string(),
-            value: raw.to_string(),
-        })?;
-    let index = seconds.entry(ts.as_second()).or_default();
-    let millis = (*index).min(999);
-    *index = index.saturating_add(1);
-    let second = jiff::Timestamp::from_second(ts.as_second())
-        .map_err(|_| TranscriptError::BadTimestamp {
-            record: id.to_string(),
-            value: raw.to_string(),
-        })?
-        .to_string();
-    Ok(format!("{}.{millis:03}Z", second.trim_end_matches('Z')))
+    let bad = || TranscriptError::BadTimestamp {
+        record: id.to_string(),
+        value: raw.to_string(),
+    };
+    let ts = raw.parse::<jiff::Timestamp>().map_err(|_| bad())?;
+    ordered_in_second(seconds, ts.as_second()).ok_or_else(bad)
 }
 
 /// Streams a session through filtering, normalization, truncation and redaction.
