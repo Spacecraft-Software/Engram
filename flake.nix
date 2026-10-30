@@ -40,7 +40,7 @@
           srcOverride = self;
           # Tracks Cargo.toml. Between releases main carries a -dev suffix so
           # `engram --version` never claims to be a tag it is not.
-          version = "0.7.0";
+          version = "0.8.0-dev";
         };
 
         common = with pkgs; [
