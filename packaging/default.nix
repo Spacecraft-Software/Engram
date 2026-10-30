@@ -31,7 +31,7 @@
   # with a baffling error about that unrelated package. `version` has no such
   # clash.
 , srcOverride ? null
-, version ? "0.6.0"
+, version ? "0.7.0"
 }:
 
 rustPlatform.buildRustPackage ({
@@ -51,9 +51,9 @@ rustPlatform.buildRustPackage ({
         owner = "Spacecraft-Software";
         repo = "Engram";
         rev = "v${version}";
-        # NAR hash of the unpacked v0.6.0 tag. Bump it together with the
+        # NAR hash of the unpacked v0.7.0 tag. Bump it together with the
         # `version` default above; the flake never takes this branch.
-        hash = "sha256-MmwflLDJvej2f12Kvl5DBpcytvdN+Sxx7zz7EtLjnMo=";
+        hash = "sha256-qf6CnRzDuEV+l9mX1ITjqjTORzZBIvTEYsI4xn17IIg=";
       };
 
   # rusqlite is built with its `bundled` feature, which compiles vendored
@@ -88,7 +88,7 @@ rustPlatform.buildRustPackage ({
     # `outputHashes` stays empty: every dependency comes from crates.io.
     cargoLock.lockFile = ../Cargo.lock;
   } else {
-    # Vendor hash of the v0.6.0 tarball's Cargo.lock. Bump with `hash`.
-    cargoHash = "sha256-JRe7vvZOp/w9h8Buj7YLNYZlCCooDE0TKA1mQ7RMHdo=";
+    # Vendor hash of the v0.7.0 tarball's Cargo.lock. Bump with `hash`.
+    cargoHash = "sha256-5zVMpKdAe9Bp8k5NpGSfzq2KWuZo1yfuf6xwXasrlrg=";
   }
 ))
