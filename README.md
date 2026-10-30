@@ -10,7 +10,7 @@ raw text out, full-text searchable.
 
 ## Status
 
-**0.5.0.** Builds and runs against the pinned `rmcp` 0.16. The MCP stdio
+**0.6.0.** Builds and runs against the pinned `rmcp` 0.16. The MCP stdio
 handshake tolerates a leading non-`initialize` probe (some hosts, e.g.
 Antigravity, send a proprietary discovery request first) — see `src/mcp.rs`.
 
@@ -222,12 +222,17 @@ storage failure. New routes should keep following that pattern.
 
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore`
   (no TUI yet). `json`, `jsonl`, and `csv` exist.
-- An MCP `context` tool — `context` is CLI + HTTP for now; the MCP tool lands
-  at M3 (the MCP `recall`/`search` tools do accept `budget_tokens` already).
 - Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
   writes files.
-- Semantic (embedding) search — the upgrade path is `sqlite-vec` as a
-  loadable extension alongside FTS5, not a replacement for it.
+- Transcript readers for Kimi, Grok, Cursor, VS Code and DeepCode. Their
+  formats are surveyed, and `engram ingest --list` names each one and why it
+  has no reader yet. Until one exists, `remember` during the session and
+  `save-chat`, or export and `engram import`, are the fallbacks.
+
+Already shipped, despite earlier versions of this list: the MCP `context` tool,
+and semantic search behind the opt-in `vector` build feature (Model2Vec
+embeddings in a side table, fused with FTS5 by reciprocal rank — not
+`sqlite-vec`).
 
 ## License
 

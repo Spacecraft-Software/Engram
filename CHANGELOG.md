@@ -11,6 +11,8 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-30
+
 ### Added
 
 - **Antigravity transcripts.** `engram ingest --harness antigravity` reads
