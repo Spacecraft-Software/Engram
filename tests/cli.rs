@@ -1973,7 +1973,7 @@ fn ingest_from_a_readerless_harness_is_exit_2_with_a_fallback() {
     // readers land, which is the point — it must never be padded with a
     // harness engram can now read, or the test would assert a refusal that
     // should no longer happen.
-    for harness in ["cursor", "kimi", "vscode"] {
+    for harness in ["cursor", "vscode"] {
         let assert = ingest(&db, &home, &project, &["--harness", harness, "--list"])
             .assert()
             .failure()
@@ -4823,4 +4823,174 @@ fn import_files_a_non_git_chat_dir_under_its_parent() {
         .success();
     let data = parse_single_line_json(&assert.get_output().stdout)["data"].clone();
     assert_eq!(data["scopes"], serde_json::json!(["alpha"]), "{data}");
+}
+
+/// Runs `ingest` twice for `harness` in `project` and returns
+/// (sessions listed, inserted on the first run, inserted on the second).
+fn ingest_twice(db: &Path, home: &Path, project: &Path, harness: &str) -> (usize, i64, i64) {
+    let listed = ingest(db, home, project, &["--harness", harness, "--list"])
+        .assert()
+        .success();
+    let listed = parse_single_line_json(&listed.get_output().stdout)["data"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .len();
+    let mut inserted = [0, 0];
+    for slot in &mut inserted {
+        let run = ingest(
+            db,
+            home,
+            project,
+            &["--harness", harness, "--session", "all", "--scope", "r"],
+        )
+        .assert()
+        .success();
+        *slot = parse_single_line_json(&run.get_output().stdout)["data"]["inserted"]
+            .as_i64()
+            .expect("inserted");
+    }
+    (listed, inserted[0], inserted[1])
+}
+
+/// Synthetic Grok session: conversation on ACP's `session/update`, machinery
+/// on the vendor method, as the real `updates.jsonl` splits them.
+fn plant_grok(home: &Path, cwd: &Path, id: &str) {
+    let encoded = cwd.to_string_lossy().replace('/', "%2F");
+    let dir = home.join(".grok/sessions").join(encoded).join(id);
+    std::fs::create_dir_all(&dir).expect("grok dir");
+    let line = |second: i64, method: &str, update: serde_json::Value| {
+        serde_json::json!({"timestamp": second, "method": method,
+            "params": {"sessionId": id, "update": update}})
+        .to_string()
+    };
+    let text = |kind: &str, text: &str| serde_json::json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}});
+    let lines = [
+        line(
+            1_793_114_928,
+            "_x.ai/session/update",
+            serde_json::json!({"sessionUpdate": "hook_execution", "event_name": "session_start"}),
+        ),
+        line(
+            1_793_114_986,
+            "session/update",
+            text("user_message_chunk", "synthetic question"),
+        ),
+        line(
+            1_793_114_994,
+            "session/update",
+            text("agent_message_chunk", "synthetic answer"),
+        ),
+        line(
+            1_793_115_028,
+            "_x.ai/session/update",
+            serde_json::json!({"sessionUpdate": "turn_completed", "stop_reason": "end_turn"}),
+        ),
+    ];
+    std::fs::write(dir.join("updates.jsonl"), lines.join("\n") + "\n").expect("updates");
+}
+
+#[test]
+fn grok_reads_exact_workspace_sessions_idempotently() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_grok(&home, &project, "g1");
+    // A session run in a child directory belongs to the child, not to us.
+    plant_grok(&home, &project.join("child"), "g2");
+    assert_eq!(ingest_twice(&db, &home, &project, "grok"), (1, 2, 0));
+}
+
+/// Synthetic Kimi session directory with a main wire log.
+fn plant_kimi(home: &Path, id: &str, protocol: &str, state_work_dir: Option<&Path>) {
+    let dir = home.join(".kimi-code/sessions/wd_p_0").join(id);
+    std::fs::create_dir_all(dir.join("agents/main")).expect("kimi dir");
+    if let Some(work_dir) = state_work_dir {
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::json!({"workDir": work_dir}).to_string(),
+        )
+        .expect("state");
+    }
+    let lines = [
+        serde_json::json!({"type": "metadata", "protocol_version": protocol}).to_string(),
+        serde_json::json!({"type": "turn.prompt", "origin": {"kind": "user"}, "time": 1_781_305_535_254_i64,
+            "input": [{"type": "text", "text": "synthetic question"}]})
+        .to_string(),
+        serde_json::json!({"type": "context.append_loop_event", "time": 1_781_305_537_000_i64,
+            "event": {"type": "content.part", "uuid": format!("{id}-p1"),
+                "part": {"type": "text", "text": "synthetic answer"}}})
+        .to_string(),
+    ];
+    std::fs::write(dir.join("agents/main/wire.jsonl"), lines.join("\n") + "\n").expect("wire");
+}
+
+#[test]
+fn kimi_reads_timed_sessions_and_refuses_untimed_ones() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_kimi(&home, "session_timed", "1.4", Some(&project));
+    // Attributed only through the index, as most real sessions are.
+    plant_kimi(&home, "session_indexed", "1.5", None);
+    plant_kimi(&home, "ses_untimed", "1.0", None);
+    let index = ["session_indexed", "ses_untimed"]
+        .iter()
+        .map(|id| serde_json::json!({"sessionId": id, "workDir": project}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(home.join(".kimi-code/session_index.jsonl"), index + "\n").expect("index");
+
+    assert_eq!(ingest_twice(&db, &home, &project, "kimi"), (2, 4, 0));
+
+    let refused = ingest(
+        &db,
+        &home,
+        &project,
+        &["--harness", "kimi", "--session", "ses_untimed"],
+    )
+    .assert()
+    .failure()
+    .code(2);
+    assert!(refused.get_output().stdout.is_empty());
+    let err = parse_single_line_json(&refused.get_output().stderr);
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("cannot be read"), "{message}");
+    // `kimi export` writes a zip that `engram import` cannot read, so the
+    // hint must not send the user there.
+    let hint = err["error"]["hint"].as_str().expect("hint");
+    assert!(!hint.contains("kimi export"), "{hint}");
+    assert!(hint.contains("remember"), "{hint}");
+}
+
+/// Synthetic Deep Code project: an index naming its path, and one session.
+fn plant_deepcode(home: &Path, code: &str, original: &Path, id: &str) {
+    let dir = home.join(".deepcode/projects").join(code);
+    std::fs::create_dir_all(&dir).expect("deepcode dir");
+    std::fs::write(
+        dir.join("sessions-index.json"),
+        serde_json::json!({"version": 1, "entries": [], "originalPath": original}).to_string(),
+    )
+    .expect("index");
+    let message = |mid: &str, role: &str, content: &str| {
+        serde_json::json!({"id": mid, "sessionId": id, "role": role, "content": content,
+            "contentParams": null, "messageParams": null, "compacted": false, "visible": true,
+            "createTime": "2026-06-14T23:23:43.001Z", "updateTime": "2026-06-14T23:23:43.001Z"})
+        .to_string()
+    };
+    let lines = [
+        message(&format!("{id}-0"), "system", "You are Deep Code"),
+        message(&format!("{id}-1"), "user", "synthetic question"),
+        message(&format!("{id}-2"), "assistant", "synthetic answer"),
+    ];
+    std::fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n") + "\n").expect("session");
+}
+
+#[test]
+fn deepcode_reads_sessions_by_original_path() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let (home, project) = ingest_fixture(&tmp);
+    plant_deepcode(&home, "-project", &project, "d1");
+    plant_deepcode(&home, "-project-child", &project.join("child"), "d2");
+    assert_eq!(ingest_twice(&db, &home, &project, "deepcode"), (1, 2, 0));
 }

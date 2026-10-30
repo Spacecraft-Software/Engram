@@ -38,7 +38,10 @@ pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 pub mod copilot;
+pub mod deepcode;
 pub mod goose;
+pub mod grok;
+pub mod kimi;
 pub mod opencode;
 pub mod qwen;
 pub mod redact;
@@ -131,6 +134,9 @@ pub enum TranscriptError {
     /// The harness has no reader; the string explains what its transcripts
     /// look like instead.
     NoReader(&'static str),
+    /// The harness has a reader, but this session's log lacks something the
+    /// reader cannot do without; the string says what.
+    Unreadable(&'static str),
     /// `$HOME` could not be resolved, so no harness path can be built.
     NoHome,
     /// The transcript file could not be read.
@@ -145,7 +151,9 @@ pub enum TranscriptError {
 impl std::fmt::Display for TranscriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TranscriptError::NoReader(detail) => write!(f, "{detail}"),
+            TranscriptError::NoReader(detail) | TranscriptError::Unreadable(detail) => {
+                write!(f, "{detail}")
+            }
             TranscriptError::NoHome => {
                 write!(f, "cannot resolve the home directory (HOME is unset)")
             }
@@ -444,6 +452,9 @@ pub fn locate_session(
     match spec.transcript {
         TranscriptSupport::Reader(ReaderKind::ClaudeCode) => claude_code::find_by_id(spec, id),
         TranscriptSupport::Reader(ReaderKind::Antigravity) => antigravity::find_by_id(spec, id),
+        TranscriptSupport::Reader(ReaderKind::Grok) => grok::find_by_id(spec, id),
+        TranscriptSupport::Reader(ReaderKind::Kimi) => kimi::find_by_id(spec, id),
+        TranscriptSupport::Reader(ReaderKind::DeepCode) => deepcode::find_by_id(spec, id),
         _ => Ok(None),
     }
 }
@@ -459,6 +470,9 @@ pub fn sessions_for(spec: &HarnessSpec, cwd: &Path) -> Result<Vec<SessionRef>, T
         TranscriptSupport::Reader(ReaderKind::ClaudeCode) => claude_code::sessions(spec, cwd),
         TranscriptSupport::Reader(ReaderKind::Codex) => codex::sessions(spec, cwd),
         TranscriptSupport::Reader(ReaderKind::Antigravity) => antigravity::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::Grok) => grok::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::Kimi) => kimi::sessions(spec, cwd),
+        TranscriptSupport::Reader(ReaderKind::DeepCode) => deepcode::sessions(spec, cwd),
         TranscriptSupport::Reader(ReaderKind::Opencode) => opencode::sessions(spec, cwd),
         TranscriptSupport::Reader(ReaderKind::Goose) => goose::sessions(spec, cwd),
         TranscriptSupport::Reader(ReaderKind::CopilotCli) => copilot::sessions(spec, cwd),
@@ -486,6 +500,11 @@ pub fn read_session(
         TranscriptSupport::Reader(ReaderKind::Codex) => codex::read(Path::new(&session.path), opts),
         TranscriptSupport::Reader(ReaderKind::Antigravity) => {
             antigravity::read(Path::new(&session.path), &session.session_id, opts)
+        }
+        TranscriptSupport::Reader(ReaderKind::Grok) => grok::read(Path::new(&session.path), opts),
+        TranscriptSupport::Reader(ReaderKind::Kimi) => kimi::read(Path::new(&session.path), opts),
+        TranscriptSupport::Reader(ReaderKind::DeepCode) => {
+            deepcode::read(Path::new(&session.path), opts)
         }
         // A store-backed harness keeps every session in one file, so the
         // reader needs the id as well as the path.
@@ -631,6 +650,79 @@ pub(crate) fn sort_newest_first(sessions: &mut [(SessionRef, std::time::SystemTi
 /// Absolute path form used when reporting a session.
 pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Whether `id` may be joined into a path as one component.
+///
+/// By-id lookups take the id from the command line and join it under a
+/// harness's session root, so anything outside `[A-Za-z0-9_-]` — a slash, a
+/// `..` — is refused rather than resolved.
+pub(crate) fn is_path_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// Decodes `%XX` escapes. A malformed escape or invalid UTF-8 yields `None`,
+/// so a name engram cannot decode is never matched against a working
+/// directory by accident.
+pub(crate) fn percent_decode(encoded: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut iter = encoded.bytes();
+    while let Some(byte) = iter.next() {
+        if byte == b'%' {
+            let high = char::from(iter.next()?).to_digit(16)?;
+            let low = char::from(iter.next()?).to_digit(16)?;
+            bytes.push(u8::try_from(high * 16 + low).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Formats an instant as ISO 8601 UTC with **exactly three** fractional
+/// digits.
+///
+/// `memories.created_at` is compared as TEXT. jiff's default rendering drops
+/// a zero fraction, and `.` sorts before `Z`, so `…:00.500Z` would sort
+/// before `…:00Z` although it is later. A fixed width keeps text order equal
+/// to time order for every reader that uses this.
+pub(crate) fn iso_millis(ts: jiff::Timestamp) -> String {
+    ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// The `created_at` for the next record in whole second `second`, with an
+/// ordering-only millisecond fraction.
+///
+/// Some harnesses record whole seconds, and several records often share one.
+/// `recall` breaks `created_at` ties by `id`, a uuid, so same-second turns
+/// would otherwise reorder at random. Each call for the same second takes the
+/// next fraction in file order (`.000`, `.001`, …), saturating at `.999`. The
+/// fraction preserves reading order; it does not claim the harness's clock
+/// was that precise.
+///
+/// Returns `None` when `second` is not a representable instant.
+pub(crate) fn ordered_in_second(
+    seconds: &mut std::collections::HashMap<i64, i64>,
+    second: i64,
+) -> Option<String> {
+    let index = seconds.entry(second).or_default();
+    let millis = (*index).min(999);
+    *index = index.saturating_add(1);
+    jiff::Timestamp::from_millisecond(second.checked_mul(1000)?.checked_add(millis)?)
+        .ok()
+        .map(iso_millis)
+}
+
+/// A stable identity for a record that carries no id of its own:
+/// `{line}:{v5 digest of its text}`. The index alone would suffice for an
+/// append-only log; folding in the content means a line inserted earlier in
+/// the file does not silently re-identify every later turn.
+pub(crate) fn positional_id(line: usize, text: &str) -> String {
+    let digest = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, text.as_bytes()).simple();
+    format!("{line}:{digest}")
 }
 
 #[cfg(test)]

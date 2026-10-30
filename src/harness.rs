@@ -71,6 +71,9 @@ pub enum ReaderKind {
     ClaudeCode,
     Codex,
     Antigravity,
+    Grok,
+    Kimi,
+    DeepCode,
     /// Serves Opencode and Z.ai's Z Code, which share one schema.
     Opencode,
     Goose,
@@ -283,22 +286,18 @@ pub const ALL: &[HarnessSpec] = &[
         // `~/.kimi` is the pre-migration root and still holds sessions; the
         // `.migrated-to-kimi-code` marker inside it points at `~/.kimi-code`,
         // which is where configuration lives now. Probing both means a user on
-        // either side of that migration is detected.
+        // either side of that migration is detected. Only the kimi-code layout
+        // is read: its wire log is timed, while legacy `~/.kimi` sessions use a
+        // different schema and reach engram through `kimi export`.
         probe: &[".kimi-code", ".kimi"],
-        sessions_dir: Some(".kimi/sessions"),
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "kimi writes a line-oriented conversation engram could read — \
-                     sessions/wd_<name>_<hash>/<session>/agents/main/wire.jsonl in the \
-                     kimi-code layout, or the legacy sessions/<md5>/<session>/context.jsonl. \
-                     The working directory is recoverable three ways: session_index.jsonl \
-                     maps session to workDir, each session's state.json carries workDir, and \
-                     the legacy hash is the MD5 of the absolute path. What is missing is a \
-                     per-message timestamp, so ordering is positional",
-        },
+        sessions_dir: Some(".kimi-code/sessions"),
+        transcript: TranscriptSupport::Reader(ReaderKind::Kimi),
         command_surface: CommandSurface::Skill {
             dir: ".kimi-code/skills",
         },
-        export_command: Some("kimi export [session] -o out.zip"),
+        // `kimi export [session] -o out.zip` exists, but `engram import` does
+        // not read a zip, so naming it would only lead to a second failure.
+        export_command: None,
         also_scans: &[],
         mcp_config: Some(McpConfigSource::Json(".kimi-code/mcp.json")),
         hooks_config: None,
@@ -427,13 +426,7 @@ pub const ALL: &[HarnessSpec] = &[
         name: "grok",
         probe: &[".grok/config.toml", ".grok"],
         sessions_dir: Some(".grok/sessions"),
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "grok keeps a directory per working directory under .grok/sessions, named \
-                     by percent-encoding the absolute path (%2Fspacecraft-software%2Fbravais). \
-                     Unlike Claude Code's mangling that mapping is reversible, so a reader \
-                     would not need the cwd supplied. 83 files on this machine; a reader is \
-                     not written yet",
-        },
+        transcript: TranscriptSupport::Reader(ReaderKind::Grok),
         command_surface: CommandSurface::None {
             detail: "grok reads other vendors' directories on purpose — [compat.claude] in \
                      ~/.grok/config.toml scans ~/.claude/commands and ~/.claude/skills — so \
@@ -464,12 +457,7 @@ pub const ALL: &[HarnessSpec] = &[
         name: "deepcode",
         probe: &[".deepcode/projects", ".deepcode"],
         sessions_dir: Some(".deepcode/projects"),
-        transcript: TranscriptSupport::NotImplemented {
-            detail: "deepcode lays its sessions out like Claude Code — \
-                     projects/<mangled-cwd>/<uuid>.jsonl — but the records do not carry \
-                     Claude Code's keys (no type, uuid or cwd), so the existing reader would \
-                     not serve it. One session on this machine; not surveyed further",
-        },
+        transcript: TranscriptSupport::Reader(ReaderKind::DeepCode),
         command_surface: CommandSurface::None {
             detail: "deepcode has no user command directory engram has surveyed",
         },

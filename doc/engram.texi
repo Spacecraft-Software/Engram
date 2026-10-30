@@ -874,6 +874,25 @@ stored once.  The log records whole seconds and several records often share
 one, so engram appends a millisecond fraction in file order
 (@code{.000}, @code{.001}, @dots{}).  The fraction exists only to keep
 reading order; it is not the harness's precision.
+
+@item Grok
+Each working directory gets a directory named by percent-encoding its
+path, which engram decodes and compares exactly.  The conversation is read
+from @file{updates.jsonl}, the timed record of what the interface showed,
+rather than from the model's untimed context log.
+
+@item Kimi
+Only the main agent's @file{wire.jsonl} is read, and only from wire
+protocol 1.3 on, where every displayed record carries a time.  An older log
+--- typically a session migrated from @file{~/.kimi} --- records none, so
+engram refuses it and names @command{kimi export} and
+@command{engram import} instead of inventing an order.
+
+@item Deep Code
+Each project's @file{sessions-index.json} records the project's path
+verbatim, which listing compares with the working directory.  Every message
+carries a stable id, so a re-run stores nothing twice even though Deep Code
+rewrites its log on compaction.
 @end table
 
 A rollout carries the conversation twice: once as the events the interface
@@ -1405,11 +1424,14 @@ otherwise:
 @item claude-code @tab read @tab written @tab written (opt-in)
 @item openclaude @tab read @tab written @tab ---
 @item codex @tab read @tab written @tab ---
-@item opencode @tab --- @tab written @tab ---
+@item opencode @tab read @tab written @tab ---
 @item antigravity @tab read @tab plugin (skills) @tab ---
-@item qwen @tab --- @tab --- @tab ---
-@item goose @tab --- @tab --- @tab ---
-@item copilot-cli @tab --- @tab --- @tab ---
+@item qwen @tab read @tab skills @tab ---
+@item kimi @tab read @tab skills @tab ---
+@item grok @tab read @tab (via Claude Code's) @tab ---
+@item deepcode @tab read @tab --- @tab ---
+@item goose @tab read @tab --- @tab ---
+@item copilot-cli @tab read @tab --- @tab ---
 @end multitable
 
 @cindex openclaude
