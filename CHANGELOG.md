@@ -11,6 +11,8 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-31
+
 ### Fixed
 
 - **`database is locked` on open.** Every engram command rebuilt the FTS
