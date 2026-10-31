@@ -21,6 +21,12 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
   writes nothing, and long-lived connections such as `engram mcp` no longer
   re-read the schema after every CLI call.
 
+  Reads still write. `recall`, `search`, `context` and `get` record how often
+  each memory is read, on the CLI and through the MCP tools, and that update
+  needs the same lock at the end of the read. So `database is locked` can
+  still happen when another writer holds the lock for more than 5 seconds.
+  Only `--no-track` (CLI-only) reads write nothing.
+
 ## [0.7.0] — 2026-10-30
 
 ### Added
