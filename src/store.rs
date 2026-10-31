@@ -413,6 +413,29 @@ fn decode_vector(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// How long a statement waits for another connection's write lock before
+/// failing with `database is locked`. Five seconds outlasts any ordinary
+/// engram write; a writer holding the lock longer is stuck or doing bulk work.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long read-path access tracking waits for the write lock before
+/// skipping its bump (see [`Store::track_access`]). Long enough to ride out
+/// a normal commit, which takes milliseconds; short enough that a reader
+/// behind a bulk writer is not visibly delayed.
+const TRACKING_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// True for the two errors meaning another connection holds the lock.
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 impl Store {
     /// Opens (creating if needed) the shared database file. Point every
     /// agent at the same path — that's the entire "shared memory" story.
@@ -439,7 +462,7 @@ impl Store {
     /// place for pragmas + schema + migration, so the two cannot drift.
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // Required by the facts index (M4): `facts_extract` upserts with
         // INSERT OR REPLACE, and SQLite fires the conflict-resolution
         // DELETE's triggers only when recursive triggers are enabled.
@@ -495,7 +518,20 @@ impl Store {
     /// Bumps the access-tracking columns for the given memory ids: one
     /// batched `UPDATE` per 500-id chunk (SQLite's default host-parameter
     /// ceiling is 999; 500 leaves comfortable margin), all sharing one
-    /// timestamp. A no-op when tracking is off or `ids` is empty.
+    /// timestamp and one transaction. A no-op when tracking is off or `ids`
+    /// is empty.
+    ///
+    /// **Skipped, not failed, when the database is busy.** The bump is a
+    /// write, so it needs the lock another writer (an `ingest`, a second
+    /// agent) may be holding. Waiting the full [`BUSY_TIMEOUT`] and then
+    /// failing turned a successful read into `database is locked` over a
+    /// counter. The transaction is therefore begun under the much shorter
+    /// [`TRACKING_BUSY_TIMEOUT`]; if the lock is still held, the read keeps
+    /// its results and the bump is dropped. That only makes those memories
+    /// look slightly staler to `consolidate --report` — no data is lost —
+    /// and it is not reported, because the envelope has no warnings channel
+    /// and the decay score is a heuristic, not a ledger. Any other error
+    /// still fails the read.
     ///
     /// Called at the END of each tracked read, inside the same lock, and
     /// only for the memories actually *returned* — candidates that lost the
@@ -510,6 +546,19 @@ impl Store {
         if !self.tracking || ids.is_empty() {
             return Ok(());
         }
+        // The short timeout covers BEGIN IMMEDIATE only: once it returns,
+        // this connection holds the write lock and the updates cannot wait.
+        self.conn.busy_timeout(TRACKING_BUSY_TIMEOUT)?;
+        let begun = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        );
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        let tx = match begun {
+            Ok(tx) => tx,
+            Err(e) if is_busy(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         let now = crate::time::now_iso8601();
         for chunk in ids.chunks(500) {
             let placeholders: Vec<String> =
@@ -524,9 +573,9 @@ impl Store {
             for id in chunk {
                 bind.push(id);
             }
-            self.conn.execute(&sql, rusqlite::params_from_iter(bind))?;
+            tx.execute(&sql, rusqlite::params_from_iter(bind))?;
         }
-        Ok(())
+        tx.commit()
     }
 
     pub fn remember(
@@ -3982,6 +4031,50 @@ mod tests {
             before,
             "a steady-state open must not change the schema"
         );
+    }
+
+    #[test]
+    fn a_tracked_read_under_a_held_write_lock_succeeds_and_skips_the_bump() {
+        // The access bump is a write. It used to wait the full busy timeout
+        // behind another writer and then fail the whole read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("engram.db");
+        let store = Store::open(&path).expect("open");
+        let mem = store
+            .remember("a", "busy", "note", "read while another writes")
+            .expect("remember");
+
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold the write lock");
+        let started = std::time::Instant::now();
+        let rows = store
+            .recall("busy", 10, Validity::Current)
+            .expect("a busy database must not fail a tracked read");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            started.elapsed() < BUSY_TIMEOUT / 2,
+            "the bump waits the short tracking timeout, not the full one: {:?}",
+            started.elapsed()
+        );
+        writer.execute_batch("COMMIT;").expect("release");
+
+        let busy_timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("busy_timeout");
+        assert_eq!(
+            u128::try_from(busy_timeout).expect("non-negative"),
+            BUSY_TIMEOUT.as_millis(),
+            "the full timeout is restored for every other statement"
+        );
+        let (count, _) = access(&store, &mem.id);
+        assert_eq!(count, None, "the skipped bump wrote nothing");
+
+        store.recall("busy", 10, Validity::Current).expect("recall");
+        let (count, _) = access(&store, &mem.id);
+        assert_eq!(count, Some(1), "once the lock is free, tracking resumes");
     }
 
     #[test]
