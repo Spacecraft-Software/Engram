@@ -474,10 +474,6 @@ impl Store {
             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
                 INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
             END;
-            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
             "#,
         )?;
         migrate(&conn)?;
@@ -2293,22 +2289,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "access_count") {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN access_count INTEGER;")?;
     }
-    // Narrow the FTS update trigger to content changes (M5). The original
-    // trigger fired on EVERY update, so each access-tracking bump — i.e.
-    // every read — and each supersession (`valid_to`/`superseded_by`) would
-    // churn the FTS index with a pointless delete+reinsert of unchanged
-    // content. `AFTER UPDATE OF content` fires only when a statement assigns
-    // the content column (rule revisions), which is the only case the index
-    // must follow. SQLite has no CREATE OR REPLACE TRIGGER, so the narrowing
-    // is an unconditional drop+create on every open — idempotent, and it
-    // also converts the broad trigger in any pre-M5 database in place.
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS memories_au;
-         CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
-             INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-             INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-         END;",
-    )?;
+    install_fts_update_trigger(conn)?;
     // Partial index: enforces one rule per (scope, rule_id) without constraining
     // ordinary messages, which all have a NULL rule_id.
     conn.execute_batch(
@@ -2373,6 +2354,69 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         END;",
     )?;
     Ok(())
+}
+
+/// The FTS update trigger, narrowed to content changes (M5).
+///
+/// The original trigger fired on EVERY update, so each access-tracking bump
+/// — i.e. every read — and each supersession (`valid_to`/`superseded_by`)
+/// churned the FTS index with a pointless delete+reinsert of unchanged
+/// content. `AFTER UPDATE OF content` fires only when a statement assigns the
+/// content column (rule revisions), which is the only case the index must
+/// follow.
+///
+/// Written the way SQLite stores it in `sqlite_master.sql` — no `IF NOT
+/// EXISTS`, no trailing semicolon — so [`install_fts_update_trigger`] can
+/// compare the two.
+const MEMORIES_AU_DDL: &str = "CREATE TRIGGER memories_au AFTER UPDATE OF content ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END";
+
+/// Installs [`MEMORIES_AU_DDL`] unless the database already has it.
+///
+/// SQLite has no `CREATE OR REPLACE TRIGGER`, and replacing one is a drop
+/// plus a create — DDL, which takes the database's write lock and bumps its
+/// schema cookie. This used to run unconditionally on every open, which made
+/// every engram process a writer before it had done anything: a pure
+/// `recall` waited out the 5 s busy timeout behind any other writer and
+/// failed `database is locked`, and every long-lived connection (an `engram
+/// mcp` server) had to re-read the schema after each CLI call. Comparing
+/// first keeps a steady-state open free of writes; only a new database or
+/// a pre-M5 one (whose trigger fired on every update) is rewritten.
+///
+/// SQLite keeps the trigger body's whitespace verbatim but normalizes the
+/// `CREATE TRIGGER` prefix, so the comparison collapses whitespace. A
+/// database created by the earlier unconditional rewrite therefore matches
+/// and is not rewritten even once. The drop and create share one
+/// `IMMEDIATE` transaction, so no concurrent update can land between them
+/// with no trigger installed and leave the FTS index stale.
+///
+/// # Errors
+///
+/// Returns the underlying `rusqlite` error if the schema cannot be read or
+/// the trigger cannot be replaced.
+fn install_fts_update_trigger(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+
+    let installed: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_au'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if installed.as_deref().map(collapse_whitespace) == Some(collapse_whitespace(MEMORIES_AU_DDL)) {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS memories_au;")?;
+    tx.execute_batch(MEMORIES_AU_DDL)?;
+    tx.commit()
+}
+
+fn collapse_whitespace(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
@@ -2484,6 +2528,10 @@ mod tests {
                     content, content='memories', content_rowid='rowid'
                 );
                 CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+                END;
+                CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
                     INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
                 END;
                 "#,
@@ -3895,6 +3943,68 @@ mod tests {
             trigger_sql.contains("UPDATE OF content"),
             "the update trigger must fire on content changes only: {trigger_sql}"
         );
+    }
+
+    fn schema_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .expect("schema_version")
+    }
+
+    #[test]
+    fn reopening_an_existing_database_takes_no_write_lock() {
+        // Every open used to drop and recreate memories_au. That DDL needs
+        // the write lock, so with another writer active even a pure read
+        // waited out the busy timeout and failed "database is locked".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("engram.db");
+        let first = Store::open(&path).expect("first open");
+        first
+            .remember("a", "lock", "note", "written before the lock")
+            .expect("remember");
+        drop(first);
+
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold the write lock");
+        let before = schema_version(&writer);
+
+        let mut reader = Store::open(&path).expect("reopen while another connection writes");
+        reader.set_tracking(false);
+        let rows = reader
+            .recall("lock", 10, Validity::Current)
+            .expect("untracked recall needs no write lock");
+        assert_eq!(rows.len(), 1);
+
+        writer.execute_batch("COMMIT;").expect("release");
+        assert_eq!(
+            schema_version(&writer),
+            before,
+            "a steady-state open must not change the schema"
+        );
+    }
+
+    #[test]
+    fn a_trigger_from_the_old_unconditional_rewrite_is_kept_as_is() {
+        // Databases opened by 0.7.0 and earlier hold memories_au exactly as
+        // that batch wrote it: same statement, different indentation. That
+        // must count as installed, or upgrading would rewrite it once more.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("engram.db");
+        drop(Store::open(&path).expect("create"));
+        let conn = Connection::open(&path).expect("conn");
+        conn.execute_batch(
+            "DROP TRIGGER memories_au;
+         CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+             INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+             INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;",
+        )
+        .expect("old-style trigger");
+        let before = schema_version(&conn);
+
+        drop(Store::open(&path).expect("reopen"));
+        assert_eq!(schema_version(&conn), before);
     }
 
     #[test]
