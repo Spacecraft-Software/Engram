@@ -11,6 +11,22 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **`database is locked` on open.** Every engram command rebuilt the FTS
+  update trigger when it opened the database, which needs the write lock.
+  With another writer active, even an untracked `recall` waited the full
+  5-second busy timeout and failed. The trigger is now rebuilt only when it
+  differs from the expected definition, so opening an existing database
+  writes nothing, and long-lived connections such as `engram mcp` no longer
+  re-read the schema after every CLI call.
+
+  Reads still write. `recall`, `search`, `context` and `get` record how often
+  each memory is read, on the CLI and through the MCP tools, and that update
+  needs the same lock at the end of the read. So `database is locked` can
+  still happen when another writer holds the lock for more than 5 seconds.
+  Only `--no-track` (CLI-only) reads write nothing.
+
 ## [0.7.0] — 2026-10-30
 
 ### Added
