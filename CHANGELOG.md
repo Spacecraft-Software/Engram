@@ -22,7 +22,9 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
     only by you, and prints the path but never the token. `--token-file`
     picks another file.
   - **Refusals:** a token file other users can read, or one shorter than 32
-    characters, is refused before the server listens.
+    characters, is refused before the server listens. Token authentication
+    is Unix-only: where engram cannot verify that the file is private, it
+    refuses the file instead of trusting it.
   - **Opting out:** `--no-auth` restores the open server, on a loopback
     address only.
   - **Errors:** a failure to bind is now a structured error with exit code 2,

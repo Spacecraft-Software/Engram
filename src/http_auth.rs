@@ -147,9 +147,19 @@ fn check_permissions(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Fails closed where engram cannot inspect permissions. On Windows a new
+/// file inherits its directory's ACL, which may grant other users read
+/// access, and verifying that needs the Win32 security API. Engram is built
+/// and tested on Unix only, so rather than ship an untested ACL check it
+/// refuses to trust a token file it cannot verify. `--no-auth` remains,
+/// loopback only.
 #[cfg(not(unix))]
-fn check_permissions(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn check_permissions(path: &Path) -> Result<(), String> {
+    Err(format!(
+        "cannot verify that token file {} is private on this platform; \
+         token authentication is supported on Unix only",
+        path.display()
+    ))
 }
 
 /// Compares two byte strings in time that depends only on their lengths, so
