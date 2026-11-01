@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! HTTP API. Same Store, same data shapes as the CLI and MCP surfaces —
 //! for tools that don't speak MCP (curl, Nushell `http`, other services).
-//! Local-only by default (PFA: bind 127.0.0.1, no auth, no telemetry).
-//! Add a Bearer token check before exposing this beyond localhost.
+//! Local-only by default (PFA: bind 127.0.0.1, no telemetry), and every
+//! route but `/v1/health` needs a bearer token unless `serve --no-auth` was
+//! given; see [`crate::http_auth`].
 
+use crate::http_auth::{require_token, Auth};
 use crate::output::envelope::Response;
 use crate::store::{RetireOutcome, Store, SupersedeOutcome, Validity};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -75,7 +78,9 @@ fn http_validity(as_of: Option<&str>, include_superseded: bool) -> Result<Validi
     }
 }
 
-pub fn router(store: SharedStore) -> Router {
+/// Builds the API. `auth` is applied to every route as one layer, so a route
+/// added later cannot forget the check.
+pub fn router(store: SharedStore, auth: Auth) -> Router {
     Router::new()
         .route("/v1/memory", post(remember))
         .route("/v1/memory/recall", get(recall))
@@ -93,6 +98,7 @@ pub fn router(store: SharedStore) -> Router {
         .route("/v1/rules/:rule_id", delete(rule_retire))
         .route("/v1/health", get(health))
         .with_state(store)
+        .layer(middleware::from_fn_with_state(auth, require_token))
 }
 
 #[derive(Deserialize)]
@@ -645,6 +651,12 @@ mod tests {
     /// ...`) — dropping it deletes the database along with its WAL/SHM
     /// sidecar files. A directory per test keeps concurrently running tests
     /// fully isolated from one another.
+    /// The API with authentication off. Route-behaviour tests use this; the
+    /// bearer check has its own tests below.
+    fn app(store: SharedStore) -> Router {
+        router(store, Auth::Disabled)
+    }
+
     fn test_store() -> (tempfile::TempDir, SharedStore) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let store = Store::open(&dir.path().join("engram-test.db")).expect("open test store");
@@ -703,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn post_memory_round_trips_content() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let body = serde_json::json!({
             "agent": "test-agent",
             "scope": "http-remember",
@@ -724,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn post_memory_whitespace_content_is_400() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let body = serde_json::json!({
             "agent": "test-agent",
             "scope": "http-remember",
@@ -745,7 +757,7 @@ mod tests {
     #[tokio::test]
     async fn post_memory_malformed_json_is_client_error() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let req = Request::builder()
             .method("POST")
             .uri("/v1/memory")
@@ -762,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn recall_returns_chronological_order() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         for content in ["first message", "second message"] {
             let body = serde_json::json!({
                 "agent": "test-agent",
@@ -788,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn search_finds_inserted_row_and_survives_operators() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let body = serde_json::json!({
             "agent": "test-agent",
             "scope": "search-scope",
@@ -826,7 +838,7 @@ mod tests {
     #[tokio::test]
     async fn recall_with_budget_reports_and_drops_when_tight() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         for content in ["aaaa", "bbbb", "cccc"] {
             let body = serde_json::json!({
                 "agent": "test-agent",
@@ -867,7 +879,7 @@ mod tests {
     #[tokio::test]
     async fn context_returns_rules_memories_and_budget() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let rule = serde_json::json!({
             "rule_id": "http-context-rule",
             "text": "Context blocks must open with the rules.",
@@ -909,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn context_with_unknown_scope_is_200_and_empty() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let (status, text) = send(&app, get("/v1/context?scope=never-used")).await;
         assert_eq!(status, StatusCode::OK, "body: {text}");
         let json = parse(&text);
@@ -921,7 +933,7 @@ mod tests {
     #[tokio::test]
     async fn recall_without_scope_is_client_error() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let (status, text) = send(&app, get("/v1/memory/recall")).await;
         assert!(
             status.is_client_error(),
@@ -932,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn rule_add_rejects_bad_id_then_accepts_valid_body() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
 
         // Whitespace in the id fails validation before anything is stored.
         let bad = serde_json::json!({
@@ -961,7 +973,7 @@ mod tests {
     #[tokio::test]
     async fn delete_unknown_rule_is_404_from_the_handler() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let (status, text) = send(&app, delete("/v1/rules/some-unknown-id?scope=rules-404")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {text}");
         // The handler's own message, not axum's bare fallback 404. This locks
@@ -977,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn delete_rule_retires_then_reports_already_retired() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let body = serde_json::json!({
             "rule_id": "retire-me",
             "text": "A rule that is about to be withdrawn.",
@@ -999,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn health_reports_ok() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let (status, text) = send(&app, get("/v1/health")).await;
         assert_eq!(status, StatusCode::OK, "body: {text}");
         let json = parse(&text);
@@ -1010,12 +1022,100 @@ mod tests {
         );
     }
 
+    // --- Bearer authentication --------------------------------------------
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn guarded(store: SharedStore) -> Router {
+        router(store, Auth::Bearer(TOKEN.into()))
+    }
+
+    fn with_auth(mut req: Request<Body>, value: &str) -> Request<Body> {
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, value.parse().expect("header value"));
+        req
+    }
+
+    #[tokio::test]
+    async fn every_route_but_health_needs_the_token() {
+        let (_dir, store) = test_store();
+        let app = guarded(store);
+        let requests = [
+            get("/v1/memory/recall?scope=x"),
+            get("/v1/memory/search?query=x"),
+            get("/v1/context?scope=x"),
+            get("/v1/rules?scope=x"),
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({"agent": "a", "scope": "x", "content": "c"}),
+            ),
+            // dry_run: if the check ever broke, this must not touch a real AGENTS.md.
+            post_json(
+                "/v1/rules/sync",
+                &serde_json::json!({"scope": "x", "dry_run": true}),
+            ),
+            delete("/v1/rules/some-rule?scope=x"),
+        ];
+        for req in requests {
+            let uri = req.uri().clone();
+            let response = app.clone().oneshot(req).await.expect("infallible");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(
+                response.headers()[header::WWW_AUTHENTICATE],
+                "Bearer realm=\"engram\"",
+                "{uri}"
+            );
+        }
+        let (status, _) = send(&app, get("/v1/health")).await;
+        assert_eq!(status, StatusCode::OK, "health stays open for supervisors");
+    }
+
+    #[tokio::test]
+    async fn the_right_token_is_accepted_and_others_are_not() {
+        let (_dir, store) = test_store();
+        let app = guarded(store);
+        let write = || {
+            post_json(
+                "/v1/memory",
+                &serde_json::json!({"agent": "a", "scope": "auth", "content": "kept"}),
+            )
+        };
+
+        let (status, text) = send(&app, with_auth(write(), &format!("Bearer {TOKEN}"))).await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+
+        let (status, text) = send(&app, with_auth(write(), &format!("Bearer {TOKEN}x"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            parse(&text)["error"]["message"],
+            "invalid bearer token",
+            "the body uses the same error shape as every other route"
+        );
+        let (status, _) = send(&app, with_auth(write(), &format!("Basic {TOKEN}"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, text) = send(
+            &app,
+            with_auth(
+                get("/v1/memory/recall?scope=auth"),
+                &format!("bearer {TOKEN}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the scheme is case-insensitive");
+        assert_eq!(
+            parse(&text)["data"].as_array().map(Vec::len),
+            Some(1),
+            "only the authorized write landed: {text}"
+        );
+    }
+
     // --- M2: supersession + validity -------------------------------------
 
     #[tokio::test]
     async fn supersede_chain_outcomes_over_http() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
 
         let (_, body) = send(
             &app,
@@ -1092,7 +1192,7 @@ mod tests {
     #[tokio::test]
     async fn validity_params_validate_over_http() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
 
         let (status, _) = send(&app, get("/v1/memory/recall?scope=s&as_of=yesterday")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1110,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn search_mode_fts_works_and_bad_modes_are_400() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         let body = serde_json::json!({
             "agent": "a", "scope": "mode-scope", "content": "the gyroscope drifts",
         });
@@ -1142,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn search_mode_hybrid_without_prerequisites_is_400() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
         // Whatever is missing — the feature (default build), the model, or
         // any indexed vectors (a fresh test database never has them) — an
         // explicit hybrid request must answer 400 with a hint, not fall back
@@ -1163,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn get_memory_by_id_finds_current_and_superseded_rows() {
         let (_dir, store) = test_store();
-        let app = router(store);
+        let app = app(store);
 
         let (_, body) = send(
             &app,

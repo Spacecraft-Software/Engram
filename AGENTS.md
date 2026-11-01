@@ -19,7 +19,7 @@ cargo doc -p rmcp --open                 # verify rmcp 0.16 macro shape if build
 |---|---|---|
 | CLI | `engram remember/recall/search/context/save-chat/mcp/serve/schema/describe` | clap derive, stdin fallback for content |
 | MCP | `engram mcp` | rmcp 0.16 stdio, `#[tool_router]`/`#[tool_handler]` macros |
-| HTTP | `engram serve` | axum, `127.0.0.1:8420`, no auth |
+| HTTP | `engram serve` | axum, `127.0.0.1:8420`, bearer token (`src/http_auth.rs`) |
 
 ## CLI quirks
 
@@ -157,12 +157,19 @@ cargo doc -p rmcp --open
 ./target/release/engram mcp --db ./engram.db
 ```
 
-**Run as HTTP server** (local-only, `127.0.0.1:8420`, no auth):
+**Run as HTTP server** (`127.0.0.1:8420`, bearer token required):
 ```sh
 ./target/release/engram serve --db ./engram.db --addr 127.0.0.1:8420
-curl -s -XPOST localhost:8420/v1/memory -d '{"agent":"kimi","scope":"x","content":"..."}'
-curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
+T=$(cat ~/.local/state/engram/http-token)
+curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -XPOST localhost:8420/v1/memory -d '{"agent":"kimi","scope":"x","content":"..."}'
+curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/memory/recall?scope=x&limit=10"
 ```
+
+**HTTP authentication** (`src/http_auth.rs`, 0.8.0). Loopback keeps out other machines, not other programs, and `POST /v1/rules/sync` rewrites `AGENTS.md`, so the token is on by default.
+- **Token file:** `--token-file`, else `$XDG_STATE_HOME/engram/http-token` (absolute only), else `~/.local/state/engram/http-token`. Created on first start with `create_new`, file `0600`, directory `0700`; 64 hex chars from two v4 UUIDs (`getrandom`), so no new dependency. A file that group/others can read, or shorter than 32 chars, is refused with exit 2 **before** the socket is bound. `serve` prints the path, never the token.
+- **Check:** one `from_fn_with_state` layer over the whole router, so a new route cannot skip it. Scheme case-insensitive; constant-time compare; failure is 401 with `WWW-Authenticate: Bearer realm="engram"` and the usual `{"error":{message,hint,timestamp}}` body. `/v1/health` stays open for supervisors.
+- **`--no-auth`** restores the open server and is refused unless the bound address is loopback.
+- **Tests:** route tests build `router(store, Auth::Disabled)` via `app()`; the bearer tests use `guarded()`. Any test that could reach `rules/sync` passes `dry_run`, so a broken check can never write a real `AGENTS.md`.
 
 `cargo test` covers the rules subsystem (unit tests in `rules.rs`/`store.rs`) and the memory surfaces (integration tests in `tests/cli.rs`). CI runs rustfmt, clippy, and the test suite via `.github/workflows/ci.yml`.
 
@@ -388,4 +395,3 @@ Landed in 0.2.0 (no longer gaps): `--format jsonl|csv`, `remember --dry-run`, re
 Still missing:
 
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore` (no TUI yet).
-- Authentication on the HTTP surface (currently `127.0.0.1`-only, no bearer check).

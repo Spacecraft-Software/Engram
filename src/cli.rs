@@ -317,10 +317,19 @@ EXAMPLES:
     },
     /// Run as an MCP server over stdio.
     Mcp,
-    /// Run the HTTP API.
+    /// Run the HTTP API. Every route but /v1/health needs
+    /// `Authorization: Bearer <token>`; the token file is created on first
+    /// start and its path printed.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8420")]
         addr: String,
+        /// Token file to read, or create when missing
+        /// [default: $XDG_STATE_HOME/engram/http-token, else ~/.local/state/engram/http-token].
+        #[arg(long, conflicts_with = "no_auth")]
+        token_file: Option<std::path::PathBuf>,
+        /// Serve without authentication. Refused unless `--addr` is a loopback address.
+        #[arg(long)]
+        no_auth: bool,
     },
     /// JSON Schema for engram's data types (CLI Standard introspection).
     Schema,

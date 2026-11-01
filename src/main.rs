@@ -11,6 +11,7 @@ mod error;
 mod facts;
 mod harness;
 mod http;
+mod http_auth;
 mod import;
 mod install;
 mod managed_file;
@@ -454,18 +455,11 @@ fn run(
             }
             0
         }
-        Command::Serve { addr } => {
-            #[cfg(feature = "vector")]
-            embed::warm(model_path.as_deref());
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async {
-                let app = http::router(store);
-                let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind address");
-                eprintln!("engram: serving on http://{addr} (local-only; no auth — do not expose beyond localhost)");
-                axum::serve(listener, app).await.expect("serve");
-            });
-            0
-        }
+        Command::Serve {
+            addr,
+            token_file,
+            no_auth,
+        } => run_serve(store, &addr, token_file, no_auth, model_path, mode),
         Command::Schema => {
             let schema = serde_json::json!({
                 "Memory": schemars::schema_for!(store::Memory),
@@ -1832,6 +1826,114 @@ fn scope_error(e: std::io::Error) -> AppError {
 }
 
 /// Emits an error in the active mode and yields its exit code.
+/// `engram serve`: resolve authentication, bind, and run until killed.
+///
+/// Auth is settled before the socket is bound, so a bad token file never
+/// leaves a server listening without its check. `--no-auth` on a non-loopback
+/// address is refused: it would hand every memory, and `AGENTS.md` through
+/// rule sync, to the network.
+fn run_serve(
+    store: Arc<Mutex<Store>>,
+    addr: &str,
+    token_file: Option<std::path::PathBuf>,
+    no_auth: bool,
+    model_path: Option<std::path::PathBuf>,
+    mode: OutputMode,
+) -> i32 {
+    let invalid = |message: String, hint: &str| {
+        AppError::new(error::ErrorCode::InvalidArgument, 2, message, hint)
+    };
+    let (auth, auth_note) = if no_auth {
+        (
+            http_auth::Auth::Disabled,
+            "no auth: any local process can read and write".to_string(),
+        )
+    } else {
+        let Some(path) = token_file.or_else(http_auth::default_token_path) else {
+            return fail(
+                invalid(
+                    "cannot locate a token file: neither XDG_STATE_HOME nor HOME is set".into(),
+                    "pass --token-file PATH",
+                ),
+                mode,
+            );
+        };
+        match http_auth::load_or_create(&path) {
+            Ok((token, source)) => {
+                let verb = match source {
+                    http_auth::TokenSource::Created => "created",
+                    http_auth::TokenSource::Existing => "using",
+                };
+                (
+                    http_auth::Auth::Bearer(token),
+                    format!("bearer token required; {verb} {}", path.display()),
+                )
+            }
+            Err(message) => {
+                return fail(
+                    invalid(message, "fix the token file, or pass --token-file PATH"),
+                    mode,
+                )
+            }
+        }
+    };
+    #[cfg(feature = "vector")]
+    embed::warm(model_path.as_deref());
+    #[cfg(not(feature = "vector"))]
+    let _ = model_path;
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            return fail(
+                AppError::new(
+                    error::ErrorCode::InternalError,
+                    1,
+                    format!("cannot start the async runtime: {e}"),
+                    "",
+                ),
+                mode,
+            )
+        }
+    };
+    rt.block_on(async {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                return fail(
+                    invalid(
+                        format!("cannot bind {addr}: {e}"),
+                        "pick a free address with --addr",
+                    ),
+                    mode,
+                )
+            }
+        };
+        let local = listener.local_addr().map(|a| a.ip().is_loopback());
+        if no_auth && !matches!(local, Ok(true)) {
+            return fail(
+                invalid(
+                    format!("--no-auth is refused on non-loopback address {addr}"),
+                    "drop --no-auth, or bind 127.0.0.1",
+                ),
+                mode,
+            );
+        }
+        eprintln!("engram: serving on http://{addr} ({auth_note})");
+        match axum::serve(listener, http::router(store, auth)).await {
+            Ok(()) => 0,
+            Err(e) => fail(
+                AppError::new(
+                    error::ErrorCode::InternalError,
+                    1,
+                    format!("server stopped: {e}"),
+                    "",
+                ),
+                mode,
+            ),
+        }
+    })
+}
+
 fn fail(err: AppError, mode: OutputMode) -> i32 {
     emit_error(&err, mode);
     err.exit_code
