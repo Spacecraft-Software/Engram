@@ -220,8 +220,7 @@ storage failure. New routes should keep following that pattern.
 
 ## What's deliberately not here yet
 
-- `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore`
-  (no TUI yet). `json`, `jsonl`, and `csv` exist.
+- `--format explore` (no TUI yet). `json`, `jsonl`, `csv`, and `yaml` exist.
 - Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
   writes files.
 - Transcript readers for Cursor and VS Code, which keep chat as editor state

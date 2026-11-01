@@ -16,11 +16,12 @@ pub enum OutputMode {
     Json,
     Jsonl,
     Csv,
+    Yaml,
 }
 
 impl OutputMode {
     pub fn is_machine(self) -> bool {
-        matches!(self, Self::Json | Self::Jsonl | Self::Csv)
+        matches!(self, Self::Json | Self::Jsonl | Self::Csv | Self::Yaml)
     }
 }
 
@@ -42,6 +43,7 @@ pub fn resolve_mode(
             Format::Json => OutputMode::Json,
             Format::Jsonl => OutputMode::Jsonl,
             Format::Csv => OutputMode::Csv,
+            Format::Yaml => OutputMode::Yaml,
         };
     }
     if json_flag {

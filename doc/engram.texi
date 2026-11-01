@@ -148,8 +148,11 @@ Alias for @code{--format json}.
 
 @item --format @var{format}
 @cindex output formats
-Machine output format: @code{json}, @code{jsonl}, or @code{csv}.
-Overrides mode auto-detection.  (@code{yaml} is deferred.)
+Machine output format: @code{json}, @code{jsonl}, @code{csv}, or
+@code{yaml}.  Overrides mode auto-detection.  @code{yaml} is the same
+envelope as a YAML 1.2 block document, with every string
+double-quoted, so no value can be misread as a number, boolean or
+null.
 
 @item --no-color
 @cindex colors, disabling

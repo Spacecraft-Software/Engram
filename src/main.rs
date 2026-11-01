@@ -586,9 +586,10 @@ fn run(
                 "transports": ["cli", "mcp-stdio", "http"],
                 "storage": "sqlite+fts5, single shared file",
                 "output": {
-                    "formats": ["json", "jsonl", "csv"],
+                    "formats": ["json", "jsonl", "csv", "yaml"],
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
+                    "yaml": "the same envelope as a YAML 1.2 block document; every string double-quoted",
                     "dry_run": "remember and rule sync accept --dry-run; the envelope carries metadata.dry_run=true",
                     "accessible": "--accessible or SPACECRAFT_A11Y=1 (Standard §18); status tags [OK]/[ERROR] are present in every human mode",
                     "budgeting": "recall/search accept --budget-tokens and context always packs to one; \
@@ -2103,6 +2104,10 @@ fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
         }
         OutputMode::Jsonl => emit_jsonl(&resp),
         OutputMode::Csv => emit_csv(&resp),
+        OutputMode::Yaml => {
+            let value = serde_json::to_value(&resp).expect("Response serializes");
+            print!("{}", output::yaml::to_yaml(&value));
+        }
         OutputMode::HumanWithColor | OutputMode::HumanNoColor => {
             // Status tag to stderr (never color-only, §18.2.1); the data
             // payload alone goes to stdout (§7 stdout/stderr separation).
