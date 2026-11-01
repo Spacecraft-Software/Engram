@@ -227,8 +227,6 @@ storage failure. New routes should keep following that pattern.
 
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore`
   (no TUI yet). `json`, `jsonl`, and `csv` exist.
-- Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
-  writes files.
 - Transcript readers for Cursor and VS Code, which keep chat as editor state
   rather than a per-session log. `engram ingest --list` names every harness
   without a reader and why. For those, `remember` during the session and
