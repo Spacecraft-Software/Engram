@@ -1055,10 +1055,11 @@ writes; reference the plugin directory from the configuration instead.
 
 @command{install} writes into the user's home directory, a step beyond
 anything else engram does --- @command{rule sync} stays inside the
-project root.  The HTTP surface has no authentication, which already
-means any local process can rewrite a project's @file{AGENTS.md}.
-Exposing @command{install} there would extend that reach to the home
-directory, and eventually to code executed at the end of every session.
+project root.  The HTTP surface can already rewrite a project's
+@file{AGENTS.md} for any caller holding its token, or for any local
+process under @option{--no-auth}.  Exposing @command{install} there
+would extend that reach to the home directory, and eventually to code
+executed at the end of every session.
 There is no route, and there should not be one.
 
 @node MCP Server
@@ -1179,8 +1180,34 @@ argument on every rule call.
 @cindex routes
 
 @command{engram serve} binds a local-only HTTP API --- default
-@code{127.0.0.1:8420}, no authentication.  Do not expose it beyond the
-loopback interface.
+@code{127.0.0.1:8420}.  Do not expose it beyond the loopback interface.
+
+@cindex authentication
+@cindex bearer token
+@cindex @option{--no-auth}
+@cindex @option{--token-file}
+Binding to loopback keeps other machines out, not other programs, so
+every route except @code{/v1/health} requires an
+@samp{Authorization: Bearer @var{token}} header.  On first start,
+@command{serve} creates the token in
+@file{$XDG_STATE_HOME/engram/http-token}, or
+@file{~/.local/state/engram/http-token} when that variable is unset,
+readable only by its owner, and prints the path (never the token).
+A client reads the file:
+
+@example
+T=$(cat ~/.local/state/engram/http-token)
+curl -s -H "Authorization: Bearer $T" \
+  "localhost:8420/v1/memory/recall?scope=x"
+@end example
+
+@option{--token-file @var{path}} names another file, which is created
+when missing.  A token file that other users can read, or that holds
+fewer than 32 characters, is refused before anything listens.  A
+missing or wrong token gets @code{401 Unauthorized} with a
+@code{WWW-Authenticate: Bearer} header and the usual error body.
+@option{--no-auth} serves without the check, and is refused unless
+the address is a loopback address.
 
 @cindex status codes
 As of 0.2.0, @emph{all} routes return real HTTP status codes (a
