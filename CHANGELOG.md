@@ -11,6 +11,25 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Changed
+
+- **The HTTP API requires a bearer token (breaking).** Binding to
+  `127.0.0.1` kept other machines out but not other programs, and
+  `POST /v1/rules/sync` can rewrite a project's `AGENTS.md`. Every route
+  except `/v1/health` now needs `Authorization: Bearer <token>`.
+  - **Token:** `engram serve` creates it on first start at
+    `~/.local/state/engram/http-token` (or under `$XDG_STATE_HOME`), readable
+    only by you, and prints the path but never the token. `--token-file`
+    picks another file.
+  - **Refusals:** a token file other users can read, or one shorter than 32
+    characters, is refused before the server listens. Token authentication
+    is Unix-only: where engram cannot verify that the file is private, it
+    refuses the file instead of trusting it.
+  - **Opting out:** `--no-auth` restores the open server, on a loopback
+    address only.
+  - **Errors:** a failure to bind is now a structured error with exit code 2,
+    not a panic.
+
 ## [0.7.1] — 2026-10-31
 
 ### Fixed

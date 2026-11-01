@@ -70,7 +70,7 @@ memories are always presented chronologically.
 ```sh
 ./target/release/engram recall --scope majestic-adr-023 --budget-tokens 500
 ./target/release/engram context --scope majestic-adr-023 --query "Gnomon" --budget-tokens 3000
-curl -s "localhost:8420/v1/context?scope=majestic-adr-023&budget_tokens=3000"
+curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/context?scope=majestic-adr-023&budget_tokens=3000"
 ./target/release/engram consolidate --extract   # index "Decided:"/"TODO"/… lines so context + hybrid rank decisions first (deterministic, no LLM)
 ./target/release/engram consolidate --dedup --report   # idle maintenance: duplicate groups (add --yes to supersede — never delete), contradiction + decay report
 ```
@@ -81,13 +81,17 @@ MCP (stdio), for wiring into Claude Code / Codex / any MCP client:
 engram mcp --db /shared/engram.db
 ```
 
-HTTP, local-only by default (no auth — do not expose beyond `127.0.0.1`
-without adding a Bearer check first):
+HTTP, bound to `127.0.0.1` by default. Every route except `/v1/health`
+needs a bearer token. `serve` creates one on first start at
+`~/.local/state/engram/http-token` (mode 0600; `$XDG_STATE_HOME` is honoured)
+and prints the path; a client reads that file. `--token-file PATH` picks
+another file, and `--no-auth` turns the check off, on a loopback address only.
 
 ```sh
 engram serve --db /shared/engram.db --addr 127.0.0.1:8420
-curl -s -XPOST localhost:8420/v1/memory -d '{"agent":"kimi","scope":"x","content":"..."}'
-curl -s "localhost:8420/v1/memory/recall?scope=x&limit=10"
+T=$(cat ~/.local/state/engram/http-token)
+curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -XPOST localhost:8420/v1/memory -d '{"agent":"kimi","scope":"x","content":"..."}'
+curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/memory/recall?scope=x&limit=10"
 ```
 
 ## Rules — policy that outlives the session
@@ -197,12 +201,13 @@ mid-session and have it apply to every session afterwards:
 ### HTTP
 
 ```sh
-curl -s -XPOST localhost:8420/v1/rules \
+T=$(cat ~/.local/state/engram/http-token)
+curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -XPOST localhost:8420/v1/rules \
   -d '{"rule_id":"signed-commits","text":"Every commit must be signed.","scope":"engram"}'
-curl -s "localhost:8420/v1/rules?scope=engram"
-curl -s "localhost:8420/v1/rules?scope=engram&include_retired=true"
-curl -s -XDELETE "localhost:8420/v1/rules/signed-commits?scope=engram"
-curl -s -XPOST localhost:8420/v1/rules/sync -d '{"scope":"engram"}'
+curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/rules?scope=engram"
+curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/rules?scope=engram&include_retired=true"
+curl -s -H "Authorization: Bearer $T" -XDELETE "localhost:8420/v1/rules/signed-commits?scope=engram"
+curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -XPOST localhost:8420/v1/rules/sync -d '{"scope":"engram"}'
 ```
 
 `DELETE` retires (soft-deletes) rather than erases, per above. As of 0.2.0
@@ -222,8 +227,6 @@ storage failure. New routes should keep following that pattern.
 
 - `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore`
   (no TUI yet). `json`, `jsonl`, and `csv` exist.
-- Auth on the HTTP surface — now more consequential, since `POST /v1/rules/sync`
-  writes files.
 - Transcript readers for Cursor and VS Code, which keep chat as editor state
   rather than a per-session log. `engram ingest --list` names every harness
   without a reader and why. For those, `remember` during the session and
