@@ -26,7 +26,7 @@ pub enum Format {
     Jsonl,
     /// RFC 4180 CSV of the data records; metadata goes to stderr as JSON.
     Csv,
-    /// YAML 1.2 block document of the same envelope; strings double-quoted.
+    /// YAML 1.2 block document of the same envelope; string values double-quoted.
     Yaml,
 }
 

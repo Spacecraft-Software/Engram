@@ -583,7 +583,7 @@ fn run(
                     "formats": ["json", "jsonl", "csv", "yaml"],
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
-                    "yaml": "the same envelope as a YAML 1.2 block document; every string double-quoted",
+                    "yaml": "the same envelope as a YAML 1.2 block document; string values are double-quoted, and keys stay plain only when they are unambiguous identifiers",
                     "dry_run": "remember and rule sync accept --dry-run; the envelope carries metadata.dry_run=true",
                     "accessible": "--accessible or SPACECRAFT_A11Y=1 (Standard §18); status tags [OK]/[ERROR] are present in every human mode",
                     "budgeting": "recall/search accept --budget-tokens and context always packs to one; \
