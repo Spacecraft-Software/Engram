@@ -8,7 +8,7 @@
 @settitle Engram Manual
 @c %**end of header
 
-@set VERSION 0.8.0-dev
+@set VERSION 0.7.1
 @set UPDATED 2026-10-30
 
 @copying

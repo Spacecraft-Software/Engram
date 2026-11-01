@@ -1,6 +1,6 @@
 {
   "name": "engram",
-  "version": "0.8.0-dev",
+  "version": "0.7.1",
   "description": "Shared verbatim chat memory: capture this session's transcript, archive it, and load prior context.",
   "author": {
     "name": "Mohamed Hammad",
