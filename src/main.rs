@@ -1987,8 +1987,13 @@ fn explore_or_fallback(color: bool, accessible_flag: bool) -> OutputMode {
 
         let accessible = output::mode::accessible_resolved(accessible_flag);
         let stdout_tty = std::io::stdout().is_terminal();
-        let Some(reason) = explore::blocker(|k| std::env::var(k).ok(), stdout_tty, accessible)
-        else {
+        let stderr_tty = std::io::stderr().is_terminal();
+        let Some(reason) = explore::blocker(
+            |k| std::env::var(k).ok(),
+            stdout_tty,
+            stderr_tty,
+            accessible,
+        ) else {
             return OutputMode::Explore { color };
         };
         let fallback = if accessible && stdout_tty {
@@ -2316,18 +2321,26 @@ fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
 
 /// Runs the browser over a response. Whatever the user selects is printed
 /// to stdout as one line of JSON; quitting prints nothing.
+///
+/// A browser failure exits 1 here, after `explore::run` has already
+/// restored the terminal. `emit_ok` returns nothing and every command then
+/// exits 0, so only exiting here keeps a failed session from looking like
+/// a deliberate quit to the calling shell (Codex on #35).
 #[cfg(feature = "tui")]
 fn emit_explore(envelope: &serde_json::Value, color: bool) {
     match explore::run(envelope, color) {
         Ok(Some(selected)) => println!("{selected}"),
         Ok(None) => {}
-        Err(e) => AppError::new(
-            error::ErrorCode::InternalError,
-            1,
-            format!("the explore browser failed: {e}"),
-            "rerun with --json",
-        )
-        .emit_human(false),
+        Err(e) => {
+            let err = AppError::new(
+                error::ErrorCode::InternalError,
+                1,
+                format!("the explore browser failed: {e}"),
+                "rerun with --json",
+            );
+            err.emit_human(false);
+            std::process::exit(err.exit_code);
+        }
     }
 }
 

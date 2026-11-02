@@ -24,7 +24,7 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
   - **Rendering:** it draws on stderr's alternate screen, so stdout stays
     clean for pipes.
   - **Fallbacks:** it never starts where it could trap an agent or corrupt a
-    pipe. When stdout is not a terminal, `AI_AGENT`, `AGENT` or `CI` is set,
+    pipe. When stdout or stderr is not a terminal, `AI_AGENT`, `AGENT` or `CI` is set,
     `TERM` is `dumb`, or accessible mode is on, engram prints a
     `TUI_FALLBACK` warning and falls back to JSON, or to plain text in
     accessible mode.

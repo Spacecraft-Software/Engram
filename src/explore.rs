@@ -33,9 +33,14 @@ use std::path::Path;
 /// Why the TUI may not start, or `None` when it may. Checked by `main`
 /// before raw mode is ever entered (Standard §5: never enter raw mode on a
 /// non-TTY, in CI, or under an agent).
+///
+/// stderr is checked as well as stdout because stderr is where the browser
+/// draws: with `2>log` it would write control sequences into the file while
+/// waiting for keys nobody can see (Codex on #35).
 pub fn blocker(
     env: impl Fn(&str) -> Option<String>,
     stdout_is_tty: bool,
+    stderr_is_tty: bool,
     accessible: bool,
 ) -> Option<&'static str> {
     let set = |name: &str| env(name).is_some_and(|v| !v.is_empty());
@@ -47,6 +52,8 @@ pub fn blocker(
         Some("CI is set")
     } else if !stdout_is_tty {
         Some("stdout is not a terminal")
+    } else if !stderr_is_tty {
+        Some("stderr is not a terminal, and the browser draws there")
     } else if env("TERM").is_some_and(|t| t == "dumb") {
         Some("TERM is dumb")
     } else if accessible {
@@ -875,14 +882,21 @@ mod tests {
                     .map(|(_, v)| (*v).to_owned())
             }
         };
-        assert!(blocker(env(&[("AI_AGENT", "claude-code_2-1")]), true, false).is_some());
-        assert!(blocker(env(&[("AGENT", "x")]), true, false).is_some());
-        assert!(blocker(env(&[("CI", "true")]), true, false).is_some());
-        assert!(blocker(env(&[]), false, false).is_some(), "stdout piped");
-        assert!(blocker(env(&[("TERM", "dumb")]), true, false).is_some());
-        assert!(blocker(env(&[]), true, true).is_some(), "accessible");
+        assert!(blocker(env(&[("AI_AGENT", "claude-code_2-1")]), true, true, false).is_some());
+        assert!(blocker(env(&[("AGENT", "x")]), true, true, false).is_some());
+        assert!(blocker(env(&[("CI", "true")]), true, true, false).is_some());
+        assert!(
+            blocker(env(&[]), false, true, false).is_some(),
+            "stdout piped"
+        );
+        assert!(
+            blocker(env(&[]), true, false, false).is_some(),
+            "stderr redirected"
+        );
+        assert!(blocker(env(&[("TERM", "dumb")]), true, true, false).is_some());
+        assert!(blocker(env(&[]), true, true, true).is_some(), "accessible");
         assert_eq!(
-            blocker(env(&[("CI", "false"), ("AI_AGENT", "")]), true, false),
+            blocker(env(&[("CI", "false"), ("AI_AGENT", "")]), true, true, false),
             None
         );
     }
