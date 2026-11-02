@@ -17,7 +17,6 @@ pub enum SearchMode {
 }
 
 /// Machine output formats — spacecraft-cli-standard §3 `--format`.
-/// `explore` has no TUI yet.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 pub enum Format {
     /// Single JSON document with the metadata envelope (default machine mode).
@@ -28,6 +27,10 @@ pub enum Format {
     Csv,
     /// YAML 1.2 block document of the same envelope; string values double-quoted.
     Yaml,
+    /// Interactive terminal browser (filter, sort, detail, export). Falls
+    /// back to json, with a warning, when stdout is not a terminal, an agent
+    /// or CI is detected, TERM is dumb, or accessible mode is on.
+    Explore,
 }
 
 /// Engram — shared verbatim chat memory for multi-model LLM pipelines.
@@ -45,9 +48,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Machine output format (json, jsonl, csv, yaml). Overrides mode auto-detection.
+    /// Output format (json, jsonl, csv, yaml, explore). Overrides mode auto-detection.
     #[arg(long, global = true, value_enum)]
     pub format: Option<Format>,
+
+    /// Alias for --format explore.
+    #[arg(short = 'E', global = true, conflicts_with_all = ["format", "json"])]
+    pub explore: bool,
 
     #[arg(long, global = true)]
     pub no_color: bool,

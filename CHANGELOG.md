@@ -13,6 +13,25 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **`--format explore` (and `-E`): a terminal browser for any command's
+  output.** It shows the same records `--json` would print, as a table:
+  - **Keys:** CUA and Vim bindings both work, `/` filters, `s` sorts the
+    focused column, and `?` lists everything.
+  - **Detail and selection:** Enter opens a record in full; Enter again
+    prints that record as JSON on stdout and exits. Quitting prints nothing.
+  - **Export:** `e` writes the current filtered view to a new file and never
+    overwrites one.
+  - **Rendering:** it draws on stderr's alternate screen, so stdout stays
+    clean for pipes.
+  - **Fallbacks:** it never starts where it could trap an agent or corrupt a
+    pipe. When stdout is not a terminal, `AI_AGENT`, `AGENT` or `CI` is set,
+    `TERM` is `dumb`, or accessible mode is on, engram prints a
+    `TUI_FALLBACK` warning and falls back to JSON, or to plain text in
+    accessible mode.
+  - **Build:** it is part of the default `tui` feature. A build with
+    `--no-default-features` leaves it out, and `--format explore` then
+    exits 2 with `FEATURE_UNAVAILABLE`.
+
 - **`--fields a,b,…`.** Keeps only the listed keys in each record, in that
   order, in every output format; CSV columns follow the same order.
   `recall --fields id,content` drops each memory's scope, agent, role and

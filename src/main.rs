@@ -8,6 +8,8 @@ mod archive;
 mod cli;
 mod embed;
 mod error;
+#[cfg(feature = "tui")]
+mod explore;
 mod facts;
 mod harness;
 mod http;
@@ -33,7 +35,15 @@ use store::Store;
 
 fn main() {
     let cli = Cli::parse();
-    let mode = resolve_mode(cli.format, cli.json, cli.no_color, cli.accessible);
+    let format = if cli.explore {
+        Some(cli::Format::Explore)
+    } else {
+        cli.format
+    };
+    let mode = match resolve_mode(format, cli.json, cli.no_color, cli.accessible) {
+        OutputMode::Explore { color } => explore_or_fallback(color, cli.accessible),
+        other => other,
+    };
     if let Some(raw) = &cli.fields {
         match output::fields::parse(raw) {
             Ok(list) => output::fields::set(list),
@@ -596,7 +606,8 @@ fn run(
                 "transports": ["cli", "mcp-stdio", "http"],
                 "storage": "sqlite+fts5, single shared file",
                 "output": {
-                    "formats": ["json", "jsonl", "csv", "yaml"],
+                    "formats": ["json", "jsonl", "csv", "yaml", "explore"],
+                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; falls back to json with a TUI_FALLBACK warning when stdout is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on",
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
                     "fields": "--fields a,b keeps only those keys in each record, in that order, in every format; metadata.fields echoes the list",
@@ -1952,6 +1963,60 @@ fn run_serve(
     })
 }
 
+/// Decides whether `--format explore` may start. Where it may not, it says
+/// why with a `TUI_FALLBACK` warning (CLI Standard tui-explore.md §1) and
+/// returns the mode to use instead: plain text in accessible mode on a
+/// terminal, json everywhere else. A build without the `tui` feature exits 2.
+fn explore_or_fallback(color: bool, accessible_flag: bool) -> OutputMode {
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = (color, accessible_flag);
+        std::process::exit(fail(
+            AppError::new(
+                error::ErrorCode::FeatureUnavailable,
+                2,
+                "this engram was built without the tui feature, so --format explore is unavailable",
+                "use --format json, or rebuild with the default features",
+            ),
+            OutputMode::Json,
+        ));
+    }
+    #[cfg(feature = "tui")]
+    {
+        use std::io::IsTerminal;
+
+        let accessible = output::mode::accessible_resolved(accessible_flag);
+        let stdout_tty = std::io::stdout().is_terminal();
+        let Some(reason) = explore::blocker(|k| std::env::var(k).ok(), stdout_tty, accessible)
+        else {
+            return OutputMode::Explore { color };
+        };
+        let fallback = if accessible && stdout_tty {
+            OutputMode::HumanNoColor
+        } else {
+            OutputMode::Json
+        };
+        if fallback.is_machine() {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "diagnostic": {
+                    "severity": "warn",
+                    "code": "TUI_FALLBACK",
+                    "message": "interactive explore mode unavailable; falling back to `--format json`",
+                    "hint": "rerun with --json to ask for it directly",
+                    "reason": reason,
+                    "timestamp": time::now_iso8601(),
+                    "command": std::env::args().collect::<Vec<_>>().join(" "),
+                }})
+            );
+        } else {
+            eprintln!("[WARN] interactive explore mode unavailable: {reason}; showing plain text");
+            eprintln!("  hint: rerun with --json for machine-readable output");
+        }
+        fallback
+    }
+}
+
 fn fail(err: AppError, mode: OutputMode) -> i32 {
     emit_error(&err, mode);
     err.exit_code
@@ -2229,6 +2294,7 @@ fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
         OutputMode::Jsonl => emit_jsonl(&resp),
         OutputMode::Csv => emit_csv(&resp),
         OutputMode::Yaml => print!("{}", output::yaml::to_yaml(&envelope_value(&resp))),
+        OutputMode::Explore { color } => emit_explore(&envelope_value(&resp), color),
         OutputMode::HumanWithColor | OutputMode::HumanNoColor => {
             // Status tag to stderr (never color-only, §18.2.1); the data
             // payload alone goes to stdout (§7 stdout/stderr separation).
@@ -2246,6 +2312,30 @@ fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
             );
         }
     }
+}
+
+/// Runs the browser over a response. Whatever the user selects is printed
+/// to stdout as one line of JSON; quitting prints nothing.
+#[cfg(feature = "tui")]
+fn emit_explore(envelope: &serde_json::Value, color: bool) {
+    match explore::run(envelope, color) {
+        Ok(Some(selected)) => println!("{selected}"),
+        Ok(None) => {}
+        Err(e) => AppError::new(
+            error::ErrorCode::InternalError,
+            1,
+            format!("the explore browser failed: {e}"),
+            "rerun with --json",
+        )
+        .emit_human(false),
+    }
+}
+
+/// Unreachable: `explore_or_fallback` exits before a build without `tui`
+/// can choose this mode. Kept so `emit_ok`'s match stays exhaustive.
+#[cfg(not(feature = "tui"))]
+fn emit_explore(envelope: &serde_json::Value, _color: bool) {
+    println!("{envelope}");
 }
 
 /// `--format jsonl`: first line is the envelope metadata with `data: null`,
