@@ -166,7 +166,7 @@ fn records(envelope: &Value) -> Vec<Map<String, Value>> {
             for (section, child) in map {
                 if let Value::Array(items) = child {
                     for item in items.iter().filter_map(Value::as_object) {
-                        let mut row = single("section", Value::String(section.clone()));
+                        let mut row = single(SECTION_KEY, Value::String(section.clone()));
                         row.extend(item.clone());
                         rows.push(row);
                     }
@@ -187,6 +187,19 @@ fn records(envelope: &Value) -> Vec<Map<String, Value>> {
         Some(Value::Null) | None => Vec::new(),
         Some(other) => vec![single("value", other.clone())],
     }
+}
+
+/// Key of the browser's own `section` column on container rows. The unit
+/// separator in front keeps it apart from a record field that is itself
+/// called `section`: that one stays a column of its own and survives
+/// selection, where a plain `"section"` key would have been overwritten and
+/// then stripped (CodeRabbit on #35). Shown as `section`.
+const SECTION_KEY: &str = "\u{1f}section";
+
+/// A column key as shown on screen: the synthetic section key loses its
+/// separator.
+fn display_name(key: &str) -> &str {
+    key.strip_prefix('\u{1f}').unwrap_or(key)
 }
 
 fn single(key: &str, value: Value) -> Map<String, Value> {
@@ -217,20 +230,34 @@ fn cell_text(value: Option<&Value>) -> String {
     }
 }
 
-/// Orders two cells: numbers numerically, everything else as text; empty
-/// cells sort last in ascending order.
+/// Orders two cells: numbers first, compared numerically; then other text,
+/// compared as text; empty cells last (in ascending order).
+///
+/// Ranking by type first makes this a total order. Comparing numbers
+/// numerically and everything else as text, pair by pair, is not one on a
+/// mixed column: 9 < 10, "10" < "5" and "5" < "9" form a cycle, and
+/// `sort_by` may panic on that. A plain record's `value` column mixes
+/// numbers, strings and booleans routinely (CodeRabbit on #35).
 fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
-    match (a.and_then(Value::as_f64), b.and_then(Value::as_f64)) {
-        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-        _ => {
-            let (x, y) = (cell_text(a), cell_text(b));
-            match (x.is_empty(), y.is_empty()) {
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                _ => x.cmp(&y),
-            }
+    fn rank(value: Option<&Value>, text: &str) -> u8 {
+        if text.is_empty() {
+            2
+        } else if value.is_some_and(Value::is_number) {
+            0
+        } else {
+            1
         }
     }
+    let (x, y) = (cell_text(a), cell_text(b));
+    rank(a, &x).cmp(&rank(b, &y)).then_with(|| {
+        match (a.and_then(Value::as_f64), b.and_then(Value::as_f64)) {
+            // JSON numbers are never NaN, so partial_cmp always answers.
+            (Some(p), Some(q)) if a.is_some_and(Value::is_number) => {
+                p.partial_cmp(&q).unwrap_or(Ordering::Equal)
+            }
+            _ => x.cmp(&y),
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +302,10 @@ pub struct App {
     pending: Option<char>,
     status: Option<(String, bool)>,
     page: usize,
+    /// Kept across frames so the scroll offset persists: a fresh state per
+    /// frame made Up from deep in a long list scroll the content under a
+    /// highlight pinned to the bottom row (CodeRabbit on #35).
+    table: TableState,
 }
 
 impl App {
@@ -294,6 +325,7 @@ impl App {
             pending: None,
             status: None,
             page: 10,
+            table: TableState::new(),
         };
         app.refresh();
         app
@@ -412,12 +444,8 @@ impl App {
             KeyCode::Enter => {
                 if let Some(row) = self.current() {
                     let mut record = row.clone();
-                    // The section tag is the browser's, not the data's.
-                    if matches!(record.get("section"), Some(Value::String(_)))
-                        && self.columns.first().is_some_and(|c| c == "section")
-                    {
-                        record.remove("section");
-                    }
+                    // The section label is the browser's, not the data's.
+                    record.remove(SECTION_KEY);
                     return Outcome::Select(serde_json::json!({
                         "metadata": self.metadata,
                         "data": Value::Object(record),
@@ -584,7 +612,7 @@ fn draw(frame: &mut Frame, app: &mut App, theme: Theme) {
     }
 }
 
-fn draw_table(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
+fn draw_table(frame: &mut Frame, app: &mut App, theme: Theme, area: Rect) {
     let header = Row::new(app.columns.iter().enumerate().map(|(i, name)| {
         let marker = match app.sort {
             Some((c, SortDir::Ascending)) if c == i => " ▲",
@@ -596,7 +624,7 @@ fn draw_table(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         } else {
             theme.chrome()
         };
-        Cell::from(format!("{name}{marker}")).style(style)
+        Cell::from(format!("{}{marker}", display_name(name))).style(style)
     }));
     let rows = app.view.iter().map(|&i| {
         Row::new(
@@ -626,8 +654,8 @@ fn draw_table(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
                 .border_style(theme.chrome())
                 .title(title),
         );
-    let mut state = TableState::new().with_selected(Some(app.selected));
-    frame.render_stateful_widget(table, area, &mut state);
+    app.table.select(Some(app.selected));
+    frame.render_stateful_widget(table, area, &mut app.table);
 }
 
 /// Widest a column may be before it shares the leftover space instead.
@@ -703,7 +731,7 @@ fn natural_width(app: &App, column: &str) -> usize {
     app.view
         .iter()
         .map(|&i| cell_text(app.rows[i].get(column)).chars().count())
-        .chain(std::iter::once(column.chars().count() + 2))
+        .chain(std::iter::once(display_name(column).chars().count() + 2))
         .max()
         .unwrap_or(0)
 }
@@ -712,7 +740,10 @@ fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: Rect, scroll: u
     let mut lines: Vec<Line> = Vec::new();
     if let Some(row) = app.current() {
         for (key, value) in row {
-            lines.push(Line::from(Span::styled(key.clone(), theme.chrome())));
+            lines.push(Line::from(Span::styled(
+                display_name(key).to_owned(),
+                theme.chrome(),
+            )));
             let text = match value {
                 Value::String(s) => s.clone(),
                 other => serde_json::to_string_pretty(other).expect("a JSON value serializes"),
@@ -910,8 +941,8 @@ mod tests {
         let container = App::new(&json!({"metadata": {}, "data": {
             "scope": "x", "rules": [{"rule_id": "r1"}], "memories": [{"id": "m1"}],
         }}));
-        assert_eq!(container.columns, ["section", "rule_id", "id"]);
-        assert_eq!(cell_text(container.rows[1].get("section")), "memories");
+        assert_eq!(container.columns, [SECTION_KEY, "rule_id", "id"]);
+        assert_eq!(cell_text(container.rows[1].get(SECTION_KEY)), "memories");
 
         let plain = App::new(&json!({"metadata": {}, "data": {"id": "a", "content": "c"}}));
         assert_eq!(plain.columns, ["key", "value"]);
@@ -996,6 +1027,65 @@ mod tests {
                 "data": {"id": "b", "content": "beta note", "n": 2},
             }))
         );
+    }
+
+    #[test]
+    fn the_scroll_offset_persists_so_up_moves_the_highlight() {
+        let rows: Vec<Value> = (0..50).map(|i| json!({"id": format!("r{i:02}")})).collect();
+        let mut app = App::new(&json!({"metadata": {}, "data": rows}));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).expect("terminal");
+        let mut draw_now = |app: &mut App| {
+            term.draw(|f| draw(f, app, Theme { color: false }))
+                .expect("draw");
+        };
+        press(&mut app, KeyCode::End);
+        draw_now(&mut app);
+        let offset = app.table.offset();
+        assert!(offset > 0, "the last row scrolled into view");
+        press(&mut app, KeyCode::Up);
+        draw_now(&mut app);
+        assert_eq!(
+            app.table.offset(),
+            offset,
+            "Up moves the highlight, not the content"
+        );
+        assert_eq!(app.table.selected(), Some(48));
+    }
+
+    #[test]
+    fn a_records_own_section_field_survives_selection() {
+        let mut app = App::new(&json!({"metadata": {}, "data": {
+            "memories": [{"id": "m1", "section": "chapter 2"}],
+        }}));
+        assert_eq!(
+            app.columns,
+            [SECTION_KEY, "id", "section"],
+            "two distinct columns"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::Select(json!({
+                "metadata": {},
+                "data": {"id": "m1", "section": "chapter 2"},
+            })),
+            "only the browser's label is removed"
+        );
+    }
+
+    #[test]
+    fn sorting_a_mixed_column_is_total_and_does_not_panic() {
+        let mut app = App::new(&json!({"metadata": {}, "data": {
+            "a": 9, "b": 10, "c": "5", "d": "", "e": true, "f": null, "g": "apple",
+        }}));
+        press(&mut app, KeyCode::Char('l')); // focus "value"
+        press(&mut app, KeyCode::Char('s'));
+        let order: Vec<String> = app
+            .view
+            .iter()
+            .map(|&i| cell_text(app.rows[i].get("value")))
+            .collect();
+        assert_eq!(order, ["9", "10", "5", "apple", "true", "", ""]);
     }
 
     #[test]

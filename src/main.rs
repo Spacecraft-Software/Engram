@@ -607,7 +607,7 @@ fn run(
                 "storage": "sqlite+fts5, single shared file",
                 "output": {
                     "formats": ["json", "jsonl", "csv", "yaml", "explore"],
-                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; falls back to json with a TUI_FALLBACK warning when stdout is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on",
+                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; falls back to json with a TUI_FALLBACK warning when stdout or stderr is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on",
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
                     "fields": "--fields a,b keeps only those keys in each record, in that order, in every format; metadata.fields echoes the list",

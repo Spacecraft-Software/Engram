@@ -153,8 +153,8 @@ Output format: @code{json}, @code{jsonl}, @code{csv}, @code{yaml}, or
 interactive browser over the same records: @kbd{/} filters, @kbd{s}
 sorts, @key{RET} opens a record and @key{RET} again prints it as JSON
 and exits, @kbd{e} exports the view, @kbd{?} lists every key (Vim and
-CUA bindings both work).  It never starts when standard output is not
-a terminal, an agent or CI is detected, @env{TERM} is @samp{dumb}, or
+CUA bindings both work).  It never starts when standard output or
+standard error is not a terminal, an agent or CI is detected, @env{TERM} is @samp{dumb}, or
 accessible mode is on; engram then warns and prints JSON (plain text
 in accessible mode).  Overrides mode auto-detection.  @code{yaml} is the same
 envelope as a YAML 1.2 block document, with every string value
