@@ -558,7 +558,7 @@ impl App {
         let rows: Vec<Value> = self
             .view
             .iter()
-            .map(|&i| Value::Object(self.rows[i].clone()))
+            .map(|&i| Value::Object(exported(&self.rows[i])))
             .collect();
         let count = rows.len();
         let body = serde_json::to_string_pretty(&self.view_envelope(rows))
@@ -568,6 +568,24 @@ impl App {
             Err(e) => (format!("export failed: {e}"), true),
         });
     }
+}
+
+/// A row as it goes into an export file: the browser's internal section key
+/// becomes a plain `section` field, unless the record has its own
+/// `section`, which then wins and keeps its value. An export must never
+/// contain the `\u{1f}` key (CodeRabbit on #35).
+fn exported(row: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = Map::new();
+    for (key, value) in row {
+        if key == SECTION_KEY {
+            if !row.contains_key("section") {
+                out.insert("section".to_owned(), value.clone());
+            }
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    out
 }
 
 fn write_new(path: &Path, body: &str) -> std::io::Result<()> {
@@ -1086,6 +1104,30 @@ mod tests {
             .map(|&i| cell_text(app.rows[i].get("value")))
             .collect();
         assert_eq!(order, ["9", "10", "5", "apple", "true", "", ""]);
+    }
+
+    #[test]
+    fn a_container_export_names_the_section_plainly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("container.json");
+        let mut app = App::new(&json!({"metadata": {}, "data": {
+            "rules": [{"rule_id": "r1"}],
+            "memories": [{"id": "m1", "section": "own"}],
+        }}));
+        press(&mut app, KeyCode::Char('e'));
+        typed(&mut app, path.to_str().expect("utf-8 path"));
+        press(&mut app, KeyCode::Enter);
+        let text = std::fs::read_to_string(&path).expect("exported");
+        assert!(
+            !text.contains("\\u001f") && !text.contains('\u{1f}'),
+            "{text}"
+        );
+        let written: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(
+            written["data"],
+            json!([{"section": "rules", "rule_id": "r1"}, {"id": "m1", "section": "own"}]),
+            "the label becomes section; a record's own section wins"
+        );
     }
 
     #[test]
