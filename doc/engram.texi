@@ -155,6 +155,17 @@ double-quoted, so no value can be misread as a number, boolean or
 null.  Keys stay plain only when they are identifiers no YAML parser
 could misread.
 
+@item --fields @var{field},@dots{}
+@cindex @option{--fields}
+@cindex token cost, reducing
+Keep only the listed keys in each record, in the order given, in every
+output format; CSV columns follow the same order.  A record is an
+object in @code{data}, or in an array inside a @code{data} object such
+as @command{context}'s @code{memories}, whose own fields are kept.
+The envelope reports the list as @code{metadata.fields}.  For example,
+@samp{engram recall --fields id,content} drops each memory's scope,
+agent, role and timestamps.
+
 @item --no-color
 @cindex colors, disabling
 Disable colored output.  The @env{NO_COLOR} environment variable has

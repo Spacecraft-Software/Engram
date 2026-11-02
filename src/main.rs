@@ -34,6 +34,22 @@ use store::Store;
 fn main() {
     let cli = Cli::parse();
     let mode = resolve_mode(cli.format, cli.json, cli.no_color, cli.accessible);
+    if let Some(raw) = &cli.fields {
+        match output::fields::parse(raw) {
+            Ok(list) => output::fields::set(list),
+            Err(message) => {
+                std::process::exit(fail(
+                    AppError::new(
+                        error::ErrorCode::InvalidArgument,
+                        2,
+                        message,
+                        "pass comma-separated field names, e.g. --fields id,content",
+                    ),
+                    mode,
+                ));
+            }
+        }
+    }
 
     let store = match Store::open(&cli.db) {
         Ok(mut s) => {
@@ -583,6 +599,7 @@ fn run(
                     "formats": ["json", "jsonl", "csv", "yaml"],
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
+                    "fields": "--fields a,b keeps only those keys in each record, in that order, in every format; metadata.fields echoes the list",
                     "yaml": "the same envelope as a YAML 1.2 block document; string values are double-quoted, and keys stay plain only when they are unambiguous identifiers",
                     "dry_run": "remember and rule sync accept --dry-run; the envelope carries metadata.dry_run=true",
                     "accessible": "--accessible or SPACECRAFT_A11Y=1 (Standard §18); status tags [OK]/[ERROR] are present in every human mode",
@@ -2196,20 +2213,22 @@ fn handle_import(
 
 // Rust guideline compliant 2026-05-18
 
+/// The response as a JSON value, with `--fields` applied when given. Every
+/// output format starts from this, so the filter cannot miss one.
+fn envelope_value<T: serde::Serialize>(resp: &Response<T>) -> serde_json::Value {
+    let mut value = serde_json::to_value(resp).expect("Response serializes");
+    if let Some(fields) = output::fields::get() {
+        output::fields::apply(&mut value, fields);
+    }
+    value
+}
+
 fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
     match mode {
-        OutputMode::Json => {
-            println!(
-                "{}",
-                serde_json::to_string(&resp).expect("Response serializes")
-            );
-        }
+        OutputMode::Json => println!("{}", envelope_value(&resp)),
         OutputMode::Jsonl => emit_jsonl(&resp),
         OutputMode::Csv => emit_csv(&resp),
-        OutputMode::Yaml => {
-            let value = serde_json::to_value(&resp).expect("Response serializes");
-            print!("{}", output::yaml::to_yaml(&value));
-        }
+        OutputMode::Yaml => print!("{}", output::yaml::to_yaml(&envelope_value(&resp))),
         OutputMode::HumanWithColor | OutputMode::HumanNoColor => {
             // Status tag to stderr (never color-only, §18.2.1); the data
             // payload alone goes to stdout (§7 stdout/stderr separation).
@@ -2223,7 +2242,7 @@ fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&resp).expect("Response serializes")
+                serde_json::to_string_pretty(&envelope_value(&resp)).expect("Response serializes")
             );
         }
     }
@@ -2233,7 +2252,7 @@ fn emit_ok<T: serde::Serialize>(resp: Response<T>, mode: OutputMode) {
 /// then one line per record (list payloads) or one line with the whole
 /// payload (object payloads). Documented in `engram describe`.
 fn emit_jsonl<T: serde::Serialize>(resp: &Response<T>) {
-    let value = serde_json::to_value(resp).expect("Response serializes");
+    let value = envelope_value(resp);
     let metadata = &value["metadata"];
     println!(
         "{}",
@@ -2252,7 +2271,7 @@ fn emit_jsonl<T: serde::Serialize>(resp: &Response<T>) {
 /// `--format csv`: RFC 4180 rows of the data records on stdout; the envelope
 /// metadata goes to stderr as one line of JSON (CSV has no envelope).
 fn emit_csv<T: serde::Serialize>(resp: &Response<T>) {
-    let value = serde_json::to_value(resp).expect("Response serializes");
+    let value = envelope_value(resp);
     eprintln!("{}", serde_json::json!({ "metadata": &value["metadata"] }));
     let records: Vec<serde_json::Map<String, serde_json::Value>> = match &value["data"] {
         serde_json::Value::Array(items) => items
@@ -2267,9 +2286,14 @@ fn emit_csv<T: serde::Serialize>(resp: &Response<T>) {
         }
     };
     let Some(first) = records.first() else { return };
-    // serde_json preserves struct field order, so the first record's keys are
-    // the stable header. Records missing a key emit an empty field.
-    let headers: Vec<&String> = first.keys().collect();
+    // With --fields the requested list is the header, so a field the first
+    // record happens to lack still gets its column. Otherwise serde_json's
+    // preserved struct order makes the first record's keys the stable
+    // header. Records missing a key emit an empty field either way.
+    let headers: Vec<&String> = match output::fields::get() {
+        Some(fields) => fields.iter().collect(),
+        None => first.keys().collect(),
+    };
     println!(
         "{}",
         headers
