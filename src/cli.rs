@@ -45,7 +45,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Machine output format (json, jsonl, csv). Overrides mode auto-detection.
+    /// Machine output format (json, jsonl, csv, yaml). Overrides mode auto-detection.
     #[arg(long, global = true, value_enum)]
     pub format: Option<Format>,
 
@@ -65,6 +65,13 @@ pub struct Cli {
     /// opt-out — agent reads are exactly what the tracking measures.
     #[arg(long, global = true)]
     pub no_track: bool,
+
+    /// Keep only these comma-separated keys in each record, in this order
+    /// (e.g. `recall --fields id,content`), to cut output tokens. Records
+    /// are the objects in `data`, or in its arrays (context, rule list);
+    /// the envelope says `metadata.fields`. Applies to every output format.
+    #[arg(long, global = true, value_name = "FIELD,...")]
+    pub fields: Option<String>,
 
     /// Local Model2Vec model directory for semantic (vector) search. First
     /// step of the model cascade: --model-path, then ENGRAM_MODEL, then

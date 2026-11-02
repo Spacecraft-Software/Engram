@@ -380,6 +380,76 @@ fn recall_format_yaml_matches_the_json_envelope() {
 }
 
 #[test]
+fn fields_keeps_only_the_listed_keys_in_every_format() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "fields-scope";
+    remember(&db, "a", scope, "kept content");
+
+    let json_out = engram(&db)
+        .args([
+            "--json",
+            "--fields",
+            "content,id",
+            "recall",
+            "--scope",
+            scope,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&json_out).expect("json");
+    let record = json["data"][0].as_object().expect("record");
+    let keys: Vec<&String> = record.keys().collect();
+    assert_eq!(
+        keys,
+        ["content", "id"],
+        "only the listed keys, in that order"
+    );
+    assert_eq!(record["content"], "kept content");
+    assert_eq!(
+        json["metadata"]["fields"],
+        serde_json::json!(["content", "id"])
+    );
+
+    let csv_out = engram(&db)
+        .args([
+            "--format",
+            "csv",
+            "--fields",
+            "content,id",
+            "recall",
+            "--scope",
+            scope,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let csv = String::from_utf8(csv_out).expect("UTF-8");
+    assert_eq!(
+        csv.lines().next(),
+        Some("content,id"),
+        "csv columns follow --fields"
+    );
+
+    engram(&db)
+        .args([
+            "--json",
+            "--fields",
+            "id,,content",
+            "recall",
+            "--scope",
+            scope,
+        ])
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn recall_format_csv_puts_rows_on_stdout_and_metadata_on_stderr() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");

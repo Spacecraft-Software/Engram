@@ -13,6 +13,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **`--fields a,b,…`.** Keeps only the listed keys in each record, in that
+  order, in every output format; CSV columns follow the same order.
+  `recall --fields id,content` drops each memory's scope, agent, role and
+  timestamps. On real data, `id,content` cut recall output by 17%, search
+  by 37% and context by 20%. Records are the objects in `data`, or in its
+  arrays for `context` and `rule list`, and the envelope reports the list as
+  `metadata.fields`. A malformed list such as `id,,content` exits 2.
+
 - **`--format yaml`.** The same envelope as `--format json`, as a YAML 1.2
   block document. Every string value is double-quoted, so a value such as `yes`,
   `null`, `1.5` or `key: value` can never be read back as anything else.
