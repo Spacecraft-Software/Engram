@@ -27,7 +27,7 @@ cargo doc -p rmcp --open                 # verify rmcp 0.16 macro shape if build
 - `recall`/`search` accept `--budget-tokens N`: results are packed to a token budget (estimator `chars-div-4` — ceil(Unicode chars / 4), min 1; no single tokenizer is correct across models). Recall packs newest-first (oldest drop) but output stays chronological; search packs in rank order. The envelope then carries `metadata.budget` (`requested_tokens`, `estimator`, `estimated_tokens`, `included`, `dropped`, `dropped_ids`, `channels`). Without the flag, output is byte-identical to before. Same `budget_tokens` argument exists on the MCP `recall`/`search` tools (result becomes `{"memories": [...], "budget": {...}}`) and the HTTP recall/search routes.
 - `context [--scope S] [--query Q] [--budget-tokens N=3000] [--limit N=50]`: one-shot session-start block — active rules first (**always all included**, even over budget), then memories packed into the remainder. No query → newest-first selection; with `--query` → reciprocal rank fusion (k=60) of the recency and FTS channels. Presentation is chronological either way. Scope resolves via the rule-command cascade. Also `GET /v1/context` over HTTP; no MCP context tool yet (M3).
 - Mode cascade: explicit `--format`/`--json` > `AI_AGENT`/`AGENT` set non-empty or `CI` truthy > non-TTY stdout → machine output (single-line JSON to stdout, structured error to stderr).
-- `--format <json|jsonl|csv>` (global; `--json` is an alias for `--format json`). `jsonl`: first line `{"metadata":...,"data":null}`, then one line per record. `csv`: RFC 4180 rows on stdout, metadata as one JSON line on stderr. `yaml`/`explore` deferred.
+- `--format <json|jsonl|csv|yaml>` (global; `--json` is an alias for `--format json`). `jsonl`: first line `{"metadata":...,"data":null}`, then one line per record. `csv`: RFC 4180 rows on stdout, metadata as one JSON line on stderr. `yaml`: the same envelope as a YAML 1.2 block document, string values double-quoted (`src/output/yaml.rs`, hand-written: `serde_yaml` is archived and engram only writes YAML). `explore` deferred.
 - `--accessible` (global): plain linear output per Standard §18. Also via `SPACECRAFT_A11Y=1`; the flag wins over `SPACECRAFT_A11Y=0`.
 - `--no-track` (global): read-only auditing — do not update access counts on reads. CLI-only; MCP/HTTP reads always track (`access_count`/`last_accessed_at` are internal columns feeding `consolidate --report` decay; never serialized on `Memory`).
 - `install [--harness H]... [--db-path P] [--list] [--dry-run] [--force] [--hooks]`: write `/engram-save-chat`, `/engram-ingest`, `/engram-context` into each detected harness's command directory. Start with `--list`. Only detected harnesses, only files carrying engram's banner, never a delete; idempotent (a second run reports `unchanged` and touches no mtimes). Of the seven known harnesses only Claude Code, Codex, and Opencode have a writable command surface; the rest are reported as having none. CLI-only — never an HTTP route, because it writes into `$HOME`. `--hooks` additionally merges an opt-in `SessionEnd` hook into the harness's settings (Claude Code only), taking a backup first, leaving other hooks alone, and refusing a settings file it cannot parse. That hook runs `ingest` and never `save-chat`.
@@ -198,7 +198,7 @@ curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/memory/recall?scope=x&l
 **Global flags:**
 - `--db <path>` — database file (env: `ENGRAM_DB`, default: `engram.db`)
 - `--json` — machine output; alias for `--format json`
-- `--format <json|jsonl|csv>` — machine output format, overrides mode auto-detection. `jsonl`: first line is `{"metadata":...,"data":null}`, then one line per record (arrays) or one line with the object. `csv`: RFC 4180 rows on stdout (header from the first record's keys), metadata as one JSON line on stderr. `yaml`/`explore` are deferred
+- `--format <json|jsonl|csv|yaml>` — machine output format, overrides mode auto-detection. `jsonl`: first line is `{"metadata":...,"data":null}`, then one line per record (arrays) or one line with the object. `csv`: RFC 4180 rows on stdout (header from the first record's keys), metadata as one JSON line on stderr. `yaml`: the envelope as YAML 1.2, string values double-quoted. `explore` is deferred
 - `--no-color` — disable colors (respects `NO_COLOR` env var)
 - `--accessible` — accessible output per Standard §18: plain linear text, no color, status tags. Also enabled by `SPACECRAFT_A11Y=1`; the flag wins over `SPACECRAFT_A11Y=0`
 - `--no-track` — read-only auditing: do not update access counts on reads. CLI-only; MCP/HTTP have no opt-out (agent reads are exactly what the tracking measures)
@@ -211,6 +211,14 @@ curl -s -H "Authorization: Bearer $T" "localhost:8420/v1/memory/recall?scope=x&l
 - `AI_AGENT`, `AGENT` (set non-empty), `CI` (truthy) — trigger machine output mode (detected for structured logging in CI/agent contexts)
 - `SPACECRAFT_A11Y` — `1` enables accessible output, `0` disables auto-detection (`--accessible` still wins)
 - `NO_COLOR` — disable colors
+
+## YAML output (`--format yaml`)
+
+`src/output/yaml.rs` renders the JSON envelope as a YAML 1.2 block document. It is hand-written, with no runtime dependency: `serde_yaml` is archived, and engram only ever *writes* YAML from a `serde_json::Value`.
+
+- **Every string value is double-quoted**, and so is every key except a plain identifier other than a YAML 1.1 boolean/null word (`on`, `No`, …). That removes the whole class of plain-scalar bugs: `yes`, `null`, `1.5`, `- x`, `key: value` and a leading `#` all stay strings. `quote` escapes what a double-quoted scalar cannot hold raw (C0, DEL, C1, U+FFFE/FFFF) plus U+0085/2028/2029, which YAML 1.1 parsers treat as line breaks.
+- **Tests parse the output back** with `yaml-rust2` (a YAML 1.2 parser, **dev-dependency only**) and compare it with the source JSON, including 33 adversarial strings as values and as keys. PyYAML (YAML 1.1) also read a real `context` output back identical (checked 2026-11-01).
+- Errors stay single-line JSON on stderr, as in every machine mode.
 
 ## Semantic search (the `vector` feature, M3)
 
@@ -394,4 +402,4 @@ Landed in 0.2.0 (no longer gaps): `--format jsonl|csv`, `remember --dry-run`, re
 
 Still missing:
 
-- `--format yaml` (deferred — `serde_yaml` is archived) and `--format explore` (no TUI yet).
+- `--format explore` (no TUI yet).

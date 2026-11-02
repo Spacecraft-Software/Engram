@@ -17,7 +17,7 @@ pub enum SearchMode {
 }
 
 /// Machine output formats — spacecraft-cli-standard §3 `--format`.
-/// `yaml` is deferred (serde_yaml is archived); `explore` has no TUI yet.
+/// `explore` has no TUI yet.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 pub enum Format {
     /// Single JSON document with the metadata envelope (default machine mode).
@@ -26,6 +26,8 @@ pub enum Format {
     Jsonl,
     /// RFC 4180 CSV of the data records; metadata goes to stderr as JSON.
     Csv,
+    /// YAML 1.2 block document of the same envelope; string values double-quoted.
+    Yaml,
 }
 
 /// Engram — shared verbatim chat memory for multi-model LLM pipelines.

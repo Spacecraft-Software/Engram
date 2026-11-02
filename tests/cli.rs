@@ -348,6 +348,38 @@ fn recall_format_jsonl_streams_metadata_then_records() {
 }
 
 #[test]
+fn recall_format_yaml_matches_the_json_envelope() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let scope = "yaml-scope";
+    remember(&db, "a", scope, "Decided: yes\n- not a list\nkey: value");
+
+    let run = |format: &str| {
+        let output = engram(&db)
+            .args(["--format", format, "recall", "--scope", scope])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        String::from_utf8(output.stdout).expect("UTF-8")
+    };
+    let yaml = run("yaml");
+    let json: Value = serde_json::from_str(&run("json")).expect("json output");
+
+    let docs = yaml_rust2::YamlLoader::load_from_str(&yaml)
+        .unwrap_or_else(|e| panic!("--format yaml is not YAML ({e}):\n{yaml}"));
+    let doc = &docs[0];
+    let record = &doc["data"][0];
+    assert_eq!(
+        record["content"].as_str(),
+        json["data"][0]["content"].as_str(),
+        "content survives verbatim:\n{yaml}"
+    );
+    assert_eq!(record["id"].as_str(), json["data"][0]["id"].as_str());
+    assert_eq!(doc["metadata"]["tool"].as_str(), Some("engram"));
+}
+
+#[test]
 fn recall_format_csv_puts_rows_on_stdout_and_metadata_on_stderr() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("test.db");

@@ -11,6 +11,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+### Added
+
+- **`--format yaml`.** The same envelope as `--format json`, as a YAML 1.2
+  block document. Every string value is double-quoted, so a value such as `yes`,
+  `null`, `1.5` or `key: value` can never be read back as anything else.
+  Errors stay single-line JSON on stderr, as in every machine mode. No new
+  runtime dependency: `serde_yaml` is archived, and engram only writes YAML.
+
 ### Changed
 
 - **The HTTP API requires a bearer token (breaking).** Binding to
