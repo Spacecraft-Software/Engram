@@ -436,6 +436,29 @@ fn fields_keeps_only_the_listed_keys_in_every_format() {
         "csv columns follow --fields"
     );
 
+    // A listed field the first record lacks still gets its column.
+    let csv_out = engram(&db)
+        .args([
+            "--format",
+            "csv",
+            "--fields",
+            "id,superseded_by",
+            "recall",
+            "--scope",
+            scope,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let csv = String::from_utf8(csv_out).expect("UTF-8");
+    assert_eq!(csv.lines().next(), Some("id,superseded_by"));
+    assert!(
+        csv.lines().nth(1).is_some_and(|row| row.ends_with(',')),
+        "empty cell: {csv}"
+    );
+
     engram(&db)
         .args([
             "--json",

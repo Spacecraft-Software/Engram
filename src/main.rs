@@ -2286,9 +2286,14 @@ fn emit_csv<T: serde::Serialize>(resp: &Response<T>) {
         }
     };
     let Some(first) = records.first() else { return };
-    // serde_json preserves struct field order, so the first record's keys are
-    // the stable header. Records missing a key emit an empty field.
-    let headers: Vec<&String> = first.keys().collect();
+    // With --fields the requested list is the header, so a field the first
+    // record happens to lack still gets its column. Otherwise serde_json's
+    // preserved struct order makes the first record's keys the stable
+    // header. Records missing a key emit an empty field either way.
+    let headers: Vec<&String> = match output::fields::get() {
+        Some(fields) => fields.iter().collect(),
+        None => first.keys().collect(),
+    };
     println!(
         "{}",
         headers

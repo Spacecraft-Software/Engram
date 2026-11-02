@@ -60,20 +60,14 @@ pub fn apply(envelope: &mut Value, fields: &[String]) {
     if let Some(data) = envelope.get_mut("data") {
         match data {
             Value::Array(items) => items.iter_mut().for_each(|r| select(r, fields)),
-            Value::Object(map) => {
-                let mut nested = false;
+            Value::Object(map) if is_container(map) => {
                 for child in map.values_mut() {
                     if let Value::Array(items) = child {
-                        if items.iter().any(Value::is_object) {
-                            nested = true;
-                            items.iter_mut().for_each(|r| select(r, fields));
-                        }
+                        items.iter_mut().for_each(|r| select(r, fields));
                     }
                 }
-                if !nested {
-                    select(data, fields);
-                }
             }
+            Value::Object(_) => select(data, fields),
             _ => {}
         }
     }
@@ -83,6 +77,19 @@ pub fn apply(envelope: &mut Value, fields: &[String]) {
             Value::Array(fields.iter().cloned().map(Value::String).collect()),
         );
     }
+}
+
+/// True when a `data` object holds records rather than being one: it has an
+/// array field that is empty or contains an object. Empty counts, so an
+/// empty `rule list` or `context` keeps its own fields (`scope`, `count`,
+/// `budget`) instead of being filtered as if it were a record and coming
+/// back as `{}` (Codex and CodeRabbit on #34). An array of scalars, such as
+/// a record's own tag list, does not make its object a container.
+pub fn is_container(map: &Map<String, Value>) -> bool {
+    map.values().any(|child| match child {
+        Value::Array(items) => items.is_empty() || items.iter().any(Value::is_object),
+        _ => false,
+    })
 }
 
 /// Keeps only `fields` of one record, in the order given. Non-objects are
@@ -150,6 +157,25 @@ mod tests {
                 "tags": ["kept", "as", "is"],
             })
         );
+    }
+
+    #[test]
+    fn an_empty_result_keeps_its_container_fields() {
+        let mut v = json!({"metadata": {}, "data": {
+            "scope": "engram", "count": 0, "rules": [],
+        }});
+        apply(&mut v, &names(&["id", "content"]));
+        assert_eq!(
+            v["data"],
+            json!({"scope": "engram", "count": 0, "rules": []})
+        );
+
+        let mut v = json!({"metadata": {}, "data": {
+            "scope": "x", "budget": {"requested_tokens": 10}, "rules": [], "memories": [],
+        }});
+        apply(&mut v, &names(&["id"]));
+        assert_eq!(v["data"]["scope"], "x");
+        assert_eq!(v["data"]["budget"]["requested_tokens"], 10);
     }
 
     #[test]
