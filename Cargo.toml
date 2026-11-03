@@ -16,8 +16,14 @@ path = "src/main.rs"
 
 [features]
 # Default build stays FTS5-only: zero ML dependencies, identical behavior to
-# 0.2.x. Vector/hybrid retrieval is strictly opt-in.
-default = []
+# 0.2.x. Vector/hybrid retrieval is strictly opt-in. The `tui` feature
+# (`--format explore`) is on by default; a headless build drops it with
+# `--no-default-features`, and `--format explore` then exits 2.
+default = ["tui"]
+# Interactive browser for `--format explore` (CLI Standard tui-explore.md).
+# Pure Rust: ratatui plus the crossterm it re-exports, so the two versions
+# cannot drift apart.
+tui = ["dep:ratatui"]
 # Semantic (vector) search via Model2Vec static embeddings, loaded from a
 # LOCAL model directory only (--model-path / ENGRAM_MODEL /
 # $XDG_DATA_HOME/engram/model). model2vec-rs is pulled with
@@ -61,6 +67,7 @@ uuid = { version = "1", features = ["v4", "v5"] }
 anyhow = "1"
 # Optional — gated behind the "vector" feature (see [features] for why the
 # default features are disabled: no hf-hub network fetching, ever).
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
 model2vec-rs = { version = "0.2", optional = true, default-features = false, features = [
     "local-only",
     "fancy-regex",

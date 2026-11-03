@@ -39,12 +39,18 @@ reads the same memories back.
 
 Machine output beyond the default JSON envelope: `--format jsonl` streams one
 metadata line then one line per record; `--format csv` writes RFC 4180 rows to
-stdout with the metadata as a JSON line on stderr. `remember --dry-run`
-validates and shows what would be stored without writing.
+stdout with the metadata as a JSON line on stderr; `--format yaml` is the same
+envelope as YAML 1.2. `--fields id,content` keeps only those keys in each
+record, in every format. `--format explore` (or `-E`) opens an interactive
+browser in a terminal: filter, sort, open a record, and press Enter to print
+it as JSON. It falls back to JSON for agents, CI and pipes. `remember
+--dry-run` validates and shows what would be stored without writing.
 
 ```sh
 ./target/release/engram recall --scope majestic-adr-023 --format jsonl
 ./target/release/engram recall --scope majestic-adr-023 --format csv
+./target/release/engram recall --scope majestic-adr-023 --fields id,content
+./target/release/engram recall --scope majestic-adr-023 -E
 ./target/release/engram remember --agent claude-code --scope majestic-adr-023 --dry-run "Would store this."
 ```
 
@@ -225,7 +231,6 @@ storage failure. New routes should keep following that pattern.
 
 ## What's deliberately not here yet
 
-- `--format explore` (no TUI yet). `json`, `jsonl`, `csv`, and `yaml` exist.
 - Transcript readers for Cursor and VS Code, which keep chat as editor state
   rather than a per-session log. `engram ingest --list` names every harness
   without a reader and why. For those, `remember` during the session and

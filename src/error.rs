@@ -9,6 +9,13 @@ use serde::Serialize;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     NotFound,
+    /// The build left out the feature a flag needs (`--format explore`
+    /// without `tui`).
+    #[cfg_attr(
+        feature = "tui",
+        expect(dead_code, reason = "only builds without the tui feature report it")
+    )]
+    FeatureUnavailable,
     InvalidArgument,
     Conflict,
     InternalError,

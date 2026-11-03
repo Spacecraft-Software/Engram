@@ -17,6 +17,12 @@ pub enum OutputMode {
     Jsonl,
     Csv,
     Yaml,
+    /// The interactive browser. `color` is false under `--no-color`,
+    /// `NO_COLOR`, or a dumb terminal. Only reached after `main` has checked
+    /// `explore::blocker`; until then a request for it is `Explore` too.
+    Explore {
+        color: bool,
+    },
 }
 
 impl OutputMode {
@@ -44,6 +50,9 @@ pub fn resolve_mode(
             Format::Jsonl => OutputMode::Jsonl,
             Format::Csv => OutputMode::Csv,
             Format::Yaml => OutputMode::Yaml,
+            Format::Explore => OutputMode::Explore {
+                color: !no_color_flag && !env_non_empty("NO_COLOR"),
+            },
         };
     }
     if json_flag {
@@ -81,7 +90,7 @@ fn ci_truthy() -> bool {
 /// §18.1 activation cascade: the `--accessible` flag always wins; otherwise
 /// `SPACECRAFT_A11Y` decides (`0` is an explicit off, anything else non-empty
 /// is on). Silence means standard rendering.
-fn accessible_resolved(flag: bool) -> bool {
+pub fn accessible_resolved(flag: bool) -> bool {
     if flag {
         return true;
     }
