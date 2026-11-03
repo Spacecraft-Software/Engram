@@ -26,8 +26,10 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
   - **Fallbacks:** it never starts where it could trap an agent or corrupt a
     pipe. When stdout or stderr is not a terminal, `AI_AGENT`, `AGENT` or `CI` is set,
     `TERM` is `dumb`, or accessible mode is on, engram prints a
-    `TUI_FALLBACK` warning and falls back to JSON, or to plain text in
-    accessible mode.
+    warning and falls back to plain text when accessible mode is on and
+    stdout is a terminal, or to JSON with a `TUI_FALLBACK` diagnostic
+    otherwise. The diagnostic redacts command arguments so private memory
+    content and search queries do not enter fallback logs.
   - **Build:** it is part of the default `tui` feature. A build with
     `--no-default-features` leaves it out, and `--format explore` then
     exits 2 with `FEATURE_UNAVAILABLE`.

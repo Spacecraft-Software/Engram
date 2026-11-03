@@ -607,7 +607,7 @@ fn run(
                 "storage": "sqlite+fts5, single shared file",
                 "output": {
                     "formats": ["json", "jsonl", "csv", "yaml", "explore"],
-                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; falls back to json with a TUI_FALLBACK warning when stdout or stderr is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on",
+                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; falls back with a warning when stdout or stderr is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on; fallback is plain text when accessible mode is on and stdout is a TTY, otherwise JSON with a TUI_FALLBACK diagnostic",
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
                     "fields": "--fields a,b keeps only those keys in each record, in that order, in every format; metadata.fields echoes the list",
@@ -2011,7 +2011,8 @@ fn explore_or_fallback(color: bool, accessible_flag: bool) -> OutputMode {
                     "hint": "rerun with --json to ask for it directly",
                     "reason": reason,
                     "timestamp": time::now_iso8601(),
-                    "command": std::env::args().collect::<Vec<_>>().join(" "),
+                    // Arguments can contain private memories or search queries.
+                    "command": "engram --format explore [arguments redacted]",
                 }})
             );
         } else {

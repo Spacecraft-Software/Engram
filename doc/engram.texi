@@ -155,8 +155,10 @@ sorts, @key{RET} opens a record and @key{RET} again prints it as JSON
 and exits, @kbd{e} exports the view, @kbd{?} lists every key (Vim and
 CUA bindings both work).  It never starts when standard output or
 standard error is not a terminal, an agent or CI is detected, @env{TERM} is @samp{dumb}, or
-accessible mode is on; engram then warns and prints JSON (plain text
-in accessible mode).  Overrides mode auto-detection.  @code{yaml} is the same
+accessible mode is on; engram then warns and prints plain text when
+accessible mode is on and standard output is a terminal, or JSON otherwise.
+The JSON fallback diagnostic redacts command arguments, which may contain
+private memories or search queries.  Overrides mode auto-detection.  @code{yaml} is the same
 envelope as a YAML 1.2 block document, with every string value
 double-quoted, so no value can be misread as a number, boolean or
 null.  Keys stay plain only when they are identifiers no YAML parser

@@ -28,9 +28,10 @@ pub enum Format {
     /// YAML 1.2 block document of the same envelope; string values double-quoted.
     Yaml,
     /// Interactive terminal browser (filter, sort, detail, export). Falls
-    /// back to json, with a warning, when stdout or stderr is not a
-    /// terminal, an agent or CI is detected, TERM is dumb, or accessible
-    /// mode is on.
+    /// back with a warning when stdout or stderr is not a terminal, an
+    /// agent or CI is detected, TERM is dumb, or accessible mode is on.
+    /// The fallback is plain text when accessible mode is on and stdout
+    /// is a terminal; otherwise it is json.
     Explore,
 }
 

@@ -680,8 +680,8 @@ fn draw_table(frame: &mut Frame, app: &mut App, theme: Theme, area: Rect) {
 /// Fits a UUID (36) with a little room; content columns are far wider.
 const MAX_COLUMN: usize = 38;
 
-/// Narrowest a short column is squeezed to when space runs out: enough to
-/// recognise `user`, a UUID's first block, or a date's year.
+/// Preferred minimum for a short column when the table can afford it:
+/// enough to recognize `user`, a UUID's first block, or a date's year.
 const MIN_COLUMN: usize = 4;
 
 /// Each column gets its natural width (header or widest cell, among the rows
@@ -695,7 +695,9 @@ const MIN_COLUMN: usize = 4;
 /// squeezing `id`, `agent`, `scope` and `role` to nothing while both
 /// timestamps kept their room. Both were found by driving a real terminal.
 /// Here, when space is short, every short column shrinks in proportion and
-/// keeps at least [`MIN_COLUMN`] cells; the detail view shows values whole.
+/// keeps at least [`MIN_COLUMN`] cells when the budget permits. Otherwise
+/// short columns shrink further so wide columns keep their reserved space.
+/// The detail view shows values whole.
 fn column_widths(app: &App, area_width: u16) -> Vec<Constraint> {
     let n = app.columns.len();
     if n == 0 {
@@ -714,6 +716,12 @@ fn column_widths(app: &App, area_width: u16) -> Vec<Constraint> {
         .filter(|(_, w)| !**w)
         .map(|(n, _)| *n)
         .sum();
+    let short_floor: usize = natural
+        .iter()
+        .zip(&wide)
+        .filter(|(_, w)| !**w)
+        .map(|(n, _)| (*n).min(MIN_COLUMN))
+        .sum();
     let mut lengths: Vec<usize> = natural
         .iter()
         .zip(&wide)
@@ -722,8 +730,13 @@ fn column_widths(app: &App, area_width: u16) -> Vec<Constraint> {
                 0
             } else if short_total <= short_budget {
                 w
+            } else if short_floor > short_budget {
+                w * short_budget / short_total
             } else {
-                (w * short_budget / short_total).max(MIN_COLUMN.min(w))
+                let floor = MIN_COLUMN.min(w);
+                // Reserve the minimums first, then divide only the extra
+                // cells proportionally. Rounding cannot exceed the budget.
+                floor + (w - floor) * (short_budget - short_floor) / (short_total - short_floor)
             }
         })
         .collect();
@@ -1172,26 +1185,31 @@ mod tests {
             "created_at": "2026-10-29T20:40:20.235Z",
             "valid_from": "2026-10-29T20:40:20.235Z",
         }]}));
-        let mut term = Terminal::new(TestBackend::new(110, 10)).expect("terminal");
-        term.draw(|f| draw(f, &mut app, Theme { color: false }))
-            .expect("draw");
-        let screen: String = term
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(screen.contains("content"), "header present: {screen}");
-        assert!(screen.contains("the content column must"), "{screen}");
-        assert!(
-            screen.contains("dc9e"),
-            "the id keeps a recognisable start: {screen}"
-        );
-        assert!(
-            screen.contains("clau") && screen.contains("assi"),
-            "{screen}"
-        );
+        for width in [32, 40, 64, 80, 110] {
+            let mut term = Terminal::new(TestBackend::new(width, 10)).expect("terminal");
+            term.draw(|f| draw(f, &mut app, Theme { color: false }))
+                .expect("draw");
+            let screen: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(screen.contains("content"), "width {width}: {screen}");
+            assert!(screen.contains("the content"), "width {width}: {screen}");
+            if width == 110 {
+                assert!(screen.contains("the content column must"), "{screen}");
+                assert!(
+                    screen.contains("dc9e"),
+                    "the id keeps a recognisable start: {screen}"
+                );
+                assert!(
+                    screen.contains("clau") && screen.contains("assi"),
+                    "{screen}"
+                );
+            }
+        }
     }
 
     #[test]

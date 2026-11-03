@@ -107,6 +107,27 @@ fn recall_data(db: &Path, scope: &str) -> Vec<Value> {
         .clone()
 }
 
+#[cfg(feature = "tui")]
+#[test]
+fn explore_fallback_does_not_log_private_arguments() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("test.db");
+    let private_query = "private-query-f63e9201";
+    let assert = engram(&db)
+        .args(["--format", "explore", "search", private_query])
+        .assert()
+        .success();
+    let output = assert.get_output();
+    let diagnostic = parse_single_line_json(&output.stderr);
+    assert_eq!(diagnostic["diagnostic"]["code"], "TUI_FALLBACK");
+    assert!(diagnostic["diagnostic"]["command"].is_string());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(private_query),
+        "fallback diagnostics must not copy private arguments"
+    );
+    assert!(parse_single_line_json(&output.stdout)["data"].is_array());
+}
+
 #[test]
 fn remember_json_happy_path() {
     let tmp = TempDir::new().expect("tempdir");
