@@ -81,6 +81,10 @@ const NON_MESSAGE_TYPES: &[&str] = &[
     // `restored_owner_mismatch`). The user-facing "Claude can't use thinking
     // from another organization" notice is a separate `system` record.
     "history-suppression",
+    // Which account and organization own the session (`accountUuid`,
+    // `organizationUuid`, `sessionId`), with no `message`. The ownership that
+    // `history-suppression` is checked against; re-appended during a session.
+    "session-owner",
     // Links from the session to a published artifact page.
     "frame-link",
     // The set of tools the session has used so far.
@@ -559,9 +563,10 @@ mod tests {
         }
     }
 
-    /// Nine record types that arrived after `atis-latch` and `cost-state`,
-    /// measured over 22 sessions in two weeks: thousands of `unknown_record`
-    /// per run, none of them conversation. `api-request-blob` is the one that
+    /// Record types that arrived after `atis-latch` and `cost-state`: nine
+    /// measured over 22 sessions in two weeks (thousands of `unknown_record`
+    /// per run), then `session-owner` (31 records in 6 sessions by
+    /// 2026-11-06). None of them is conversation. `api-request-blob` is the one that
     /// matters most, because it carries a `message` key: it must stay a
     /// non-message, never a turn.
     #[test]
@@ -576,6 +581,7 @@ mod tests {
             r#"{"type":"artifact-autoreact-ledger","sessionId":"s1","v":1,"artifacts":{}}"#,
             r#"{"type":"artifact-comment-monitor","sessionId":"s1","v":1,"artifacts":{}}"#,
             r#"{"type":"continued-in","sessionId":"s1","continuedInSessionId":"s2"}"#,
+            r#"{"type":"session-owner","accountUuid":"00000000-0000-0000-0000-000000000000","organizationUuid":"00000000-0000-0000-0000-000000000000","sessionId":"s1"}"#,
         ] {
             let (turn, stats) = parse(record, &ReadOptions::default());
             assert!(turn.is_none(), "{record} must not become a turn");
