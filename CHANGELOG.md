@@ -13,6 +13,36 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ### Added
 
+- **Terminal protocols, spoken only where they cannot do harm.**
+  - **Keyboard:** the explore browser asks the terminal whether it speaks
+    the kitty keyboard protocol, waiting at most 200 ms
+    (`ENGRAM_TERM_PROBE_MS` changes the wait). If it does, engram turns it
+    on, so `Esc` is never mistaken for the start of another key. A terminal
+    without it keeps working as before.
+  - **Copy:** `y` copies the highlighted record to the clipboard with
+    OSC 52, which also works over SSH and in tmux. The status line says the
+    copy was sent. Terminals give no reply, so if nothing arrives, `e`
+    exports the record instead. Records over 100 KB once encoded are
+    refused rather than lost silently.
+  - **Progress:** `import` and `index` show progress in the terminal's tab
+    or taskbar (OSC 9;4). This happens only on terminals known to draw it:
+    Windows Terminal, ConEmu, Ghostty, iTerm2 3.6+, VS Code, Rio, contour,
+    foot, and WezTerm builds from 20250210. Other terminals would show
+    OSC 9 as a desktop notification on every update. Accessible mode also
+    prints an `[INFO]` line at each tenth of the work.
+  - **Restore:** quitting, an error, a panic, SIGTERM and SIGHUP all put
+    the terminal back the way they found it. Keyboard flags are popped,
+    the progress bar is cleared, and the alternate screen and raw mode are
+    left.
+  - **Never in a pipe:** nothing is sent when stderr is not a terminal,
+    when `AI_AGENT`, `AGENT` or `CI` is set, or when `TERM` is unset or
+    `dumb`.
+  - **Override:** `--term-protocols=-all,+clipboard` (or
+    `SPACECRAFT_TERM_PROTOCOLS`) turns protocols on or off and beats
+    detection. When both are given, the flag replaces the variable.
+    `engram describe` reports every protocol's state under
+    `term_protocols`.
+
 - **`--format explore` (and `-E`): a terminal browser for any command's
   output.** It shows the same records `--json` would print, as a table:
   - **Keys:** CUA and Vim bindings both work, `/` filters, `s` sorts the

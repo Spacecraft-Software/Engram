@@ -43,7 +43,11 @@ stdout with the metadata as a JSON line on stderr; `--format yaml` is the same
 envelope as YAML 1.2. `--fields id,content` keeps only those keys in each
 record, in every format. `--format explore` (or `-E`) opens an interactive
 browser in a terminal: filter, sort, open a record, and press Enter to print
-it as JSON. It falls back to JSON for agents, CI and pipes. `remember
+it as JSON, or `y` to copy it to the clipboard. It falls back to JSON for
+agents, CI and pipes. In a terminal, engram uses modern terminal protocols
+only where the terminal supports them: the kitty keyboard protocol in the
+browser, OSC 52 for copying, and OSC 9;4 progress during `import` and
+`index`. `--term-protocols=-all` turns them all off. `remember
 --dry-run` validates and shows what would be stored without writing.
 
 ```sh

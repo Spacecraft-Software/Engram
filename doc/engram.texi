@@ -152,7 +152,8 @@ Output format: @code{json}, @code{jsonl}, @code{csv}, @code{yaml}, or
 @code{explore} (also @option{-E}).  @code{explore} opens an
 interactive browser over the same records: @kbd{/} filters, @kbd{s}
 sorts, @key{RET} opens a record and @key{RET} again prints it as JSON
-and exits, @kbd{e} exports the view, @kbd{?} lists every key (Vim and
+and exits, @kbd{y} copies the record to the clipboard (OSC 52; if the
+terminal ignores it, @kbd{e} still works), @kbd{e} exports the view, @kbd{?} lists every key (Vim and
 CUA bindings both work).  It never starts when standard output or
 standard error is not a terminal, an agent or CI is detected, @env{TERM} is @samp{dumb}, or
 accessible mode is on; engram then warns and prints plain text when
@@ -174,6 +175,27 @@ as @command{context}'s @code{memories}, whose own fields are kept.
 The envelope reports the list as @code{metadata.fields}.  For example,
 @samp{engram recall --fields id,content} drops each memory's scope,
 agent, role and timestamps.
+
+@item --term-protocols @var{list}
+@cindex terminal protocols
+@cindex @env{SPACECRAFT_TERM_PROTOCOLS}
+Turn terminal protocols on or off, beating detection.  @var{list} is a
+comma-separated list of @samp{+@var{name}} and @samp{-@var{name}},
+applied left to right, so @samp{-all,+clipboard} keeps only copying.
+The names are @code{keyboard}, @code{graphics}, @code{animation},
+@code{clipboard}, @code{clipboard-rich}, @code{progress},
+@code{pointer} and @code{all}.  Engram uses three of them:
+@code{keyboard} (the explore browser turns on the kitty keyboard
+protocol when the terminal says it supports it), @code{clipboard}
+(@kbd{y} in the browser) and @code{progress} (OSC 9;4 during
+@command{import} and @command{index}, sent only to terminals known to
+draw it).  The @env{SPACECRAFT_TERM_PROTOCOLS} environment variable
+takes the same list; the flag replaces it when both are given.  No
+override sends anything when standard error is not a terminal, an
+agent or CI is detected, or @env{TERM} is unset or @samp{dumb}.
+@command{engram describe} reports the result under
+@code{term_protocols}.  @env{ENGRAM_TERM_PROBE_MS} sets how long the
+browser waits for the terminal's answer (default 200).
 
 @item --no-color
 @cindex colors, disabling

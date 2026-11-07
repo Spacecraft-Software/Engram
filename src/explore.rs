@@ -283,6 +283,9 @@ pub enum Outcome {
     Quit,
     /// Leave the TUI and print this envelope to stdout.
     Select(Value),
+    /// Copy this text to the clipboard and stay; the caller reports the
+    /// result through [`App::copied`].
+    Copy(String),
 }
 
 /// Browser state. Everything the screen shows is derived from this.
@@ -452,6 +455,7 @@ impl App {
                     }));
                 }
             }
+            KeyCode::Char('y') => return self.copy_current(),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.screen = Screen::Detail {
                     scroll: scroll.saturating_add(1),
@@ -540,12 +544,48 @@ impl App {
                 }
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.screen = Screen::Help,
+            KeyCode::Char('y') => return self.copy_current(),
             KeyCode::Enter if self.current().is_some() => {
                 self.screen = Screen::Detail { scroll: 0 };
             }
             _ => {}
         }
         Outcome::Continue
+    }
+
+    /// The highlighted record as pretty JSON, the form a person pastes
+    /// somewhere, with the browser's own section key made plain as in an
+    /// export.
+    fn copy_current(&mut self) -> Outcome {
+        match self.current() {
+            Some(row) => Outcome::Copy(
+                serde_json::to_string_pretty(&Value::Object(exported(row)))
+                    .expect("a JSON value serializes"),
+            ),
+            None => {
+                self.status = Some(("nothing to copy: no record is highlighted".to_owned(), true));
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// Reports a copy attempt in the status line. OSC 52 has no reply, so
+    /// success means "sent"; the message says how to get the record another
+    /// way when the terminal ignored it (skill clipboard rule 2).
+    pub fn copied(&mut self, result: Result<usize, String>) {
+        self.status = Some(match result {
+            Ok(chars) => (
+                format!(
+                    "sent {chars} characters to the clipboard (OSC 52); \
+                     if nothing arrived, press e to export instead"
+                ),
+                false,
+            ),
+            Err(reason) => (
+                format!("not copied: {reason}; press e to export instead"),
+                true,
+            ),
+        });
     }
 
     /// Writes the current view to `name`. Refuses an existing file rather
@@ -589,7 +629,6 @@ fn exported(row: &Map<String, Value>) -> Map<String, Value> {
 }
 
 fn write_new(path: &Path, body: &str) -> std::io::Result<()> {
-    use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -609,6 +648,7 @@ const HELP: &[(&str, &str)] = &[
     ("/", "filter (Enter applies, Esc clears)"),
     ("n N  F3 Shift+F3", "next / previous row"),
     ("Enter", "open record; Enter again prints it and exits"),
+    ("y", "copy the record to the clipboard (OSC 52)"),
     ("e", "export the current view as JSON"),
     ("q  Esc  :q  Ctrl+C", "quit (prints nothing)"),
     ("?  F1", "this help"),
@@ -816,7 +856,7 @@ fn draw_status(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
             theme.focused_header(),
         )),
         _ => Line::from(Span::styled(
-            "? help · / filter · s sort · Enter open · e export · q quit",
+            "? help · / filter · s sort · Enter open · y copy · e export · q quit",
             theme.dim(),
         )),
     };
@@ -856,15 +896,201 @@ fn draw_help(frame: &mut Frame, theme: Theme, area: Rect) {
 }
 
 // --- Terminal ---------------------------------------------------------------
+//
+// Setup order: raw mode → keyboard probe → alternate screen → push kitty
+// flags. Restore runs the reverse (pop flags → leave the alternate screen →
+// leave raw mode) from three places that share one function: the `Restore`
+// guard's `Drop`, the panic hook, and the signal watcher. `ACTIVE` makes
+// the second and third runs no-ops (spacecraft-tui-protocols §2.3).
+
+use crate::term_protocols::{self, Protocol};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Duration;
+
+/// True between setup and restore.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// True while kitty keyboard flags are pushed and must be popped.
+static KEYBOARD_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// `CSI > 1 u`: push "disambiguate escape codes" (flag 1 only; nothing in
+/// the browser needs release events or associated text).
+const KITTY_PUSH: &[u8] = b"\x1b[>1u";
+/// `CSI < u`: pop the entry pushed above. Missing it leaves the user's
+/// shell receiving `CSI … u` for every key.
+const KITTY_POP: &[u8] = b"\x1b[<u";
+
+fn restore_terminal() {
+    if !ACTIVE.swap(false, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let mut err = std::io::stderr();
+    if KEYBOARD_PUSHED.swap(false, AtomicOrdering::SeqCst) {
+        let _ = err.write_all(KITTY_POP);
+    }
+    let _ = execute!(err, terminal::LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+}
 
 /// Restores the terminal when dropped, on every exit path including errors.
 struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(std::io::stderr(), terminal::LeaveAlternateScreen);
+        restore_terminal();
     }
+}
+
+/// Default deadline for the keyboard probe. A terminal that answers DA1 at
+/// all answers within a few milliseconds; the deadline only matters for
+/// one that answers nothing.
+const PROBE_DEADLINE: Duration = Duration::from_millis(200);
+
+/// The probe deadline, overridable for slow links (ssh across the world)
+/// with `ENGRAM_TERM_PROBE_MS`.
+fn probe_deadline() -> Duration {
+    std::env::var("ENGRAM_TERM_PROBE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(PROBE_DEADLINE, |ms| Duration::from_millis(ms.min(5_000)))
+}
+
+/// What a probe reply buffer has shown so far.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Replies {
+    /// A `CSI ? <flags> u` reply arrived: the kitty keyboard protocol is
+    /// spoken.
+    kitty_keyboard: bool,
+    /// The DA1 reply `CSI ? <params> c` arrived; terminals answer in order,
+    /// so anything still unanswered is unsupported.
+    da1: bool,
+}
+
+/// Scans `bytes` for `CSI ? <params> <final>` replies. Other bytes (a key
+/// the user pressed during the probe, an unrelated reply) are skipped.
+fn scan_replies(bytes: &[u8]) -> Replies {
+    let mut found = Replies::default();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' && bytes[i + 2] == b'?' {
+            let mut j = i + 3;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            match bytes.get(j) {
+                Some(b'u') => found.kitty_keyboard = true,
+                Some(b'c') => found.da1 = true,
+                _ => {}
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+/// Asks the terminal whether it speaks the kitty keyboard protocol:
+/// `CSI ? u` fenced by DA1 (`CSI c`), read from `/dev/tty` with a deadline,
+/// then drained so no late reply leaks into the browser or the shell.
+/// Must run in raw mode and before crossterm starts reading events.
+///
+/// Any failure means "no": a probe must never stop the browser starting.
+#[cfg(unix)]
+fn probe_kitty_keyboard(deadline: Duration) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use std::io::Read;
+    use std::time::Instant;
+
+    fn readable(tty: &std::fs::File, wait: Duration) -> bool {
+        let timeout = Timespec {
+            tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(wait.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(tty, PollFlags::IN)];
+        matches!(poll(&mut fds, Some(&timeout)), Ok(n) if n > 0)
+    }
+
+    let Ok(mut tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    else {
+        return false;
+    };
+    if tty
+        .write_all(b"\x1b[?u\x1b[c")
+        .and_then(|()| tty.flush())
+        .is_err()
+    {
+        return false;
+    }
+    let end = Instant::now() + deadline;
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 256];
+    let mut replies = Replies::default();
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        if !readable(&tty, left) {
+            break;
+        }
+        match tty.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+        replies = scan_replies(&seen);
+        if replies.da1 {
+            break;
+        }
+    }
+    // Drain: swallow whatever arrives late, so it is never read as keys.
+    while readable(&tty, Duration::from_millis(20)) {
+        if !matches!(tty.read(&mut buf), Ok(n) if n > 0) {
+            break;
+        }
+    }
+    replies.kitty_keyboard
+}
+
+#[cfg(not(unix))]
+fn probe_kitty_keyboard(_deadline: Duration) -> bool {
+    false
+}
+
+/// Whether to push kitty keyboard flags: the override wins, otherwise the
+/// probe decides. Both sit behind the §2.1 gate, which `blocker` already
+/// enforced for the TTY, agent and CI conditions; `TERM` unset is the one
+/// left to check here.
+fn want_kitty_keyboard() -> bool {
+    if term_protocols::gate(|k| std::env::var(k).ok(), true).is_some() {
+        return false;
+    }
+    match term_protocols::forced(Protocol::Keyboard) {
+        Some(on) => on,
+        None => probe_kitty_keyboard(probe_deadline()),
+    }
+}
+
+/// Sends `text` to the clipboard with OSC 52 on stderr, the terminal the
+/// browser draws on. Returns the character count for the status line.
+fn copy_to_clipboard(text: &str) -> Result<usize, String> {
+    if term_protocols::forced(Protocol::Clipboard) == Some(false) {
+        return Err("the clipboard protocol is turned off (--term-protocols)".to_owned());
+    }
+    if term_protocols::gate(|k| std::env::var(k).ok(), true).is_some() {
+        return Err("TERM is unset, so no terminal protocol is sent".to_owned());
+    }
+    let encoded = term_protocols::osc52_len(text);
+    if encoded > term_protocols::OSC52_MAX_BASE64 {
+        return Err(format!(
+            "the record is {encoded} bytes encoded, over the {} terminals accept",
+            term_protocols::OSC52_MAX_BASE64
+        ));
+    }
+    let mut err = std::io::stderr();
+    err.write_all(term_protocols::osc52(text).as_bytes())
+        .and_then(|()| err.flush())
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(text.chars().count())
 }
 
 /// Runs the browser on stderr's alternate screen until the user quits or
@@ -874,17 +1100,31 @@ impl Drop for Restore {
 ///
 /// Any terminal I/O error; the terminal is restored before it is returned.
 pub fn run(envelope: &Value, color: bool) -> std::io::Result<Option<Value>> {
-    // A panic must not leave the terminal raw and on the alternate screen.
+    // A panic must not leave the terminal raw, on the alternate screen, or
+    // with kitty flags pushed. Restore first so the message prints on a
+    // sane terminal.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(std::io::stderr(), terminal::LeaveAlternateScreen);
+        restore_terminal();
         default_hook(info);
     }));
 
     terminal::enable_raw_mode()?;
+    ACTIVE.store(true, AtomicOrdering::SeqCst);
     let _restore = Restore;
+    // SIGTERM/SIGHUP (and a SIGINT sent with `kill`; in raw mode Ctrl+C is a
+    // key) restore before the process ends.
+    term_protocols::restore_on_signal(restore_terminal);
+    let kitty = want_kitty_keyboard();
     execute!(std::io::stderr(), terminal::EnterAlternateScreen)?;
+    if kitty {
+        // Pushed after entering the alternate screen, whose flag stack is
+        // separate from the main screen's.
+        KEYBOARD_PUSHED.store(true, AtomicOrdering::SeqCst);
+        let mut err = std::io::stderr();
+        err.write_all(KITTY_PUSH)?;
+        err.flush()?;
+    }
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stderr()))?;
     let theme = Theme { color };
     let mut app = App::new(envelope);
@@ -895,6 +1135,7 @@ pub fn run(envelope: &Value, color: bool) -> std::io::Result<Option<Value>> {
                 Outcome::Continue => {}
                 Outcome::Quit => return Ok(None),
                 Outcome::Select(value) => return Ok(Some(value)),
+                Outcome::Copy(text) => app.copied(copy_to_clipboard(&text)),
             }
         }
     }
@@ -1040,6 +1281,57 @@ mod tests {
         );
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(App::new(&envelope()).handle(ctrl_c), Outcome::Quit);
+    }
+
+    #[test]
+    fn the_keyboard_probe_reads_kitty_and_da1_replies() {
+        // kitty, Ghostty, WezTerm with enable_kitty_keyboard: both replies.
+        assert_eq!(
+            scan_replies(b"\x1b[?0u\x1b[?62;22c"),
+            Replies {
+                kitty_keyboard: true,
+                da1: true
+            }
+        );
+        // A terminal without the protocol answers DA1 only.
+        assert_eq!(
+            scan_replies(b"\x1b[?1;2c"),
+            Replies {
+                kitty_keyboard: false,
+                da1: true
+            }
+        );
+        // A key typed during the probe, and a reply split across reads,
+        // before the fence arrives.
+        assert_eq!(scan_replies(b"j\x1b[?1"), Replies::default());
+        assert!(scan_replies(b"j\x1b[?1u\x1b[?6").kitty_keyboard);
+        assert!(!scan_replies(b"\x1b[1u\x1b[c").kitty_keyboard);
+    }
+
+    #[test]
+    fn y_copies_the_highlighted_record_and_reports_it() {
+        let mut app = App::new(&envelope());
+        press(&mut app, KeyCode::Down);
+        let Outcome::Copy(text) = press(&mut app, KeyCode::Char('y')) else {
+            panic!("y should ask to copy");
+        };
+        let copied: Value = serde_json::from_str(&text).unwrap();
+        let expected = app.current().cloned().map(Value::Object).unwrap();
+        assert_eq!(copied, expected);
+        app.copied(Ok(42));
+        assert!(matches!(&app.status, Some((m, false)) if m.contains("42 characters")));
+        app.copied(Err("too big".to_owned()));
+        assert!(matches!(&app.status, Some((m, true)) if m.contains("press e")));
+
+        // From the detail view too, and nothing to copy in an empty view.
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('y')),
+            Outcome::Copy(_)
+        ));
+        let mut empty = App::new(&json!({ "metadata": {}, "data": [] }));
+        assert_eq!(press(&mut empty, KeyCode::Char('y')), Outcome::Continue);
+        assert!(matches!(&empty.status, Some((_, true))));
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod output;
 mod retrieval;
 mod rules;
 mod store;
+mod term_protocols;
 mod time;
 mod transcript;
 
@@ -59,6 +60,21 @@ fn main() {
                 ));
             }
         }
+    }
+
+    if let Err(message) = term_protocols::init(
+        cli.term_protocols.as_deref(),
+        output::mode::accessible_resolved(cli.accessible),
+    ) {
+        std::process::exit(fail(
+            AppError::new(
+                error::ErrorCode::InvalidArgument,
+                2,
+                message,
+                "engram --term-protocols=-all describe",
+            ),
+            mode,
+        ));
     }
 
     let store = match Store::open(&cli.db) {
@@ -603,11 +619,15 @@ fn run(
                     "escape_hatches": ["--include-superseded", "--as-of <ISO8601>"],
                     "rule_purge": "CLI-only; deletes retired-rule tombstones only"
                 },
+                "term_protocols": term_protocols::describe(
+                    |k| std::env::var(k).ok(),
+                    std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                ),
                 "transports": ["cli", "mcp-stdio", "http"],
                 "storage": "sqlite+fts5, single shared file",
                 "output": {
                     "formats": ["json", "jsonl", "csv", "yaml", "explore"],
-                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; falls back with a warning when stdout or stderr is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on; fallback is plain text when accessible mode is on and stdout is a TTY, otherwise JSON with a TUI_FALLBACK diagnostic",
+                    "explore": "interactive browser on stderr's alternate screen (tui feature); Enter twice prints the chosen record as JSON on stdout; y copies it with OSC 52; falls back with a warning when stdout or stderr is not a TTY, an agent or CI is detected, TERM=dumb, or accessible mode is on; fallback is plain text when accessible mode is on and stdout is a TTY, otherwise JSON with a TUI_FALLBACK diagnostic",
                     "jsonl": "first line is the metadata envelope with data:null, then one line per record",
                     "csv": "RFC 4180 data rows on stdout; metadata as one JSON line on stderr",
                     "fields": "--fields a,b keeps only those keys in each record, in that order, in every format; metadata.fields echoes the list",
@@ -1717,17 +1737,16 @@ fn run_index(
     let guard = store.lock().expect("store lock poisoned");
 
     if dry_run {
-        // Count-only pass. Materializing the rows to count them is fine at
-        // engram's scale (the same no-index reasoning as brute-force cosine).
-        let pending = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
-            Ok(p) => p,
+        // Count-only pass, counted in SQL so no content is loaded.
+        let pending = match guard.count_unindexed(&model, scope.as_deref()) {
+            Ok(n) => n,
             Err(e) => return fail(AppError::from(e), mode),
         };
         let data = serde_json::json!({
             "model": model,
             "dim": embedder.dim(),
             "indexed": 0,
-            "remaining": pending.len(),
+            "remaining": pending,
         });
         emit_ok(
             Response::new("engram index --dry-run", data).with_dry_run(),
@@ -1736,6 +1755,12 @@ fn run_index(
         return 0;
     }
 
+    // Counted in SQL so the denominator loads no content (Codex on #37).
+    let total = match guard.count_unindexed(&model, scope.as_deref()) {
+        Ok(n) => n,
+        Err(e) => return fail(AppError::from(e), mode),
+    };
+    let mut progress = term_protocols::Progress::start("index", "memories", total);
     let mut indexed: u64 = 0;
     loop {
         // Each embedded batch leaves the work queue, so the loop always
@@ -1753,10 +1778,12 @@ fn run_index(
                 return fail(AppError::from(e), mode);
             }
             indexed += 1;
+            progress.update(usize::try_from(indexed).unwrap_or(usize::MAX));
         }
     }
-    let remaining = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
-        Ok(p) => p.len(),
+    drop(progress);
+    let remaining = match guard.count_unindexed(&model, scope.as_deref()) {
+        Ok(n) => n,
         Err(e) => return fail(AppError::from(e), mode),
     };
     let data = serde_json::json!({
@@ -2176,7 +2203,12 @@ fn handle_import(
         redactions: transcript::redact::Redactions::default(),
     };
 
-    for path in files {
+    // Decorative and stderr-only: the tab/taskbar bar on allow-listed
+    // terminals, [INFO] lines in accessible mode, nothing in a pipe.
+    let total = files.len();
+    let mut progress = term_protocols::Progress::start("import", "files", total);
+    for (done, path) in files.into_iter().enumerate() {
+        progress.update(done);
         let display = path.display().to_string();
         let (fmt, messages) = match import::read_file(&path, format, max_bytes) {
             Ok(v) => v,
@@ -2265,6 +2297,8 @@ fn handle_import(
             approximate_times: approximate,
         });
     }
+    progress.update(total);
+    drop(progress);
 
     result.scopes.sort();
     let label = if dry_run {
