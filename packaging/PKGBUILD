@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Arch Linux PKGBUILD for engram (Steelbore Standard §5.5).
-# Builds the tagged v0.7.1 release tarball.
+# Builds the tagged v0.8.0 release tarball.
 
 pkgname=engram
-pkgver=0.7.1
+pkgver=0.8.0
 pkgrel=1
 pkgdesc="Shared verbatim chat memory for multi-model LLM pipelines (SQLite FTS5; CLI, MCP, HTTP)"
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ url="https://Engram.SpacecraftSoftware.org/"
 license=('GPL-3.0-or-later')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Spacecraft-Software/Engram/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('ee7f60c946bbb409980f96777a714beeecaded4d9694aabb4f3a16e3d42c05ec')
+sha256sums=('c444f27a4805ec017c50eea8a7a1945ffb4a1b148609f55b0ddb97cd102e2d55')
 
 build() {
   cd "Engram-$pkgver"
