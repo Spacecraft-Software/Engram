@@ -82,6 +82,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FIELD,...")]
     pub fields: Option<String>,
 
+    /// Turn terminal protocols on or off, beating detection: a comma list
+    /// of +name / -name, applied left to right (e.g. `-all,+clipboard`).
+    /// Names: keyboard, graphics, animation, clipboard, clipboard-rich,
+    /// progress, pointer, all. Replaces SPACECRAFT_TERM_PROTOCOLS when both
+    /// are set. Nothing is ever sent to a pipe or under an agent, whatever
+    /// this says. `engram describe` reports the resolved state.
+    #[arg(long, global = true, value_name = "LIST", allow_hyphen_values = true)]
+    pub term_protocols: Option<String>,
+
     /// Local Model2Vec model directory for semantic (vector) search. First
     /// step of the model cascade: --model-path, then ENGRAM_MODEL, then
     /// $XDG_DATA_HOME/engram/model (default ~/.local/share/engram/model).

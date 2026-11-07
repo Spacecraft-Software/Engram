@@ -23,7 +23,7 @@ default = ["tui"]
 # Interactive browser for `--format explore` (CLI Standard tui-explore.md).
 # Pure Rust: ratatui plus the crossterm it re-exports, so the two versions
 # cannot drift apart.
-tui = ["dep:ratatui"]
+tui = ["dep:ratatui", "dep:rustix"]
 # Semantic (vector) search via Model2Vec static embeddings, loaded from a
 # LOCAL model directory only (--model-path / ENGRAM_MODEL /
 # $XDG_DATA_HOME/engram/model). model2vec-rs is pulled with
@@ -68,10 +68,20 @@ anyhow = "1"
 # Optional — gated behind the "vector" feature (see [features] for why the
 # default features are disabled: no hf-hub network fetching, ever).
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+# poll(2) on /dev/tty for the explore browser's DA1-fenced kitty keyboard
+# probe (spacecraft-tui-protocols §2.2). Already in the tree through
+# crossterm; named here only for the `event` feature.
+rustix = { version = "1", optional = true, default-features = false, features = ["std", "event"] }
 model2vec-rs = { version = "0.2", optional = true, default-features = false, features = [
     "local-only",
     "fancy-regex",
 ] }
+
+# Restores the terminal on SIGTERM/SIGHUP/SIGINT: pops kitty keyboard flags
+# and clears an OSC 9;4 progress bar (spacecraft-tui-protocols §2.3).
+# Already in the tree through crossterm.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2"
