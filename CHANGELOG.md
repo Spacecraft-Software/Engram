@@ -11,6 +11,8 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions follow
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-07
+
 ### Added
 
 - **Terminal protocols, spoken only where they cannot do harm.**
