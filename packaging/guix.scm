@@ -5,7 +5,7 @@
 ;;
 ;; Build:  guix build -f packaging/guix.scm
 ;;
-;; Fetches the tagged v0.7.1 release tarball, and that source hash is
+;; Fetches the tagged v0.8.0 release tarball, and that source hash is
 ;; real.  Bump `version' and the sha256 together at each release;
 ;; `guix download <tarball-url>' prints the new hash.
 ;;
@@ -24,7 +24,7 @@
 (define-public engram
   (package
     (name "engram")
-    (version "0.7.1")
+    (version "0.8.0")
     (source
      (origin
        (method url-fetch)
@@ -34,7 +34,7 @@
        (file-name (string-append name "-" version ".tar.gz"))
        (sha256
         (base32
-         "1v055kaf65is9yxsm54n9pnsvv7f9dqplxwn1yc0kd5v8v4n0zzf"))))
+         "0m9d5q8cv5yv1mdza2c62hdlmyszjjhsga7fa1y03v0591xg4i64"))))
     (build-system cargo-build-system)
     (arguments
      (list #:install-source? #f))
