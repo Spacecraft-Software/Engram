@@ -1737,17 +1737,16 @@ fn run_index(
     let guard = store.lock().expect("store lock poisoned");
 
     if dry_run {
-        // Count-only pass. Materializing the rows to count them is fine at
-        // engram's scale (the same no-index reasoning as brute-force cosine).
-        let pending = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
-            Ok(p) => p,
+        // Count-only pass, counted in SQL so no content is loaded.
+        let pending = match guard.count_unindexed(&model, scope.as_deref()) {
+            Ok(n) => n,
             Err(e) => return fail(AppError::from(e), mode),
         };
         let data = serde_json::json!({
             "model": model,
             "dim": embedder.dim(),
             "indexed": 0,
-            "remaining": pending.len(),
+            "remaining": pending,
         });
         emit_ok(
             Response::new("engram index --dry-run", data).with_dry_run(),
@@ -1756,10 +1755,9 @@ fn run_index(
         return 0;
     }
 
-    // The total is counted once up front so progress has a denominator;
-    // materializing the ids is the same cost the dry run already accepts.
-    let total = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
-        Ok(p) => p.len(),
+    // Counted in SQL so the denominator loads no content (Codex on #37).
+    let total = match guard.count_unindexed(&model, scope.as_deref()) {
+        Ok(n) => n,
         Err(e) => return fail(AppError::from(e), mode),
     };
     let mut progress = term_protocols::Progress::start("index", "memories", total);
@@ -1784,8 +1782,8 @@ fn run_index(
         }
     }
     drop(progress);
-    let remaining = match guard.unindexed_memories(&model, scope.as_deref(), u32::MAX) {
-        Ok(p) => p.len(),
+    let remaining = match guard.count_unindexed(&model, scope.as_deref()) {
+        Ok(n) => n,
         Err(e) => return fail(AppError::from(e), mode),
     };
     let data = serde_json::json!({

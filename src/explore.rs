@@ -1114,7 +1114,7 @@ pub fn run(envelope: &Value, color: bool) -> std::io::Result<Option<Value>> {
     let _restore = Restore;
     // SIGTERM/SIGHUP (and a SIGINT sent with `kill`; in raw mode Ctrl+C is a
     // key) restore before the process ends.
-    let _signals = term_protocols::SignalGuard::install(restore_terminal);
+    term_protocols::restore_on_signal(restore_terminal);
     let kitty = want_kitty_keyboard();
     execute!(std::io::stderr(), terminal::EnterAlternateScreen)?;
     if kitty {

@@ -1179,6 +1179,45 @@ impl Store {
         rows.collect()
     }
 
+    /// How many memories [`Store::unindexed_memories`] would return without
+    /// a limit, counted in SQL so no content is loaded (the progress
+    /// denominator for `engram index`).
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error.
+    #[cfg_attr(
+        all(not(feature = "vector"), not(test)),
+        expect(
+            dead_code,
+            reason = "read only by the vector-feature `engram index` command and by tests"
+        )
+    )]
+    pub fn count_unindexed(&self, model: &str, scope: Option<&str>) -> rusqlite::Result<usize> {
+        let scope_clause = if scope.is_some() {
+            "AND m.scope = ?2"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM memories m
+             WHERE m.rule_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_vectors v
+                   WHERE v.memory_id = m.id AND v.model = ?1
+               )
+               {scope_clause}"
+        );
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&model];
+        if let Some(s) = scope.as_ref() {
+            bind.push(s);
+        }
+        let n: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(bind), |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Nearest stored memories to a precomputed query vector, best first.
     ///
     /// Loads every candidate row for `model` (optionally narrowed to one
@@ -3434,6 +3473,18 @@ mod tests {
                 .len(),
             1
         );
+
+        // The SQL count agrees with the queue in every case above.
+        for (model, scope) in [("m", None), ("m", Some("s")), ("other", None)] {
+            assert_eq!(
+                store.count_unindexed(model, scope).expect("count"),
+                store
+                    .unindexed_memories(model, scope, u32::MAX)
+                    .expect("unindexed")
+                    .len(),
+                "{model} {scope:?}"
+            );
+        }
     }
 
     #[test]

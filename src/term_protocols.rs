@@ -21,7 +21,7 @@
 //!
 //! Every protocol obeys the five rules of the skill's §2: a hard gate before
 //! anything is written ([`gate`]), probes fenced by DA1 with a deadline,
-//! restore on every exit path ([`SignalGuard`] plus `Drop`), no sequence
+//! restore on every exit path ([`restore_on_signal`] plus `Drop`), no sequence
 //! another meaning could catch (the OSC 9;4 allow-list in
 //! [`progress_terminal`]), and a user override ([`init`]).
 
@@ -399,63 +399,58 @@ const OSC9_4_CLEAR: &str = "\x1b]9;4;0;0\x1b\\";
 
 // --- Restore on signals -----------------------------------------------------
 
-/// Runs a restore function when SIGINT, SIGTERM, SIGHUP or SIGQUIT arrives,
-/// then lets the signal end the process as it would have. Dropping the
-/// guard stops the watcher thread and unregisters the handlers, so the
-/// default disposition comes back.
-///
-/// A watcher thread rather than a handler: the restore writes to the
-/// terminal, and nothing that takes a lock is async-signal-safe.
-#[derive(Debug)]
-pub struct SignalGuard {
-    #[cfg(unix)]
-    handle: signal_hook::iterator::Handle,
-    #[cfg(unix)]
-    thread: Option<std::thread::JoinHandle<()>>,
-}
+/// Restore functions the signal watcher runs, in registration order. Each
+/// must be idempotent and a no-op when nothing is on screen, because the
+/// watcher outlives the mode that registered it.
+static RESTORERS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
 
-impl SignalGuard {
-    /// Installs the watcher. Returns `None` when the handlers cannot be
-    /// registered: the program then runs without signal-time restore,
-    /// which is how it ran before, rather than refusing to start.
-    pub fn install(restore: fn()) -> Option<Self> {
-        #[cfg(unix)]
-        {
+/// Arranges for `restore` to run when SIGINT, SIGTERM, SIGHUP or SIGQUIT
+/// arrives, after which the signal ends the process as it would have.
+///
+/// The first call starts one watcher thread for the rest of the process.
+/// It is never stopped: signal-hook cannot put back the default
+/// disposition, so unregistering would leave those signals ignored. A
+/// signal that arrives after the mode has ended therefore still runs the
+/// (by then idle) restores and still terminates the process.
+///
+/// A watcher thread rather than a handler, because the restore writes to
+/// the terminal and nothing that takes a lock is async-signal-safe. If the
+/// handlers cannot be registered, the program runs without signal-time
+/// restore, which is how it ran before, rather than refusing to start.
+pub fn restore_on_signal(restore: fn()) {
+    {
+        let mut list = RESTORERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !list.contains(&restore) {
+            list.push(restore);
+        }
+    }
+    #[cfg(unix)]
+    {
+        static WATCHER: std::sync::Once = std::sync::Once::new();
+        WATCHER.call_once(|| {
             use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
-            let mut signals =
-                signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]).ok()?;
-            let handle = signals.handle();
-            let thread = std::thread::Builder::new()
+            let Ok(mut signals) =
+                signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])
+            else {
+                return;
+            };
+            let _ = std::thread::Builder::new()
                 .name("engram-term-restore".to_owned())
                 .spawn(move || {
                     if let Some(signal) = signals.forever().next() {
-                        restore();
+                        let list = RESTORERS
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        for restore in list {
+                            restore();
+                        }
                         let _ = signal_hook::low_level::emulate_default_handler(signal);
                     }
-                })
-                .ok()?;
-            Some(Self {
-                handle,
-                thread: Some(thread),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = restore;
-            None
-        }
-    }
-}
-
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            self.handle.close();
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
+                });
+        });
     }
 }
 
@@ -497,7 +492,6 @@ pub struct Progress {
     last_percent: Option<u8>,
     last_emit: Option<Instant>,
     last_tenth: Option<usize>,
-    _signals: Option<SignalGuard>,
 }
 
 impl Progress {
@@ -516,7 +510,7 @@ impl Progress {
                 None => progress_terminal(env).is_ok(),
             };
         let text = open && accessible;
-        Self {
+        let progress = Self {
             label,
             unit,
             total,
@@ -525,12 +519,11 @@ impl Progress {
             last_percent: None,
             last_emit: None,
             last_tenth: None,
-            _signals: if osc {
-                SignalGuard::install(clear_progress)
-            } else {
-                None
-            },
+        };
+        if progress.osc {
+            restore_on_signal(clear_progress);
         }
+        progress
     }
 
     /// Records that `done` of the units are finished.
